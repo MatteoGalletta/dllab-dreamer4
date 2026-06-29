@@ -4,6 +4,7 @@ import time
 import math
 import random
 import argparse
+import sys
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -15,8 +16,14 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 import wandb
 
-from task_set import TASK_SET
-from sharded_frame_dataset import ShardedFrameDataset
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from data_pipeline.PushTDataLoader import PushTSequenceDataset
 
 from model import (
     Encoder, Decoder, Tokenizer,
@@ -41,6 +48,14 @@ def is_rank0() -> bool:
     return int(os.environ.get("RANK", "0")) == 0
 
 
+def get_runtime_device() -> tuple[torch.device, str]:
+    if torch.cuda.is_available():
+        return torch.device("cuda"), "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu"), "xpu"
+    return torch.device("cpu"), "cpu"
+
+
 def get_wandb_mode(args: argparse.Namespace) -> str:
     mode = getattr(args, "wandb_mode", "disabled") or "disabled"
     if mode == "online" and not os.environ.get("WANDB_API_KEY") and not (Path.home() / ".netrc").exists():
@@ -53,7 +68,10 @@ def seed_everything(seed: int):
     random.seed(s)
     np.random.seed(s)
     torch.manual_seed(s)
-    torch.cuda.manual_seed_all(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.manual_seed_all(s)
 
 
 def worker_init_fn(worker_id: int):
@@ -65,8 +83,12 @@ def init_distributed() -> tuple[bool, int, int, int]:
     rank, world_size, local_rank = get_dist_info()
     ddp = world_size > 1
     if ddp:
-        dist.init_process_group(backend="nccl", init_method="env://")
-        torch.cuda.set_device(local_rank)
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.set_device(local_rank)
     return ddp, rank, world_size, local_rank
 
 
@@ -585,54 +607,29 @@ def run_dynamics_eval(
 
 def train(args):
     ddp, rank, world_size, local_rank = init_distributed()
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    device, device_type = get_runtime_device()
+    if device.type in {"cuda", "xpu"} and ddp:
+        device = torch.device(f"{device.type}:{local_rank}")
 
     seed_everything(args.seed + rank)
 
-    # Dataset and DataLoader
-    if args.use_actions:
-        from wm_dataset import WMDataset, collate_batch
-        dataset = WMDataset(
-            data_dir=args.data_dirs,
-            frames_dir=args.frame_dirs,
-            seq_len=args.seq_len,
-            img_size=128,
-            action_dim=16,
-            tasks_json=args.tasks_json,
-            tasks=TASK_SET,
-            verbose=is_rank0(),
-        )
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
-        loader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            sampler=sampler,
-            shuffle=(sampler is None),
-            num_workers=args.num_workers,
-            pin_memory=True,
-            drop_last=True,
-            persistent_workers=(args.num_workers > 0),
-            worker_init_fn=worker_init_fn,
-            collate_fn=collate_batch,
-        )
-    else:
-        dataset = ShardedFrameDataset(
-            outdirs=args.frame_dirs,
-            tasks=TASK_SET,
-            seq_len=args.seq_len,
-        )
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
-        loader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            sampler=sampler,
-            shuffle=(sampler is None),
-            num_workers=args.num_workers,
-            pin_memory=True,
-            drop_last=True,
-            persistent_workers=(args.num_workers > 0),
-            worker_init_fn=worker_init_fn,
-        )
+    # ---- data ----
+    dataset = PushTSequenceDataset(
+        data_dirs=args.data_dirs,
+        seq_len=args.seq_len,
+    )
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        shuffle=(sampler is None),
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=(args.num_workers > 0),
+        worker_init_fn=worker_init_fn,
+    )
 
     # Load frozen tokenizer
     tok_override = {}
@@ -693,8 +690,8 @@ def train(args):
     opt = torch.optim.AdamW(
         dyn.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999)
     )
-    use_amp = torch.cuda.is_available()
-    scaler = GradScaler(device="cuda", enabled=use_amp)
+    use_amp = device_type in {"cuda", "xpu"}
+    scaler = GradScaler(device=device_type, enabled=use_amp)
 
     # Initialize wandb
     if is_rank0():
@@ -729,27 +726,23 @@ def train(args):
                 if step >= args.max_steps:
                     break
 
-                if args.use_actions:
-                    obs_u8 = batch["obs"].to(device, non_blocking=True)          # (B,T+1,3,H,W) uint8
-                    act    = batch["act"].to(device, non_blocking=True)          # (B,T,16) float
-                    mask   = batch["act_mask"].to(device, non_blocking=True)     # (B,T,16) float (optional but good)
-
-                    act = act.clamp(-1, 1) * mask
-
-                    # Keep obs[0..T-1], align action[t] as action that produced obs[t]
-                    frames = obs_u8[:, :-1].float() / 255.0                      # (B,T,3,H,W)
-                    actions = torch.zeros_like(act)
-                    actions[:, 1:] = act[:, :-1]
-                    act_mask = torch.zeros_like(mask)
-                    act_mask[:, 1:] = mask[:, :-1]
-                else:
-                    frames = batch.to(device, non_blocking=True)                 # (B,T,3,H,W)
-                    actions = None
-                    act_mask = None
-
-                # Safeguard: convert to [0, 1] if dataset returns uint8
+                frames = batch["image"].to(device, non_blocking=True)  # (B,T,3,H,W)
                 if frames.dtype == torch.uint8:
                     frames = frames.float() / 255.0
+                elif float(frames.max().item()) > 1.5:
+                    frames = frames.float() / 255.0
+                else:
+                    frames = frames.float()
+
+                if args.use_actions:
+                    raw_actions = batch["action"].to(device, non_blocking=True).clamp(-1, 1)  # (B,T,2)
+                    actions = torch.zeros((*raw_actions.shape[:-1], 16), device=device, dtype=torch.float32)
+                    actions[..., : raw_actions.shape[-1]] = raw_actions.float()
+                    act_mask = torch.zeros(16, device=device, dtype=torch.float32)
+                    act_mask[: raw_actions.shape[-1]] = 1.0
+                else:
+                    actions = None
+                    act_mask = None
 
                 # Frozen encoder -> packed spatial tokens z1
                 with torch.no_grad():
@@ -808,7 +801,7 @@ def train(args):
 
                     if args.use_actions:
                         actions_eval = actions[:B_eval]
-                        act_mask_eval = act_mask[:B_eval]
+                        act_mask_eval = act_mask
                     else:
                         actions_eval = None
                         act_mask_eval = None
@@ -910,20 +903,17 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
 
     # data (if using multiple datasets, make sure they align in order)
-    p.add_argument("--data_dirs", type=str, nargs="+", default=[   # paths to raw data
-        "/<path>/expert",
-        "/<path>/mixed-small",
-        "/<path>/mixed-large",
-    ])
-    p.add_argument("--frame_dirs", type=str, nargs="+", default=[  # paths to preprocessed frames
-        "/<path>/expert-shards",
-        "/<path>/mixed-small-shards",
-        "/<path>/mixed-large-shards",
-    ])
-    p.add_argument("--tasks_json", type=str, default="../tasks.json")  # task metadata
+    p.add_argument(
+        "--data-dirs",
+        "--data_dirs",
+        dest="data_dirs",
+        type=str,
+        nargs="+",
+        default=[str(PROJECT_ROOT / "pusht_cchi_v7_replay.zarr")],
+    )
     p.add_argument("--seq_len", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)
-    p.add_argument("--batch_size", type=int, default=24)
+    p.add_argument("--batch_size", type=int, default=2)
 
     # tokenizer restore
     p.add_argument("--tokenizer_ckpt", type=str, default="./logs/tokenizer_ckpts/latest.pt")
