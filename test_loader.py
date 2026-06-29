@@ -35,9 +35,16 @@ def run_sanity_check():
         device = torch.device("cpu")
         
     images_gpu = batch['image'].to(device)
-    print(f"Bilder auf Device   : Dtype {images_gpu.dtype} (Sollte uint8 bleiben!)")
-    
-    images_norm = (images_gpu.float() / 255.0) - 0.5
+    print(f"Bilder auf Device   : Dtype {images_gpu.dtype} (Zarr speichert hier float32, keine uint8-Annahme)")
+
+    if images_gpu.dtype == torch.uint8:
+        images_norm = images_gpu.float() / 255.0 - 0.5
+    else:
+        images_float = images_gpu.float()
+        if images_float.max() > 1.5:
+            images_float = images_float / 255.0
+        images_norm = images_float - 0.5
+
     print(f"Nach Normalisierung : Dtype {images_norm.dtype}")
     print(f"Wertebereich        : Min {images_norm.min():.2f}, Max {images_norm.max():.2f}")
     

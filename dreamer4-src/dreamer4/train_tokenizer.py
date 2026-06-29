@@ -3,6 +3,7 @@ import os
 import time
 import random
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -13,8 +14,14 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 import wandb
 
-from task_set import TASK_SET
-from sharded_frame_dataset import ShardedFrameDataset
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from data_pipeline.PushTDataLoader import PushTSequenceDataset
 from model import (
     Encoder, Decoder, Tokenizer,
     temporal_patchify, temporal_unpatchify,
@@ -42,15 +49,26 @@ def get_dist_info():
 
 
 def is_rank0() -> bool:
+    return False
     return int(os.environ.get("RANK", "0")) == 0
 
+
+def get_runtime_device() -> tuple[torch.device, str]:
+    if torch.cuda.is_available():
+        return torch.device("cuda"), "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu"), "xpu"
+    return torch.device("cpu"), "cpu"
 
 def seed_everything(seed: int):
     s = int(seed) % (2**32)
     random.seed(s)
     np.random.seed(s)
     torch.manual_seed(s)
-    torch.cuda.manual_seed_all(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.manual_seed_all(s)
 
 
 def worker_init_fn(worker_id: int):
@@ -63,7 +81,10 @@ def init_distributed() -> tuple[bool, int, int, int]:
     ddp = world_size > 1
     if ddp:
         dist.init_process_group(backend="nccl", init_method="env://")
-        torch.cuda.set_device(local_rank)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.set_device(local_rank)
     return ddp, rank, world_size, local_rank
 
 
@@ -153,16 +174,16 @@ def load_ckpt(path: Path, *, model, opt, scaler) -> tuple[int, int]:
 
 def train(args):
     ddp, rank, world_size, local_rank = init_distributed()
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    device, device_type = get_runtime_device()
+    if device.type in {"cuda", "xpu"}:
+        device = torch.device(f"{device.type}:{local_rank}") if ddp else device
 
     seed_everything(args.seed + rank)
 
     # ---- data ----
-    dataset = ShardedFrameDataset(
-        outdirs=args.data_dirs,
-        tasks=TASK_SET,
+    dataset = PushTSequenceDataset(
+        data_dirs=args.data_dirs,
         seq_len=args.seq_len,
-        iid_sampling=True,
     )
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
@@ -231,8 +252,8 @@ def train(args):
 
     # ---- optim ----
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    use_amp = torch.cuda.is_available()
-    scaler = GradScaler(device="cuda", enabled=use_amp)
+    use_amp = device_type in {"cuda", "xpu"}
+    scaler = GradScaler(device=device_type, enabled=use_amp)
 
     # ---- lpips ----
     if args.lpips_weight > 0.0:
@@ -272,11 +293,17 @@ def train(args):
             if sampler is not None:
                 sampler.set_epoch(epoch)
 
-            for x in loader:
+            for batch in loader:
                 if step >= args.max_steps:
                     break
 
-                x = x.to(device, non_blocking=True)  # (B,T,C,H,W)
+                x = batch["image"].to(device, non_blocking=True)  # (B,T,C,H,W)
+                if x.dtype == torch.uint8:
+                    x = x.to(torch.float32) / 255.0
+                elif float(x.max().item()) > 1.5:
+                    x = x.to(torch.float32) / 255.0
+                else:
+                    x = x.to(torch.float32)
                 patches = temporal_patchify(x, args.patch)
 
                 with torch.no_grad():
@@ -284,7 +311,7 @@ def train(args):
                         z, _ = (model.module.encoder if hasattr(model, "module") else model.encoder)(patches)
                         wandb.log({"debug/z_std": float(z.float().std().item())}, step=step)
 
-                with autocast(device_type="cuda", enabled=use_amp):
+                with autocast(device_type=device_type, enabled=use_amp):
                     pred, mae_mask, keep_prob = model(patches)
 
                 # losses in fp32 (outside autocast)
@@ -379,20 +406,23 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
 
     # data
-    p.add_argument("--data_dirs", type=str, nargs="+", default=[   # paths to preprocessed frames
-        "/<path>/expert-shards",
-        "/<path>/mixed-small-shards",
-        "/<path>/mixed-large-shards",
-    ])
+    p.add_argument(
+        "--data-dirs",
+        "--data_dirs",
+        dest="data_dirs",
+        type=str,
+        nargs="+",
+        default=[str(PROJECT_ROOT / "pusht_cchi_v7_replay.zarr")],
+    )
     p.add_argument("--seq_len", type=int, default=8)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=8)
 
     # image / patching
-    p.add_argument("--H", type=int, default=128)
-    p.add_argument("--W", type=int, default=128)
+    p.add_argument("--H", type=int, default=96)
+    p.add_argument("--W", type=int, default=96)
     p.add_argument("--C", type=int, default=3)
-    p.add_argument("--patch", type=int, default=4)
+    p.add_argument("--patch", type=int, default=16)
 
     # model
     p.add_argument("--d_model", type=int, default=256)

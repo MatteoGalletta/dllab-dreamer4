@@ -20,3 +20,4 @@ dependencies:
     - torchrl==0.10.0
     - transformers==4.56.2
     - wandb==0.22.1
+    - gdown==6.1.0
