@@ -615,7 +615,7 @@ def train(args):
 
     # ---- data ----
     dataset = PushTSequenceDataset(
-        data_dirs=args.data_dirs,
+        h5_path=args.dataset,
         seq_len=args.seq_len,
     )
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
@@ -904,12 +904,9 @@ if __name__ == "__main__":
 
     # data (if using multiple datasets, make sure they align in order)
     p.add_argument(
-        "--data-dirs",
-        "--data_dirs",
-        dest="data_dirs",
-        type=str,
-        nargs="+",
-        default=[str(PROJECT_ROOT / "pusht_cchi_v7_replay.zarr")],
+        "--dataset",
+        dest="dataset",
+        type=str
     )
     p.add_argument("--seq_len", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)

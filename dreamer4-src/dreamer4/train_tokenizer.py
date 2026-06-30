@@ -186,7 +186,7 @@ def train(args):
 
     # ---- data ----
     dataset = PushTSequenceDataset(
-        data_dirs=args.data_dirs,
+        h5_path=args.dataset,
         seq_len=args.seq_len,
     )
 
@@ -411,20 +411,17 @@ if __name__ == "__main__":
 
     # data
     p.add_argument(
-        "--data-dirs",
-        "--data_dirs",
-        dest="data_dirs",
+        "--dataset",
+        dest="dataset",
         type=str,
-        nargs="+",
-        default=[str(PROJECT_ROOT / "pusht_cchi_v7_replay.zarr")],
     )
     p.add_argument("--seq_len", type=int, default=8)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=8)
 
     # image / patching
-    p.add_argument("--H", type=int, default=96)
-    p.add_argument("--W", type=int, default=96)
+    p.add_argument("--H", type=int, default=224)
+    p.add_argument("--W", type=int, default=224)
     p.add_argument("--C", type=int, default=3)
     p.add_argument("--patch", type=int, default=16)
 

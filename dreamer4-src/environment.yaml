@@ -20,5 +20,8 @@ dependencies:
     - torchrl==0.10.0
     - transformers==4.56.2
     - wandb==0.22.1
-    - gdown==6.1.0
     - zarr==2.18.3
+    - zstandard==0.25.0
+    - h5py==3.16.0
+    - hdf5plugin==7.0.0
+    - huggingface_hub==0.36.2
