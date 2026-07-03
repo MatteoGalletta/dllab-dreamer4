@@ -188,6 +188,7 @@ def train(args):
     dataset = PushTSequenceDataset(
         h5_path=args.dataset,
         seq_len=args.seq_len,
+        action_chunk_size=args.action_chunk_size,
     )
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
@@ -417,7 +418,8 @@ if __name__ == "__main__":
     )
     p.add_argument("--seq_len", type=int, default=8)
     p.add_argument("--num_workers", type=int, default=8)
-    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--action_chunk_size", type=int, default=5)
 
     # image / patching
     p.add_argument("--H", type=int, default=224)
@@ -455,7 +457,7 @@ if __name__ == "__main__":
     # logging / viz
     p.add_argument("--log_every", type=int, default=100)
     p.add_argument("--print_every", type=int, default=100)
-    p.add_argument("--viz_every", type=int, default=500)
+    p.add_argument("--viz_every", type=int, default=1000)
     p.add_argument("--viz_max_items", type=int, default=4)
     p.add_argument("--viz_max_T", type=int, default=8)
 
@@ -475,3 +477,4 @@ if __name__ == "__main__":
     p.add_argument("--compile", action="store_true")
 
     train(p.parse_args())
+# torchrun --nproc_per_node=8 train_tokenizer.py --dataset /data2/ws1/lagandua-MySpace/pusht_expert_train.h5 --wandb_mode online

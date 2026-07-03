@@ -1,2 +1,6 @@
 /pusht_cchi_v7_replay.zarr
 pusht_cchi_v7_replay.zarr.zip
+
+# logs
+*/logs/*
+*/wandb/*

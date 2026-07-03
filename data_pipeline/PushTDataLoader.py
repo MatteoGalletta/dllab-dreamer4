@@ -8,9 +8,11 @@ import torch
 from torch.utils.data import DataLoader
 
 class PushTSequenceDataset(Dataset):
-    def __init__(self, h5_path, seq_len=50):
+    def __init__(self, h5_path, seq_len=50, action_chunk_size=5):
         self.h5_path = h5_path
         self.seq_len = seq_len
+        self.action_chunk_size = action_chunk_size
+        self.raw_seq_len = seq_len * action_chunk_size
         
         # Öffne die Datei einmal kurz, um die Metadaten zu lesen
         with h5py.File(self.h5_path, 'r') as f:
@@ -26,7 +28,7 @@ class PushTSequenceDataset(Dataset):
         
         for end_idx in self.episode_ends:
             # end_idx ist der exklusive oder inklusive Endpunkt der Episode
-            for i in range(episode_start, end_idx - self.seq_len + 1):
+            for i in range(episode_start, end_idx - self.raw_seq_len + 1):
                 self.valid_start_indices.append(i)
             episode_start = end_idx
 
@@ -35,13 +37,18 @@ class PushTSequenceDataset(Dataset):
 
     def __getitem__(self, idx):
         start_idx = self.valid_start_indices[idx]
-        end_idx = start_idx + self.seq_len
+        end_idx = start_idx + self.raw_seq_len
         
         with h5py.File(self.h5_path, 'r') as f:
             # Lade den zusammenhängenden Chunk aus der H5-Datei
-            images = f['pixels'][start_idx:end_idx]    # Shape: (seq_len, 224, 224, 3)
-            actions = f['action'][start_idx:end_idx]  # Shape: (seq_len, 2)
-            states = f['state'][start_idx:end_idx]    # Shape: (seq_len, 7) - falls vorhanden
+            images = f['pixels'][start_idx:end_idx]    # Shape: (raw_seq_len, 224, 224, 3)
+            actions = f['action'][start_idx:end_idx]  # Shape: (raw_seq_len, 2)
+            states = f['state'][start_idx:end_idx]    # Shape: (raw_seq_len, 7) - falls vorhanden
+
+        # One image/state per action chunk (first frame of each chunk).
+        images = images[::self.action_chunk_size]
+        states = states[::self.action_chunk_size]
+        actions = actions.reshape(self.seq_len, -1)
         
         # Konvertierung in PyTorch-Tensoren
         # Dreamer erwartet Bilder meist im Format (Sequence, Channels, Height, Width)
@@ -52,14 +59,25 @@ class PushTSequenceDataset(Dataset):
         
         return {
             "image": images,   # [seq_len, 3, 224, 224]
-            "action": actions, # [seq_len, 2]
-            "state": states    # [seq_len, 5]
+            "action": actions, # [seq_len, action_chunk_size*2]
+            "state": states    # [seq_len, state_dim]
         }
         
 
-def create_pusht_dataloader(h5_path=None, data_dirs=None, batch_size=1, seq_len=64, num_workers=2):
+def create_pusht_dataloader(
+    h5_path=None,
+    data_dirs=None,
+    batch_size=1,
+    seq_len=64,
+    action_chunk_size=5,
+    num_workers=2,
+):
 
-    dataset = PushTSequenceDataset(h5_path=h5_path, seq_len=seq_len)
+    dataset = PushTSequenceDataset(
+        h5_path=h5_path,
+        seq_len=seq_len,
+        action_chunk_size=action_chunk_size,
+    )
     
     loader = DataLoader(
         dataset,

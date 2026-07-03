@@ -735,7 +735,7 @@ def train(args):
                     frames = frames.float()
 
                 if args.use_actions:
-                    raw_actions = batch["action"].to(device, non_blocking=True).clamp(-1, 1)  # (B,T,2)
+                    raw_actions = batch["action"].to(device, non_blocking=True).clamp(-1, 1)  # (B,T,action_chunk_size*2)
                     actions = torch.zeros((*raw_actions.shape[:-1], 16), device=device, dtype=torch.float32)
                     actions[..., : raw_actions.shape[-1]] = raw_actions.float()
                     act_mask = torch.zeros(16, device=device, dtype=torch.float32)
@@ -910,7 +910,8 @@ if __name__ == "__main__":
     )
     p.add_argument("--seq_len", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)
-    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--action_chunk_size", type=int, default=5)
 
     # tokenizer restore
     p.add_argument("--tokenizer_ckpt", type=str, default="./logs/tokenizer_ckpts/latest.pt")
@@ -952,7 +953,7 @@ if __name__ == "__main__":
     p.add_argument("--grad_clip", type=float, default=1.0)
 
     # eval / viz
-    p.add_argument("--eval_every", type=int, default=1_000)
+    p.add_argument("--eval_every", type=int, default=2500)
     p.add_argument("--eval_batch_size", type=int, default=4)
     p.add_argument("--eval_max_items", type=int, default=4)
     p.add_argument("--eval_ctx", type=int, default=8)
@@ -961,7 +962,7 @@ if __name__ == "__main__":
     p.add_argument("--eval_d", type=float, default=0.25)
 
     # logging
-    p.add_argument("--log_every", type=int, default=200)
+    p.add_argument("--log_every", type=int, default=250)
 
     # wandb
     p.add_argument("--wandb_project", type=str, default="dreamer4-dynamics")
@@ -979,3 +980,5 @@ if __name__ == "__main__":
     p.add_argument("--compile", action="store_true")
 
     train(p.parse_args())
+
+# torchrun --nproc_per_node=8 train_dynamics.py --dataset /data2/ws1/lagandua-MySpace/pusht_expert_train.h5 --tokenizer_ckpt ./logs/tokenizer_ckpts/step_0000000.pt --use_actions --wandb_mode online 
