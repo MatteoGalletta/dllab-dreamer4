@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, DistributedSampler
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -24,6 +24,22 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from data_pipeline.PushTDataLoader import PushTSequenceDataset
+
+DREAMER4_MODEL_PATH = PROJECT_ROOT / "dreamer4-src" / "dreamer4" / "model.py"
+
+
+def load_dreamer4_model_module():
+    spec = importlib.util.spec_from_file_location("dreamer4_model_bc", DREAMER4_MODEL_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load Dreamer4 model module from {DREAMER4_MODEL_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+dreamer4_model = load_dreamer4_model_module()
+Dreamer4Encoder = dreamer4_model.Encoder
+temporal_patchify = dreamer4_model.temporal_patchify
 
 if importlib.util.find_spec("wandb") is not None:
     wandb = importlib.import_module("wandb")
@@ -101,18 +117,16 @@ def init_distributed() -> tuple[bool, int, int, int]:
     return ddp, rank, world_size, local_rank
 
 
-@torch.no_grad()
-class CNNPolicy(nn.Module):
+class CNNBackbone(nn.Module):
     def __init__(
         self,
         *,
         in_channels: int,
-        action_dim: int,
-        hidden_dim: int,
-        dropout: float,
+        feature_dim: int = 256,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
+        self.feature_dim = int(feature_dim)
 
         def conv_block(in_ch: int, out_ch: int, *, stride: int = 2) -> nn.Sequential:
             kernel = 5 if stride == 2 else 3
@@ -133,20 +147,127 @@ class CNNPolicy(nn.Module):
             nn.AdaptiveAvgPool2d((1, 1)),
         )
 
-        self.head = nn.Sequential(
+        self.proj = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(256, hidden_dim),
+            nn.Linear(256, self.feature_dim),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, action_dim),
         )
 
     def forward(self, x_btchw: torch.Tensor) -> torch.Tensor:
         B, T, C, H, W = x_btchw.shape
         x = x_btchw.reshape(B * T, C, H, W)
-        logits = self.head(self.backbone(x))
+        features = self.proj(self.backbone(x))
+        return features.view(B, T, -1)
+
+
+class TokenizerBackbone(nn.Module):
+    def __init__(self, encoder: nn.Module, patch: int):
+        super().__init__()
+        self.encoder = encoder
+        self.patch = int(patch)
+        latent_dim = int(self.encoder.n_latents) * int(self.encoder.bottleneck_proj.out_features)
+        self.feature_dim = latent_dim
+
+    def forward(self, x_btchw: torch.Tensor) -> torch.Tensor:
+        patches = temporal_patchify(x_btchw, self.patch)
+        with torch.no_grad():
+            z, _ = self.encoder(patches)
+        return z.reshape(z.shape[0], z.shape[1], -1)
+
+
+class ActionClassifier(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int, action_dim: int, dropout: float):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, action_dim),
+        )
+
+    def forward(self, features_btD: torch.Tensor) -> torch.Tensor:
+        B, T, D = features_btD.shape
+        logits = self.net(features_btD.reshape(B * T, D))
         actions = torch.tanh(logits)
         return actions.view(B, T, -1)
+
+
+class Policy(nn.Module):
+    def __init__(self, backbone: nn.Module, classifier: ActionClassifier):
+        super().__init__()
+        self.backbone = backbone
+        self.classifier = classifier
+
+    def forward(self, x_btchw: torch.Tensor) -> torch.Tensor:
+        features = self.backbone(x_btchw)
+        return self.classifier(features)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if isinstance(self.backbone, TokenizerBackbone):
+            self.backbone.eval()
+            self.backbone.requires_grad_(False)
+        return self
+
+
+def _strip_prefix(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
+    if not any(key.startswith(prefix) for key in state_dict):
+        return state_dict
+    return {key[len(prefix):]: value for key, value in state_dict.items() if key.startswith(prefix)}
+
+
+def load_tokenizer_encoder(tokenizer_ckpt_name: str) -> nn.Module:
+    ckpt_path = Path(tokenizer_ckpt_name)
+    if not ckpt_path.is_absolute():
+        ckpt_path = PROJECT_ROOT / "logs" / "tokenizer_ckpts" / tokenizer_ckpt_name
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    ckpt_args = ckpt.get("args", {})
+    if not isinstance(ckpt_args, dict):
+        ckpt_args = vars(ckpt_args)
+
+    patch = int(ckpt_args.get("patch", 16))
+    h = int(ckpt_args.get("H", 224))
+    w = int(ckpt_args.get("W", 224))
+    c = int(ckpt_args.get("C", 3))
+    d_model = int(ckpt_args.get("d_model", 256))
+    n_heads = int(ckpt_args.get("n_heads", 4))
+    depth = int(ckpt_args.get("depth", 8))
+    n_latents = int(ckpt_args.get("n_latents", 16))
+    d_bottleneck = int(ckpt_args.get("d_bottleneck", 32))
+    dropout = float(ckpt_args.get("dropout", 0.0))
+    mlp_ratio = float(ckpt_args.get("mlp_ratio", 4.0))
+    time_every = int(ckpt_args.get("time_every", 1))
+    mae_p_min = float(ckpt_args.get("mae_p_min", 0.0))
+    mae_p_max = float(ckpt_args.get("mae_p_max", 0.9))
+    scale_pos_embeds = bool(ckpt_args.get("scale_pos_embeds", False))
+
+    n_patches = (h // patch) * (w // patch)
+    patch_dim = patch * patch * c
+    encoder = Dreamer4Encoder(
+        patch_dim=patch_dim,
+        d_model=d_model,
+        n_latents=n_latents,
+        n_patches=n_patches,
+        n_heads=n_heads,
+        depth=depth,
+        d_bottleneck=d_bottleneck,
+        dropout=dropout,
+        mlp_ratio=mlp_ratio,
+        time_every=time_every,
+        mae_p_min=mae_p_min,
+        mae_p_max=mae_p_max,
+        scale_pos_embeds=scale_pos_embeds,
+    )
+
+    state_dict = ckpt.get("model", ckpt)
+    if isinstance(state_dict, dict):
+        state_dict = _strip_prefix(state_dict, "module.")
+        state_dict = _strip_prefix(state_dict, "encoder.")
+    encoder.load_state_dict(state_dict, strict=True)
+    encoder.requires_grad_(False)
+    encoder.eval()
+    encoder.patch = patch
+    return encoder
 
 
 def save_ckpt(path: Path, *, step: int, epoch: int, model, opt, scaler, args: argparse.Namespace):
@@ -205,12 +326,21 @@ def train(args):
 
     # ---- model ----
     action_dim = args.action_chunk_size * 2
-    model = CNNPolicy(
-        in_channels=args.C,
-        action_dim=action_dim,
+    if args.tokenizer_ckpt_name:
+        encoder = load_tokenizer_encoder(args.tokenizer_ckpt_name)
+        backbone = TokenizerBackbone(encoder, patch=int(encoder.patch))
+        backbone_dim = backbone.feature_dim
+    else:
+        backbone = CNNBackbone(in_channels=args.C)
+        backbone_dim = backbone.feature_dim
+
+    classifier = ActionClassifier(
+        in_dim=backbone_dim,
         hidden_dim=args.hidden_dim,
+        action_dim=action_dim,
         dropout=args.dropout,
-    ).to(device)
+    )
+    model = Policy(backbone=backbone, classifier=classifier).to(device)
 
     if is_rank0():
         print(model)
@@ -226,7 +356,7 @@ def train(args):
         )
 
     # ---- optim ----
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
     use_amp = device_type in {"cuda", "xpu"}
     scaler = GradScaler(device=device_type, enabled=use_amp)
 
@@ -361,6 +491,12 @@ if __name__ == "__main__":
     # model
     p.add_argument("--hidden_dim", type=int, default=512)
     p.add_argument("--dropout", type=float, default=0.05)
+    p.add_argument(
+        "--tokenizer_ckpt_name",
+        type=str,
+        default=None,
+        help="optional tokenizer checkpoint filename under logs/tokenizer_ckpts",
+    )
 
     # optim
     p.add_argument("--lr", type=float, default=1e-4)
