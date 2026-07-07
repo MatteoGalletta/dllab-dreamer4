@@ -270,11 +270,11 @@ def dynamics_pretrain_loss(
         sigma_plus = sigma_self + d_half
         sigma_idx_plus = sigma_idx_self + (torch.tensor(k_max, device=device, dtype=torch.float32) * d_half).to(torch.long)
 
-        z1_hat_half1, _ = dynamics(actions[B_emp:] if actions is not None else None, step_idx_half, sigma_idx_self, z_tilde_self, act_mask=act_mask_self, agent_tokens=agent_tokens[B_emp:] if agent_tokens is not None else None)
+        z1_hat_half1, _ = dynamics(actions[B_emp:] if actions is not None else None, step_idx_half, sigma_idx_self, z_tilde_self, act_mask=act_mask_full, agent_tokens=agent_tokens[B_emp:] if agent_tokens is not None else None)
         b_prime = (z1_hat_half1.float() - z_tilde_self.float()) / (1.0 - sigma_self).clamp_min(1e-6)[..., None, None]
         z_prime = z_tilde_self.float() + b_prime * d_half[..., None, None]
 
-        z1_hat_half2, _ = dynamics(actions[B_emp:] if actions is not None else None, step_idx_half, sigma_idx_plus, z_prime.to(z_tilde_self.dtype), act_mask=act_mask_self, agent_tokens=agent_tokens[B_emp:] if agent_tokens is not None else None)
+        z1_hat_half2, _ = dynamics(actions[B_emp:] if actions is not None else None, step_idx_half, sigma_idx_plus, z_prime.to(z_tilde_self.dtype), act_mask=act_mask_full, agent_tokens=agent_tokens[B_emp:] if agent_tokens is not None else None)
         b_doubleprime = (z1_hat_half2.float() - z_prime.float()) / (1.0 - sigma_plus).clamp_min(1e-6)[..., None, None]
 
         vhat_sigma = (z1_hat_self.float() - z_tilde_self.float()) / (1.0 - sigma_self).clamp_min(1e-6)[..., None, None]
@@ -617,6 +617,7 @@ def train(args):
     dataset = PushTSequenceDataset(
         h5_path=args.dataset,
         seq_len=args.seq_len,
+        action_chunk_size=args.action_chunk_size,
     )
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
     loader = DataLoader(
