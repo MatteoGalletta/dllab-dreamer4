@@ -926,9 +926,9 @@ if __name__ == "__main__":
     p.add_argument("--scale_pos_embeds", action="store_true")
 
     # dynamics arch
-    p.add_argument("--d_model_dyn", type=int, default=512)
+    p.add_argument("--d_model_dyn", type=int, default=1024)
     p.add_argument("--dyn_depth", type=int, default=8)
-    p.add_argument("--n_heads", type=int, default=4)
+    p.add_argument("--n_heads", type=int, default=8)
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--mlp_ratio", type=float, default=4.0)
     p.add_argument("--time_every", type=int, default=1)
