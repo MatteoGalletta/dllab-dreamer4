@@ -1,5 +1,6 @@
 # train_reward.py
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import time
 import random
 import argparse
@@ -14,7 +15,8 @@ import torch.distributed as dist
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, DistributedSampler
 
-import wandb
+from torch.utils.tensorboard import SummaryWriter
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -221,12 +223,6 @@ def is_rank0() -> bool:
     return int(os.environ.get("RANK", "0")) == 0
 
 
-def get_wandb_mode(args: argparse.Namespace) -> str:
-    mode = getattr(args, "wandb_mode", "disabled") or "disabled"
-    if mode == "online" and not os.environ.get("WANDB_API_KEY") and not (Path.home() / ".netrc").exists():
-        return "disabled"
-    return mode
-
 
 def get_runtime_device() -> tuple[torch.device, str]:
     if torch.cuda.is_available():
@@ -423,14 +419,13 @@ def train(args):
         dist.broadcast(pos_weight_t, src=0)
     pos_weight = pos_weight_t.squeeze(0)
 
+    writer = None
     if is_rank0():
-        wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name,
-            entity=args.wandb_entity,
-            mode=get_wandb_mode(args),
-            config=vars(args),
-        )
+        from datetime import datetime
+        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tb_log_dir = os.path.join(args.ckpt_dir, "tensorboard_logs", f"run_{current_time}")
+        writer = SummaryWriter(log_dir=tb_log_dir)
+        print(f"--> TensorBoard logging initialized at: {tb_log_dir}")
 
     step = 0
     start_epoch = 0
@@ -473,20 +468,17 @@ def train(args):
                 scaler.step(opt)
                 scaler.update()
 
+
                 if is_rank0() and (step % args.log_every == 0):
                     precision, recall, f1 = compute_pr_metrics(logits.detach(), r)
-                    wandb.log(
-                        {
-                            "loss/bce": float(loss.item()),
-                            "train/precision": precision,
-                            "train/recall": recall,
-                            "train/f1": f1,
-                            "train/pos_frac": float(r.mean().item()),
-                            "lr": float(opt.param_groups[0]["lr"]),
-                            "time/hrs": (time.time() - t0) / 3600.0,
-                        },
-                        step=step,
-                    )
+
+                    writer.add_scalar("loss/bce", float(loss.item()), global_step=step)
+                    writer.add_scalar("train/precision", precision, global_step=step)
+                    writer.add_scalar("train/recall", recall, global_step=step)
+                    writer.add_scalar("train/f1", f1, global_step=step)
+                    writer.add_scalar("train/pos_frac", float(r.mean().item()), global_step=step)
+                    writer.add_scalar("lr", float(opt.param_groups[0]["lr"]), global_step=step)
+                    writer.flush()
 
                 if is_rank0() and (step % args.print_every == 0):
                     precision, recall, f1 = compute_pr_metrics(logits.detach(), r)
@@ -494,7 +486,7 @@ def train(args):
                           f"| P={precision:.3f} R={recall:.3f} F1={f1:.3f}")
 
                 if is_rank0() and args.eval_every > 0 and (step % args.eval_every == 0) and step > 0:
-                    evaluate(reward_head, encoder, val_loader, tok_args, device, device_type, use_amp, step)
+                    evaluate(reward_head, encoder, val_loader, tok_args, device, device_type, use_amp, step, writer)
                     reward_head.train()
 
                 if is_rank0() and args.save_every > 0 and (step % args.save_every == 0) and step > 0:
@@ -513,7 +505,7 @@ def train(args):
 
 
 @torch.no_grad()
-def evaluate(reward_head, encoder, val_loader, tok_args, device, device_type, use_amp, step):
+def evaluate(reward_head, encoder, val_loader, tok_args, device, device_type, use_amp, step, writer=None):
     reward_head.eval()
     all_logits, all_labels = [], []
     for batch in val_loader:
@@ -530,7 +522,10 @@ def evaluate(reward_head, encoder, val_loader, tok_args, device, device_type, us
     labels = torch.cat(all_labels)
     precision, recall, f1 = compute_pr_metrics(logits, labels)
     print(f"[eval @ step {step}] P={precision:.3f} R={recall:.3f} F1={f1:.3f}")
-    wandb.log({"val/precision": precision, "val/recall": recall, "val/f1": f1}, step=step)
+    if is_rank0() and writer is not None:
+        writer.add_scalar("val/precision", precision, global_step=step)
+        writer.add_scalar("val/recall", recall, global_step=step)
+        writer.add_scalar("val/f1", f1, global_step=step)
 
 
 if __name__ == "__main__":
@@ -565,18 +560,12 @@ if __name__ == "__main__":
 
     # logging
     p.add_argument("--log_every", type=int, default=50)
-    p.add_argument("--print_every", type=int, default=200)
-    p.add_argument("--eval_every", type=int, default=1000)
-
-    # wandb
-    p.add_argument("--wandb_project", type=str, default="dreamer4-reward")
-    p.add_argument("--wandb_run_name", type=str, default="default")
-    p.add_argument("--wandb_entity", type=str, default=None)
-    p.add_argument("--wandb_mode", type=str, default="disabled", choices=["disabled", "offline", "online"])
+    p.add_argument("--print_every", type=int, default=100)
+    p.add_argument("--eval_every", type=int, default=2000)
 
     # ckpt
     p.add_argument("--ckpt_dir", type=str, default="./logs/reward_ckpts")
-    p.add_argument("--save_every", type=int, default=5_000)
+    p.add_argument("--save_every", type=int, default=2000)
     p.add_argument("--resume", type=str, default=None)
 
     # misc
