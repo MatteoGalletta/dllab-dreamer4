@@ -250,20 +250,22 @@ class TrainConfig:
     actor_hidden_dim: int = 512
     actor_dropout: float = 0.05
 
-    bc_prior_path: str = "local_models/behavior_cloning/bc_prior.pt"
+    bc_prior_path: str = "logs/behavior_cloning_ckpts/latest.pt"
     prior_loss_coef: float = 0.05
     prior_loss_decay: float = 0.997
-    tokenizer_path: str = "local_models/tokenizer/tokenizer.pt"
+    tokenizer_path: str = "logs/tokenizer_ckpts/latest.pt"
     tokenizer_device: str = "auto"
 
     seed: int = 42
     device: str = "auto"
     vector_env: str = "sync"
-    save_path: str = "local_models/ppo_online/ppo_pusht_model.pth"
+    save_path: str = "logs/ppo_online_ckpts/latest.pth"
 
 
 def resolve_device(device_name: str) -> torch.device:
     if device_name == "auto":
+        if torch.xpu.is_available():
+            return torch.device("xpu")
         if not torch.cuda.is_available():
             return torch.device("cpu")
 
