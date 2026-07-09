@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = Path(__file__).resolve().parent
+LOCAL_MODEL_ROOT = PROJECT_ROOT / "local_models"
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 if str(PROJECT_ROOT) not in sys.path:
@@ -78,8 +79,8 @@ def is_rank0() -> bool:
 
 def get_wandb_mode(args: argparse.Namespace) -> str:
     mode = getattr(args, "wandb_mode", "disabled") or "disabled"
-    if mode == "online" and not os.environ.get("WANDB_API_KEY") and not (Path.home() / ".netrc").exists():
-        return "disabled"
+    # if mode == "online" and not os.environ.get("WANDB_API_KEY") and not (Path.home() / ".netrc").exists():
+        # return "disabled"
     return mode
 
 def get_runtime_device() -> tuple[torch.device, str]:
@@ -219,7 +220,12 @@ def _strip_prefix(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str,
 def load_tokenizer_encoder(tokenizer_ckpt_name: str) -> nn.Module:
     ckpt_path = Path(tokenizer_ckpt_name)
     if not ckpt_path.is_absolute():
-        ckpt_path = PROJECT_ROOT / "logs" / "tokenizer_ckpts" / tokenizer_ckpt_name
+        candidate_paths = [
+            LOCAL_MODEL_ROOT / "tokenizer" / tokenizer_ckpt_name,
+            LOCAL_MODEL_ROOT / "tokenizer" / "tokenizer.pt",
+            LOCAL_MODEL_ROOT / "tokenizer" / "latest.pt",
+        ]
+        ckpt_path = next((path for path in candidate_paths if path.exists()), candidate_paths[0])
     ckpt = torch.load(ckpt_path, map_location="cpu")
     ckpt_args = ckpt.get("args", {})
     if not isinstance(ckpt_args, dict):
@@ -523,7 +529,7 @@ if __name__ == "__main__":
     p.add_argument("--wandb_mode", type=str, default="disabled", choices=["disabled", "offline", "online"], help="wandb logging mode")
 
     # ckpt
-    p.add_argument("--ckpt_dir", type=str, default="./logs/behavior_cloning_ckpts")
+    p.add_argument("--ckpt_dir", type=str, default="./local_models/behavior_cloning")
     p.add_argument("--save_every", type=int, default=5_000)
     p.add_argument("--resume", type=str, default=None)
 
