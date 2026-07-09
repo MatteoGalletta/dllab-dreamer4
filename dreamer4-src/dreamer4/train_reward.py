@@ -33,22 +33,6 @@ torch.backends.cudnn.allow_tf32 = True
 # ----------------------------------------------------------------------------
 # Reward labeling
 # ----------------------------------------------------------------------------
-def compute_terminal_reward_labels(ep_len: int, tail_frac: float = 0.1, min_tail: int = 3) -> np.ndarray:
-    """
-    Fallback reward: assumes expert demos end in success. Labels the final
-    `tail_frac` fraction of each episode (at least `min_tail` frames) as
-    reward=1, everything before as reward=0.
-
-    Replace this with compute_coverage_reward_labels() once we confirm the
-    `state` layout — this is a placeholder that only encodes "episode is
-    ending", not "task is actually solved" at each timestep.
-    """
-    tail = max(min_tail, int(round(ep_len * tail_frac)))
-    tail = min(tail, ep_len)
-    labels = np.zeros(ep_len, dtype=np.float32)
-    labels[ep_len - tail:] = 1.0
-    return labels
-
 
 def cluster_episode_goals(h5_path: str, xy_tol: float = 10.0) -> tuple[dict, list]:
     """
@@ -166,45 +150,20 @@ class PushTRewardDataset(PushTSequenceDataset):
 
     def __getitem__(self, idx):
         item = super().__getitem__(idx)
-        seq_len = item["image"].shape[0]
         start_idx = self.valid_start_indices[idx]
 
-        if self.reward_mode == "coverage":
-            ep_idx = self._episode_index_for_frame(start_idx)
-            scene_key = self.ep_to_scene_key[ep_idx]
-            goal_pose = self.scene_to_goal[scene_key]  # (3,) [x,y,theta]
+        ep_idx = self._episode_index_for_frame(start_idx)
+        scene_key = self.ep_to_scene_key[ep_idx]
+        goal_pose = self.scene_to_goal[scene_key]  # (3,) [x,y,theta]
 
-            # block pose is state dims [2:5], subsampled the same way as
-            # image/state in the parent class (one per action chunk)
-            block_states = item["state"][:, 2:5].numpy()  # (seq_len, 3)
+        block_states = item["state"][:, 2:5].numpy()  # (seq_len, 3)
 
-            dense_reward, binary_reward = compute_coverage_reward_labels(
-                block_states, goal_pose,
-                xy_norm=self.xy_norm, success_dist=self.success_dist,
-            )
-            item["reward"] = torch.from_numpy(binary_reward)
-            item["reward_dense"] = torch.from_numpy(dense_reward)
-
-        elif self.reward_mode == "terminal":
-            ep_end = None
-            for e in self.episode_ends:
-                if start_idx < e:
-                    ep_end = e
-                    break
-            raw_end_idx = start_idx + self.raw_seq_len
-            frames_to_ep_end = max(0, ep_end - raw_end_idx)
-            steps_to_ep_end = frames_to_ep_end // self.action_chunk_size
-
-            labels = np.zeros(seq_len, dtype=np.float32)
-            tail = max(3, int(round(seq_len * self.tail_frac)))
-            if steps_to_ep_end < tail:
-                cutoff = seq_len - (tail - steps_to_ep_end)
-                cutoff = max(0, min(seq_len, cutoff))
-                labels[cutoff:] = 1.0
-            item["reward"] = torch.from_numpy(labels)
-            item["reward_dense"] = torch.from_numpy(labels)
-        else:
-            raise ValueError(f"Unknown reward_mode: {self.reward_mode}")
+        dense_reward, binary_reward = compute_coverage_reward_labels(
+            block_states, goal_pose,
+            xy_norm=self.xy_norm, success_dist=self.success_dist,
+        )
+        item["reward"] = torch.from_numpy(binary_reward)
+        item["reward_dense"] = torch.from_numpy(dense_reward)
 
         return item
 
