@@ -1,58 +1,336 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import numpy as np
 
-from .networks import VectorActorCritic
+from .networks import BCStyleLatentActorCritic, VectorActorCritic
+
+
+@dataclass
+class PriorLoadInfo:
+    loaded: bool
+    message: str
+
+
+def _extract_state_dict(payload: Any) -> dict[str, torch.Tensor] | None:
+    if isinstance(payload, dict):
+        if payload and all(isinstance(k, str) for k in payload.keys()):
+            first_value = next(iter(payload.values()))
+            if torch.is_tensor(first_value):
+                return payload
+        for key in ("state_dict", "model_state_dict", "network", "model", "actor"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                state_dict = _extract_state_dict(nested)
+                if state_dict is not None:
+                    return state_dict
+    return None
+
+
+def _normalize_prior_keys(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    normalized: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        clean_key = key
+        for prefix in ("module.", "network."):
+            if clean_key.startswith(prefix):
+                clean_key = clean_key[len(prefix):]
+
+        if clean_key.startswith(("actor.", "critic.", "log_std")):
+            normalized[clean_key] = value
+            continue
+
+        # Accept actor-only checkpoints saved from the Sequential directly.
+        if clean_key[0].isdigit():
+            normalized[f"actor.{clean_key}"] = value
+            continue
+
+        normalized[clean_key] = value
+    return normalized
+
+
+def _strip_prefix(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
+    return {key[len(prefix):]: value for key, value in state_dict.items() if key.startswith(prefix)}
+
 
 class PPOAgent:
-    def __init__(self, state_dim, action_dim, lr=3e-4, clip_coef=0.2, ent_coef=0.01, vf_coef=0.5, max_grad_norm=0.5):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        self.network = VectorActorCritic(state_dim=state_dim, action_dim=action_dim).to(self.device)
-        self.optimizer = optim.Adam(self.network.parameters(), lr=lr, eps=1e-5)
-        
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        lr: float = 3e-4,
+        clip_coef: float = 0.2,
+        ent_coef: float = 0.003,
+        vf_coef: float = 0.5,
+        max_grad_norm: float = 0.5,
+        target_kl: float | None = None,
+        actor_output_tanh: bool = True,
+        bc_prior_path: str | None = None,
+        prior_loss_coef: float = 0.0,
+        prior_loss_decay: float = 1.0,
+        prior_log_std_init: float | None = None,
+        device: torch.device | str = "cpu",
+        network_type: str = "mlp",
+        actor_hidden_dim: int = 512,
+        actor_dropout: float = 0.05,
+    ):
+        self.device_override = torch.device(device)
+        if network_type == "bc_latent":
+            self.network = BCStyleLatentActorCritic(
+                feature_dim=state_dim,
+                action_dim=action_dim,
+                hidden_dim=actor_hidden_dim,
+                dropout=actor_dropout,
+            ).to(self.device_override)
+        else:
+            self.network = VectorActorCritic(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                actor_output_tanh=actor_output_tanh,
+            ).to(self.device_override)
+
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=lr,
+            eps=1e-5,
+        )
+
         self.clip_coef = clip_coef
         self.ent_coef = ent_coef
         self.vf_coef = vf_coef
         self.max_grad_norm = max_grad_norm
+        self.target_kl = target_kl
+        self.base_prior_loss_coef = prior_loss_coef
+        self.prior_loss_decay = prior_loss_decay
 
-    def update(self, buffer, advantages, returns, batch_size=64, ppo_epochs=10):
-        b_actions = buffer.actions.to(self.device)
-        b_logprobs = buffer.logprobs.to(self.device)
-        
-        inds = np.arange(buffer.max_size)
-        
-        for epoch in range(ppo_epochs):
-            np.random.shuffle(inds)
-            for start in range(0, buffer.max_size, batch_size):
+        self._prior_network: VectorActorCritic | None = None
+        self.network_type = network_type
+        self.prior_load_info = PriorLoadInfo(False, "No BC prior requested.")
+
+        if prior_log_std_init is not None:
+            with torch.no_grad():
+                self.network.log_std.fill_(prior_log_std_init)
+
+        if bc_prior_path is not None:
+            self.prior_load_info = self.load_bc_prior(
+                bc_prior_path=bc_prior_path,
+                state_dim=state_dim,
+                action_dim=action_dim,
+                actor_output_tanh=actor_output_tanh,
+                prior_log_std_init=prior_log_std_init,
+            )
+
+    @property
+    def device(self) -> torch.device:
+        return next(self.network.parameters()).device
+
+    def _get_buffer_attr(self, buffer: Any, names: tuple[str, ...]):
+        for name in names:
+            if hasattr(buffer, name):
+                return getattr(buffer, name)
+        raise AttributeError("Buffer is missing attributes: " + ", ".join(names))
+
+    def _to_tensor(self, x: Any, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        if isinstance(x, torch.Tensor):
+            return x.to(device=self.device, dtype=dtype)
+        return torch.as_tensor(x, device=self.device, dtype=dtype)
+
+    def _flatten_states(self, states: torch.Tensor) -> torch.Tensor:
+        if states.ndim >= 3:
+            return states.reshape(-1, *states.shape[2:])
+        if states.ndim == 2:
+            return states
+        raise ValueError(f"Unexpected state shape: {tuple(states.shape)}")
+
+    def _flatten_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        if actions.ndim == 3:
+            return actions.reshape(-1, actions.shape[-1])
+        if actions.ndim == 2:
+            return actions
+        raise ValueError(f"Unexpected action shape: {tuple(actions.shape)}")
+
+    def _flatten_logprobs(self, logprobs: torch.Tensor) -> torch.Tensor:
+        if logprobs.ndim == 2:
+            return logprobs.reshape(-1)
+        if logprobs.ndim == 1:
+            return logprobs
+        if logprobs.ndim == 3:
+            return logprobs.reshape(logprobs.shape[0] * logprobs.shape[1], -1).sum(dim=-1)
+        raise ValueError(f"Unexpected logprob shape: {tuple(logprobs.shape)}")
+
+    def current_prior_loss_coef(self, update_idx: int) -> float:
+        return self.base_prior_loss_coef * (self.prior_loss_decay ** max(update_idx, 0))
+
+    def load_bc_prior(
+        self,
+        bc_prior_path: str,
+        state_dim: int,
+        action_dim: int,
+        actor_output_tanh: bool,
+        prior_log_std_init: float | None,
+    ) -> PriorLoadInfo:
+        prior_path = Path(bc_prior_path)
+        if not prior_path.exists():
+            return PriorLoadInfo(False, f"BC prior not found at {prior_path}.")
+
+        try:
+            payload = torch.load(prior_path, map_location=self.device, weights_only=True)
+        except TypeError:
+            payload = torch.load(prior_path, map_location=self.device)
+        except Exception as error:
+            return PriorLoadInfo(False, f"Failed to load BC prior: {error}")
+
+        state_dict = _extract_state_dict(payload)
+        if state_dict is None:
+            return PriorLoadInfo(False, "BC prior format is unsupported.")
+
+        checkpoint_args = payload.get("args", {}) if isinstance(payload, dict) else {}
+        state_dict = _normalize_prior_keys(state_dict)
+        if self.network_type == "bc_latent":
+            classifier_state = _strip_prefix(state_dict, "classifier.")
+            if not classifier_state:
+                return PriorLoadInfo(False, "BC prior does not contain classifier weights compatible with bc_latent PPO.")
+            incompatible = self.network.classifier.load_state_dict(classifier_state, strict=False)
+        else:
+            actor_only = {k: v for k, v in state_dict.items() if k.startswith("actor.") or k == "log_std"}
+            if not actor_only:
+                actor_only = state_dict
+            incompatible = self.network.load_state_dict(actor_only, strict=False)
+
+        if self.network_type == "bc_latent":
+            prior_network = BCStyleLatentActorCritic(
+                feature_dim=state_dim,
+                action_dim=action_dim,
+                hidden_dim=getattr(self.network, "hidden_dim", 512),
+                dropout=0.0,
+            ).to(self.device)
+        else:
+            prior_network = VectorActorCritic(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                actor_output_tanh=actor_output_tanh,
+            ).to(self.device)
+        prior_network.load_state_dict(self.network.state_dict(), strict=False)
+        if prior_log_std_init is not None:
+            with torch.no_grad():
+                prior_network.log_std.fill_(prior_log_std_init)
+        prior_network.eval()
+        for parameter in prior_network.parameters():
+            parameter.requires_grad_(False)
+        self._prior_network = prior_network
+
+        missing = list(incompatible.missing_keys)
+        unexpected = list(incompatible.unexpected_keys)
+        parts = [f"Loaded BC prior from {prior_path}."]
+        if isinstance(checkpoint_args, dict):
+            for key in ("seq_len", "action_chunk_size", "hidden_dim", "tokenizer_ckpt_name"):
+                if key in checkpoint_args:
+                    parts.append(f"{key}={checkpoint_args[key]}")
+        if missing:
+            parts.append(f"Missing keys: {missing[:6]}")
+        if unexpected:
+            parts.append(f"Unexpected keys: {unexpected[:6]}")
+        return PriorLoadInfo(True, " ".join(parts))
+
+    def update(
+        self,
+        buffer: Any,
+        advantages: torch.Tensor,
+        returns: torch.Tensor,
+        batch_size: int,
+        ppo_epochs: int,
+        update_idx: int = 0,
+    ) -> dict[str, float]:
+        states = self._to_tensor(self._get_buffer_attr(buffer, ("states", "observations", "obs")))
+        actions = self._to_tensor(self._get_buffer_attr(buffer, ("actions", "acts")))
+        old_logprobs = self._to_tensor(self._get_buffer_attr(buffer, ("logprobs", "log_probs", "old_logprobs")))
+
+        b_states = self._flatten_states(states)
+        b_actions = self._flatten_actions(actions)
+        b_old_logprobs = self._flatten_logprobs(old_logprobs)
+
+        b_advantages = self._to_tensor(advantages).reshape(-1)
+        b_returns = self._to_tensor(returns).reshape(-1)
+
+        num_samples = b_states.shape[0]
+        b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std(unbiased=False) + 1e-8)
+        indices = np.arange(num_samples)
+
+        prior_loss_coef = self.current_prior_loss_coef(update_idx)
+
+        pg_loss_value = 0.0
+        v_loss_value = 0.0
+        entropy_value = 0.0
+        approx_kl_value = 0.0
+        clipfrac_value = 0.0
+        prior_loss_value = 0.0
+        num_minibatches = 0
+
+        for _ in range(ppo_epochs):
+            np.random.shuffle(indices)
+
+            for start in range(0, num_samples, batch_size):
                 end = start + batch_size
-                mb_inds = inds[start:end]
-                
-                b_states = buffer.states[mb_inds].to(self.device).float() 
-                
-                mb_actions = b_actions[mb_inds]
-                mb_logprobs = b_logprobs[mb_inds]
-                mb_advantages = advantages[mb_inds]
-                mb_returns = returns[mb_inds]
-                
-                mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-                
-                _, new_logprob, entropy, new_value = self.network.get_action_and_value(b_states, mb_actions)
-                
-                logratio = new_logprob - mb_logprobs
+                mb_inds = torch.as_tensor(indices[start:end], device=self.device, dtype=torch.long)
+
+                _, new_logprobs, entropy, new_values = self.network.get_action_and_value(
+                    b_states[mb_inds], b_actions[mb_inds]
+                )
+                new_values = new_values.squeeze(-1)
+
+                logratio = new_logprobs - b_old_logprobs[mb_inds]
                 ratio = logratio.exp()
-                
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - self.clip_coef, 1 + self.clip_coef)
-                actor_loss = torch.max(pg_loss1, pg_loss2).mean()
-                
-                critic_loss = 0.5 * ((new_value.view(-1) - mb_returns) ** 2).mean()
-                
+                mb_advantages = b_advantages[mb_inds]
+
+                pg_loss_unclipped = -mb_advantages * ratio
+                pg_loss_clipped = -mb_advantages * torch.clamp(ratio, 1.0 - self.clip_coef, 1.0 + self.clip_coef)
+                pg_loss = torch.max(pg_loss_unclipped, pg_loss_clipped).mean()
+
+                v_loss = 0.5 * ((new_values - b_returns[mb_inds]).pow(2)).mean()
                 entropy_loss = entropy.mean()
-                loss = actor_loss + self.vf_coef * critic_loss - self.ent_coef * entropy_loss
-                
-                self.optimizer.zero_grad()
+
+                prior_loss = torch.zeros((), device=self.device)
+                if self._prior_network is not None and prior_loss_coef > 0.0:
+                    with torch.no_grad():
+                        prior_mean = self._prior_network.actor_mean(b_states[mb_inds])
+                    policy_mean = self.network.actor_mean(b_states[mb_inds])
+                    prior_loss = torch.mean((policy_mean - prior_mean).pow(2))
+
+                loss = pg_loss + self.vf_coef * v_loss - self.ent_coef * entropy_loss + prior_loss_coef * prior_loss
+
+                self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
                 self.optimizer.step()
+
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1.0) - logratio).mean()
+                    clipfrac = ((ratio - 1.0).abs() > self.clip_coef).float().mean()
+
+                pg_loss_value += float(pg_loss.detach().cpu())
+                v_loss_value += float(v_loss.detach().cpu())
+                entropy_value += float(entropy_loss.detach().cpu())
+                approx_kl_value += float(approx_kl.detach().cpu())
+                clipfrac_value += float(clipfrac.detach().cpu())
+                prior_loss_value += float(prior_loss.detach().cpu())
+                num_minibatches += 1
+
+            if self.target_kl is not None:
+                mean_kl = approx_kl_value / max(1, num_minibatches)
+                if mean_kl > self.target_kl:
+                    break
+
+        denom = max(1, num_minibatches)
+        return {
+            "policy_loss": pg_loss_value / denom,
+            "value_loss": v_loss_value / denom,
+            "entropy": entropy_value / denom,
+            "approx_kl": approx_kl_value / denom,
+            "clipfrac": clipfrac_value / denom,
+            "prior_loss": prior_loss_value / denom,
+            "prior_loss_coef": prior_loss_coef,
+        }
