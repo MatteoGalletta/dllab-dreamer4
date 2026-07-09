@@ -1,14 +1,27 @@
 import torch
+import numpy as np
+
+
+def _as_torch_dtype(dtype):
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if dtype is None:
+        return torch.float32
+    try:
+        return torch.from_numpy(np.empty((), dtype=dtype)).dtype
+    except Exception:
+        return torch.float32
 
 class PPOVectorBuffer:
-    def __init__(self, buffer_size, num_envs, state_shape, action_dim, device):
+    def __init__(self, buffer_size, num_envs, state_shape, action_dim, device, state_dtype=torch.float32):
         self.device = device
         self.max_size = buffer_size
         self.num_envs = num_envs
         self.ptr = 0
         
         state_shape = tuple(state_shape) if isinstance(state_shape, (tuple, list)) else (state_shape,)
-        self.states = torch.zeros((buffer_size, num_envs, *state_shape), dtype=torch.float32).to(device)
+        self.state_dtype = _as_torch_dtype(state_dtype)
+        self.states = torch.zeros((buffer_size, num_envs, *state_shape), dtype=self.state_dtype).to(device)
         self.actions = torch.zeros((buffer_size, num_envs, action_dim), dtype=torch.float32).to(device)
         self.logprobs = torch.zeros((buffer_size, num_envs), dtype=torch.float32).to(device)
         self.rewards = torch.zeros((buffer_size, num_envs), dtype=torch.float32).to(device)
@@ -17,7 +30,7 @@ class PPOVectorBuffer:
 
     def store(self, states, actions, logprobs, rewards, dones, values):
         # Store vectorized rollout slices directly on the target device.
-        self.states[self.ptr] = torch.as_tensor(states, dtype=torch.float32, device=self.device)
+        self.states[self.ptr] = torch.as_tensor(states, dtype=self.state_dtype, device=self.device)
         self.actions[self.ptr] = actions.detach()
         self.logprobs[self.ptr] = logprobs.detach()
         self.rewards[self.ptr] = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)

@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
+from .tokenizer_utils import load_tokenizer_from_ckpt
+
 
 def layer_init(layer: nn.Linear, std: float = np.sqrt(2.0), bias_const: float = 0.0):
     nn.init.orthogonal_(layer.weight, std)
@@ -80,6 +82,121 @@ class BCActionClassifier(nn.Module):
         logits = self.net(features_btD.reshape(B * T, D))
         actions = torch.tanh(logits)
         return actions.view(B, T, -1)
+
+
+class TokenizerBackbone(nn.Module):
+    def __init__(self, tokenizer_ckpt: str, device: torch.device | str = "cpu"):
+        super().__init__()
+        self.device_override = torch.device(device)
+        tokenizer, info = load_tokenizer_from_ckpt(tokenizer_ckpt, self.device_override)
+        self.encoder = tokenizer.encoder
+        self.patch = int(info["patch"])
+        self.image_height = int(info["H"])
+        self.image_width = int(info["W"])
+        self.feature_dim = int(info["latent_dim"])
+        self.encoder.eval()
+        self.encoder.requires_grad_(False)
+
+    def _normalize_frames(self, image_sequence: torch.Tensor) -> torch.Tensor:
+        if image_sequence.dtype == torch.uint8:
+            return image_sequence.to(torch.float32) / 255.0
+        image_sequence = image_sequence.to(torch.float32)
+        if image_sequence.numel() > 0 and float(image_sequence.max().detach().cpu()) > 1.5:
+            image_sequence = image_sequence / 255.0
+        return image_sequence.clamp(0.0, 1.0)
+
+    def _patchify(self, x_btchw: torch.Tensor) -> torch.Tensor:
+        B, T, C, H, W = x_btchw.shape
+        patch = self.patch
+        if H % patch != 0 or W % patch != 0:
+            raise ValueError(f"Image shape {(H, W)} is not divisible by patch size {patch}.")
+        x = x_btchw.reshape(B * T, C, H, W)
+        x = x.unfold(2, patch, patch).unfold(3, patch, patch)
+        x = x.permute(0, 2, 3, 1, 4, 5).contiguous()
+        x = x.reshape(B, T, -1, C * patch * patch)
+        return x
+
+    def forward(self, image_sequence: torch.Tensor) -> torch.Tensor:
+        x = self._normalize_frames(image_sequence)
+        x = self._patchify(x)
+        with torch.no_grad():
+            z_btld, _ = self.encoder(x)
+        return z_btld.reshape(z_btld.shape[0], z_btld.shape[1], -1)
+
+
+class BCPixelActorCritic(nn.Module):
+    """
+    PPO actor-critic that matches the BC policy structure:
+    rendered image sequence -> tokenizer backbone -> BC classifier head.
+    """
+
+    def __init__(
+        self,
+        image_shape: tuple[int, ...],
+        action_dim: int,
+        tokenizer_ckpt: str,
+        hidden_dim: int = 512,
+        dropout: float = 0.05,
+        backbone_device: torch.device | str = "cpu",
+    ):
+        super().__init__()
+        self.image_shape = tuple(image_shape)
+        self.action_dim = action_dim
+        self.hidden_dim = hidden_dim
+        self.backbone = TokenizerBackbone(tokenizer_ckpt=tokenizer_ckpt, device=backbone_device)
+        self.classifier = BCActionClassifier(
+            in_dim=self.backbone.feature_dim,
+            hidden_dim=hidden_dim,
+            action_dim=action_dim,
+            dropout=dropout,
+        )
+        self.log_std = nn.Parameter(torch.full((1, action_dim), -1.0))
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(self.backbone.feature_dim, hidden_dim)),
+            nn.ReLU(),
+            layer_init(nn.Linear(hidden_dim, hidden_dim)),
+            nn.ReLU(),
+            layer_init(nn.Linear(hidden_dim, 1), std=1.0),
+        )
+
+    def _ensure_sequence(self, image_obs: torch.Tensor) -> torch.Tensor:
+        if image_obs.ndim == 4:
+            image_obs = image_obs.unsqueeze(1)
+        if image_obs.ndim != 5:
+            raise ValueError(
+                f"Expected image observations with shape (B, T, H, W, C) or (B, H, W, C), got {tuple(image_obs.shape)}"
+            )
+        if image_obs.shape[-1] != 3:
+            raise ValueError(f"Expected RGB images in the last dimension, got shape {tuple(image_obs.shape)}")
+        return image_obs.permute(0, 1, 4, 2, 3).contiguous()
+
+    def _last_features(self, image_obs: torch.Tensor) -> torch.Tensor:
+        sequence = self._ensure_sequence(image_obs)
+        features = self.backbone(sequence)
+        return features[:, -1, :]
+
+    def actor_mean(self, image_obs: torch.Tensor) -> torch.Tensor:
+        sequence = self._ensure_sequence(image_obs)
+        features = self.backbone(sequence)
+        action_sequence = self.classifier(features)
+        return action_sequence[:, -1, :]
+
+    def action_dist(self, image_obs: torch.Tensor) -> Normal:
+        mean = self.actor_mean(image_obs)
+        std = self.log_std.exp().expand_as(mean)
+        return Normal(mean, std)
+
+    def get_action_and_value(self, image_obs: torch.Tensor, action: torch.Tensor | None = None):
+        distribution = self.action_dist(image_obs)
+        if action is None:
+            action = distribution.sample()
+        value = self.get_value(image_obs)
+        log_prob = distribution.log_prob(action).sum(dim=-1)
+        entropy = distribution.entropy().sum(dim=-1)
+        return action, log_prob, entropy, value
+
+    def get_value(self, image_obs: torch.Tensor) -> torch.Tensor:
+        return self.critic(self._last_features(image_obs))
 
 
 class BCStyleLatentActorCritic(nn.Module):

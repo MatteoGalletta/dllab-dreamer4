@@ -12,12 +12,13 @@ import gymnasium as gym
 import gym_pusht
 import numpy as np
 import torch
+import torch.nn.functional as F
 import wandb
 from gymnasium.wrappers import FrameStackObservation
 
 from .agent import PPOAgent
 from .buffer import PPOVectorBuffer
-from .tokenizer_utils import TokenizerZEncoder
+from .tokenizer_utils import TokenizerZEncoder, load_tokenizer_from_ckpt
 
 
 class ActionChunkingTemporalEnsembleWrapper(gym.Wrapper):
@@ -171,6 +172,45 @@ class TokenizerLatentObsWrapper(gym.ObservationWrapper):
         return self.latent_encoder.encode_frame(self._render_frame())
 
 
+class RenderedImageObsWrapper(gym.ObservationWrapper):
+    """
+    Replace the state observation with rendered RGB frames resized to the
+    tokenizer/BC training resolution so PPO can reuse the full BC image prior.
+    """
+
+    def __init__(self, env: gym.Env, tokenizer_ckpt: str):
+        super().__init__(env)
+        _, info = load_tokenizer_from_ckpt(tokenizer_ckpt, torch.device("cpu"))
+        self.target_height = int(info["H"])
+        self.target_width = int(info["W"])
+        self.observation_space = gym.spaces.Box(
+            low=0,
+            high=255,
+            shape=(self.target_height, self.target_width, 3),
+            dtype=np.uint8,
+        )
+
+    def _render_frame(self) -> np.ndarray:
+        frame = self.env.render()
+        if frame is None:
+            raise RuntimeError("Expected renderable RGB frame for image observation.")
+        frame = np.asarray(frame, dtype=np.uint8)
+        if frame.shape[:2] != (self.target_height, self.target_width):
+            frame_tensor = torch.as_tensor(frame, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+            frame_tensor = F.interpolate(
+                frame_tensor,
+                size=(self.target_height, self.target_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+            frame = frame_tensor.squeeze(0).permute(1, 2, 0).clamp(0.0, 255.0).to(torch.uint8).cpu().numpy()
+        return frame
+
+    def observation(self, observation):
+        del observation
+        return self._render_frame()
+
+
 def as_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(np.asarray(value).squeeze())
@@ -250,16 +290,16 @@ class TrainConfig:
     actor_hidden_dim: int = 512
     actor_dropout: float = 0.05
 
-    bc_prior_path: str = "logs/behavior_cloning_ckpts/latest.pt"
-    prior_loss_coef: float = 0.05
+    bc_prior_path: str = "local_models/behavior_cloning/bc_prior.pt"
+    prior_loss_coef: float = 0.0
     prior_loss_decay: float = 0.997
-    tokenizer_path: str = "logs/tokenizer_ckpts/latest.pt"
+    tokenizer_path: str = "local_models/tokenizer/tokenizer.pt"
     tokenizer_device: str = "auto"
 
     seed: int = 42
     device: str = "auto"
     vector_env: str = "sync"
-    save_path: str = "logs/ppo_online_ckpts/latest.pth"
+    save_path: str = "local_models/ppo_online/ppo_pusht_model.pth"
 
 
 def resolve_device(device_name: str) -> torch.device:
@@ -296,7 +336,19 @@ def resolve_device(device_name: str) -> torch.device:
 
 def make_env(rank: int, seed: int, config: TrainConfig, render_mode: str | None = None):
     def _thunk():
-        env = gym.make("gym_pusht/PushT-v0", obs_type="state", render_mode=render_mode or "rgb_array")
+        tokenizer_info = None
+        if config.network_type in {"bc_pixels", "bc_latent"}:
+            _, tokenizer_info = load_tokenizer_from_ckpt(config.tokenizer_path, torch.device("cpu"))
+
+        env_kwargs: dict[str, Any] = {
+            "obs_type": "state",
+            "render_mode": render_mode or "rgb_array",
+        }
+        if tokenizer_info is not None:
+            env_kwargs["observation_width"] = int(tokenizer_info["W"])
+            env_kwargs["observation_height"] = int(tokenizer_info["H"])
+
+        env = gym.make("gym_pusht/PushT-v0", **env_kwargs)
         env = PushTDenseRewardWrapper(env)
         env = ActionChunkingTemporalEnsembleWrapper(
             env,
@@ -304,12 +356,18 @@ def make_env(rank: int, seed: int, config: TrainConfig, render_mode: str | None 
             max_step_pixels=config.max_step_pixels,
             ensemble_decay=config.ensemble_decay,
         )
-        env = TokenizerLatentObsWrapper(
-            env,
-            tokenizer_ckpt=config.tokenizer_path,
-            tokenizer_device=config.tokenizer_device,
-        )
-        env = FrameStackObservation(env, stack_size=config.obs_stack_size)
+        if config.network_type == "bc_pixels":
+            env = RenderedImageObsWrapper(env, tokenizer_ckpt=config.tokenizer_path)
+            env = FrameStackObservation(env, stack_size=config.obs_stack_size)
+        elif config.network_type == "bc_latent":
+            env = TokenizerLatentObsWrapper(
+                env,
+                tokenizer_ckpt=config.tokenizer_path,
+                tokenizer_device=config.tokenizer_device,
+            )
+            env = FrameStackObservation(env, stack_size=config.obs_stack_size)
+        else:
+            env = PushTObsWrapper(env)
         env.action_space.seed(seed + rank)
         env.observation_space.seed(seed + rank)
         return env
@@ -337,6 +395,13 @@ def train_pusht():
 
     device = policy_device
     print(f"Training starts on policy_device={device}, tokenizer_device={tokenizer_device}")
+    if config.network_type in {"bc_pixels", "bc_latent"}:
+        _, tokenizer_info = load_tokenizer_from_ckpt(config.tokenizer_path, torch.device("cpu"))
+        print(
+            "Tokenizer/image setup: "
+            f"H={tokenizer_info['H']} W={tokenizer_info['W']} "
+            f"latent_dim={tokenizer_info['latent_dim']}"
+        )
 
     env_fns = [make_env(rank, config.seed, config) for rank in range(config.num_envs)]
     if config.vector_env == "async":
@@ -355,6 +420,10 @@ def train_pusht():
     obs_shape = tuple(envs.single_observation_space.shape)
     state_dim = int(obs_shape[-1]) if config.network_type == "bc_latent" else int(np.prod(obs_shape))
     action_dim = int(envs.single_action_space.shape[0])
+    print(
+        f"Observation setup: network_type={config.network_type} "
+        f"obs_shape={obs_shape} state_dim={state_dim} action_dim={action_dim}"
+    )
 
     agent = PPOAgent(
         state_dim=state_dim,
@@ -374,6 +443,9 @@ def train_pusht():
         network_type=config.network_type,
         actor_hidden_dim=config.actor_hidden_dim,
         actor_dropout=config.actor_dropout,
+        obs_shape=obs_shape,
+        tokenizer_path=config.tokenizer_path,
+        backbone_device=tokenizer_device,
     )
     print(agent.prior_load_info.message)
 
@@ -383,6 +455,7 @@ def train_pusht():
         state_shape=obs_shape,
         action_dim=action_dim,
         device=device,
+        state_dtype=envs.single_observation_space.dtype,
     )
 
     num_updates = config.total_timesteps // (config.num_envs * config.rollout_steps)

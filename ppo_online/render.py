@@ -10,10 +10,13 @@ import numpy as np
 import torch
 from gymnasium.wrappers import FrameStackObservation
 
-from ppo_online.networks import BCStyleLatentActorCritic, VectorActorCritic
+from ppo_online.networks import BCPixelActorCritic, BCStyleLatentActorCritic, VectorActorCritic
+from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
 from ppo_online.train import (
     ActionChunkingTemporalEnsembleWrapper,
     PushTDenseRewardWrapper,
+    PushTObsWrapper,
+    RenderedImageObsWrapper,
     TokenizerLatentObsWrapper,
     TrainConfig,
     resolve_device,
@@ -28,10 +31,21 @@ def load_state_dict_safe(path: str, device: torch.device):
 
 
 def make_render_env(config: TrainConfig, video_folder: str):
+    tokenizer_info = None
+    if config.network_type in {"bc_pixels", "bc_latent"}:
+        _, tokenizer_info = load_tokenizer_from_ckpt(config.tokenizer_path, torch.device("cpu"))
+
+    env_kwargs = {
+        "obs_type": "state",
+        "render_mode": "rgb_array",
+    }
+    if tokenizer_info is not None:
+        env_kwargs["observation_width"] = int(tokenizer_info["W"])
+        env_kwargs["observation_height"] = int(tokenizer_info["H"])
+
     env = gym.make(
         "gym_pusht/PushT-v0",
-        obs_type="state",
-        render_mode="rgb_array",
+        **env_kwargs,
     )
     env = gym.wrappers.RecordVideo(
         env,
@@ -47,12 +61,18 @@ def make_render_env(config: TrainConfig, video_folder: str):
         max_step_pixels=config.max_step_pixels,
         ensemble_decay=config.ensemble_decay,
     )
-    env = TokenizerLatentObsWrapper(
-        env,
-        tokenizer_ckpt=config.tokenizer_path,
-        tokenizer_device=config.tokenizer_device,
-    )
-    env = FrameStackObservation(env, stack_size=config.obs_stack_size)
+    if config.network_type == "bc_pixels":
+        env = RenderedImageObsWrapper(env, tokenizer_ckpt=config.tokenizer_path)
+        env = FrameStackObservation(env, stack_size=config.obs_stack_size)
+    elif config.network_type == "bc_latent":
+        env = TokenizerLatentObsWrapper(
+            env,
+            tokenizer_ckpt=config.tokenizer_path,
+            tokenizer_device=config.tokenizer_device,
+        )
+        env = FrameStackObservation(env, stack_size=config.obs_stack_size)
+    else:
+        env = PushTObsWrapper(env)
     return env
 
 
@@ -70,7 +90,16 @@ def render_agent_to_video():
     state_dim = int(obs_shape[-1]) if config.network_type == "bc_latent" else int(np.prod(obs_shape))
     action_dim = int(env.action_space.shape[0])
 
-    if config.network_type == "bc_latent":
+    if config.network_type == "bc_pixels":
+        network = BCPixelActorCritic(
+            image_shape=obs_shape,
+            action_dim=action_dim,
+            tokenizer_ckpt=config.tokenizer_path,
+            hidden_dim=config.actor_hidden_dim,
+            dropout=config.actor_dropout,
+            backbone_device=config.tokenizer_device,
+        ).to(device)
+    elif config.network_type == "bc_latent":
         network = BCStyleLatentActorCritic(
             feature_dim=state_dim,
             action_dim=action_dim,

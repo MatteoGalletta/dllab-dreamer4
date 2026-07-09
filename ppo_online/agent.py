@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .networks import BCStyleLatentActorCritic, VectorActorCritic
+from .networks import BCPixelActorCritic, BCStyleLatentActorCritic, VectorActorCritic
 
 
 @dataclass
@@ -77,9 +77,28 @@ class PPOAgent:
         network_type: str = "mlp",
         actor_hidden_dim: int = 512,
         actor_dropout: float = 0.05,
+        obs_shape: tuple[int, ...] | None = None,
+        tokenizer_path: str | None = None,
+        backbone_device: torch.device | str = "cpu",
     ):
         self.device_override = torch.device(device)
-        if network_type == "bc_latent":
+        self.obs_shape = obs_shape
+        self.tokenizer_path = tokenizer_path
+        self.backbone_device = torch.device(backbone_device)
+        if network_type == "bc_pixels":
+            if obs_shape is None:
+                raise ValueError("obs_shape is required for bc_pixels PPO.")
+            if tokenizer_path is None:
+                raise ValueError("tokenizer_path is required for bc_pixels PPO.")
+            self.network = BCPixelActorCritic(
+                image_shape=obs_shape,
+                action_dim=action_dim,
+                tokenizer_ckpt=tokenizer_path,
+                hidden_dim=actor_hidden_dim,
+                dropout=actor_dropout,
+                backbone_device=backbone_device,
+            ).to(self.device_override)
+        elif network_type == "bc_latent":
             self.network = BCStyleLatentActorCritic(
                 feature_dim=state_dim,
                 action_dim=action_dim,
@@ -107,7 +126,7 @@ class PPOAgent:
         self.base_prior_loss_coef = prior_loss_coef
         self.prior_loss_decay = prior_loss_decay
 
-        self._prior_network: VectorActorCritic | None = None
+        self._prior_network: nn.Module | None = None
         self.network_type = network_type
         self.prior_load_info = PriorLoadInfo(False, "No BC prior requested.")
 
@@ -190,7 +209,16 @@ class PPOAgent:
 
         checkpoint_args = payload.get("args", {}) if isinstance(payload, dict) else {}
         state_dict = _normalize_prior_keys(state_dict)
-        if self.network_type == "bc_latent":
+        if self.network_type == "bc_pixels":
+            load_target = {
+                key: value
+                for key, value in state_dict.items()
+                if key.startswith("backbone.") or key.startswith("classifier.")
+            }
+            if not load_target:
+                return PriorLoadInfo(False, "BC prior does not contain backbone/classifier weights for bc_pixels PPO.")
+            incompatible = self.network.load_state_dict(load_target, strict=False)
+        elif self.network_type == "bc_latent":
             classifier_state = _strip_prefix(state_dict, "classifier.")
             if not classifier_state:
                 return PriorLoadInfo(False, "BC prior does not contain classifier weights compatible with bc_latent PPO.")
@@ -201,7 +229,16 @@ class PPOAgent:
                 actor_only = state_dict
             incompatible = self.network.load_state_dict(actor_only, strict=False)
 
-        if self.network_type == "bc_latent":
+        if self.network_type == "bc_pixels":
+            prior_network = BCPixelActorCritic(
+                image_shape=self.obs_shape or getattr(self.network, "image_shape"),
+                action_dim=action_dim,
+                tokenizer_ckpt=self.tokenizer_path or bc_prior_path,
+                hidden_dim=getattr(self.network, "hidden_dim", 512),
+                dropout=0.0,
+                backbone_device=self.backbone_device,
+            ).to(self.device)
+        elif self.network_type == "bc_latent":
             prior_network = BCStyleLatentActorCritic(
                 feature_dim=state_dim,
                 action_dim=action_dim,
