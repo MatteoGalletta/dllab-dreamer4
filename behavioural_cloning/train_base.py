@@ -79,8 +79,8 @@ def is_rank0() -> bool:
 
 def get_wandb_mode(args: argparse.Namespace) -> str:
     mode = getattr(args, "wandb_mode", "disabled") or "disabled"
-    if mode == "online" and not os.environ.get("WANDB_API_KEY") and not (Path.home() / ".netrc").exists():
-        return "disabled"
+    # if mode == "online" and not os.environ.get("WANDB_API_KEY") and not (Path.home() / ".netrc").exists():
+        # return "disabled"
     return mode
 
 def get_runtime_device() -> tuple[torch.device, str]:
