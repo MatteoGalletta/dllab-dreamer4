@@ -521,14 +521,24 @@ def train_pusht():
 
         wandb.log(wandb_log_dict, step=global_step)
 
+        mean_episode_return = wandb_log_dict.get("Environment/Mean_Episode_Return", float("nan"))
+        mean_coverage = wandb_log_dict.get("Environment/Mean_Coverage", float("nan"))
+        mean_active_chunks = wandb_log_dict.get("Chunking/Mean_Active_Chunks", float("nan"))
+        print(
+            f"update={update + 1}/{num_updates} "
+            f"step={global_step} "
+            f"episodes={len(rollout_returns)} "
+            f"mean_return={mean_episode_return:.2f} "
+            f"mean_cov={mean_coverage:.3f} "
+            f"step_reward={mean_step_reward:.3f} "
+            f"kl={stats['approx_kl']:.5f} "
+            f"entropy={stats['entropy']:.3f} "
+            f"chunks={mean_active_chunks:.2f}"
+        )
+
         if (update + 1) % 50 == 0:
             torch.save(agent.network.state_dict(), config.save_path)
             wandb.save(config.save_path)
-            print(
-                f"update={update + 1}/{num_updates} "
-                f"return={wandb_log_dict.get('Environment/Mean_Episode_Return', float('nan')):.2f} "
-                f"coverage={wandb_log_dict.get('Environment/Mean_Coverage', float('nan')):.3f}"
-            )
 
     print("Saving final model weights...")
     torch.save(agent.network.state_dict(), config.save_path)
