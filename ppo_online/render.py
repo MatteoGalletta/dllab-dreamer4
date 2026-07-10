@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 
 import gymnasium as gym
@@ -10,6 +11,7 @@ import numpy as np
 import torch
 from gymnasium.wrappers import FrameStackObservation
 
+from ppo_online.model_paths import resolve_bc_prior_path, resolve_ppo_checkpoint_path, resolve_tokenizer_path
 from ppo_online.networks import BCPixelActorCritic, BCStyleLatentActorCritic, VectorActorCritic
 from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
 from ppo_online.train import (
@@ -28,6 +30,63 @@ def load_state_dict_safe(path: str, device: torch.device):
         return torch.load(path, map_location=device, weights_only=True)
     except TypeError:
         return torch.load(path, map_location=device)
+
+
+def extract_checkpoint_state_dict(payload):
+    if isinstance(payload, dict):
+        if payload and all(isinstance(k, str) for k in payload.keys()):
+            first_value = next(iter(payload.values()))
+            if torch.is_tensor(first_value):
+                return payload
+        for key in ("state_dict", "model_state_dict", "network", "model", "actor"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                state_dict = extract_checkpoint_state_dict(nested)
+                if state_dict is not None:
+                    return state_dict
+    return None
+
+
+def load_bc_prior_into_network(network: torch.nn.Module, path: str, device: torch.device, network_type: str):
+    payload = load_state_dict_safe(path, device)
+    state_dict = extract_checkpoint_state_dict(payload)
+    if state_dict is None:
+        raise ValueError(f"Unsupported BC prior format in {path}")
+
+    cleaned = {}
+    for key, value in state_dict.items():
+        clean_key = key
+        for prefix in ("module.", "network."):
+            if clean_key.startswith(prefix):
+                clean_key = clean_key[len(prefix):]
+        cleaned[clean_key] = value
+
+    if network_type == "bc_latent":
+        classifier_state = {
+            key[len("classifier.") :]: value
+            for key, value in cleaned.items()
+            if key.startswith("classifier.")
+        }
+        if not classifier_state:
+            raise ValueError(f"No classifier weights found in BC prior {path}")
+        incompatible = network.classifier.load_state_dict(classifier_state, strict=False)
+    elif network_type == "bc_pixels":
+        actor_state = {
+            key: value
+            for key, value in cleaned.items()
+            if key.startswith("backbone.") or key.startswith("classifier.")
+        }
+        if not actor_state:
+            raise ValueError(f"No backbone/classifier weights found in BC prior {path}")
+        incompatible = network.load_state_dict(actor_state, strict=False)
+    else:
+        raise ValueError(f"BC prior loading is only supported for bc_latent/bc_pixels, got {network_type}")
+
+    print(
+        f"Loaded BC prior from {path}. "
+        f"missing={list(incompatible.missing_keys)[:6]} "
+        f"unexpected={list(incompatible.unexpected_keys)[:6]}"
+    )
 
 
 def make_render_env(config: TrainConfig, video_folder: str):
@@ -76,13 +135,38 @@ def make_render_env(config: TrainConfig, video_folder: str):
     return env
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Render PPO or BC-prior policy on PushT.")
+    parser.add_argument(
+        "--source",
+        choices=("ppo", "bc_prior"),
+        default="bc_prior",
+        help="Which weights to render.",
+    )
+    parser.add_argument(
+        "--model-path",
+        default=None,
+        help="Optional override checkpoint path. Defaults to TrainConfig save_path or bc_prior_path based on --source.",
+    )
+    return parser.parse_args()
+
+
 def render_agent_to_video():
+    args = parse_args()
     config = TrainConfig()
+    config.bc_prior_path = resolve_bc_prior_path(config.bc_prior_path)
+    config.tokenizer_path = resolve_tokenizer_path(config.tokenizer_path)
+    config.save_path = resolve_ppo_checkpoint_path(config.save_path)
     device = resolve_device(config.device)
     config.tokenizer_device = str(resolve_device(config.tokenizer_device))
-    model_path = config.save_path
+    model_path = args.model_path or (config.bc_prior_path if args.source == "bc_prior" else config.save_path)
+    if args.source == "bc_prior":
+        model_path = resolve_bc_prior_path(model_path)
+    else:
+        model_path = resolve_ppo_checkpoint_path(model_path)
     video_folder = "./videos"
     os.makedirs(video_folder, exist_ok=True)
+    print(f"Render paths: source={args.source} model={model_path} tokenizer={config.tokenizer_path}")
 
     env = make_render_env(config, video_folder)
 
@@ -113,8 +197,12 @@ def render_agent_to_video():
             actor_output_tanh=config.actor_output_tanh,
         ).to(device)
 
-    state_dict = load_state_dict_safe(model_path, device)
-    network.load_state_dict(state_dict)
+    if args.source == "bc_prior":
+        load_bc_prior_into_network(network, model_path, device, config.network_type)
+    else:
+        state_dict = load_state_dict_safe(model_path, device)
+        network.load_state_dict(state_dict)
+        print(f"Loaded PPO checkpoint from {model_path}.")
     network.eval()
 
     state, _ = env.reset()
@@ -139,6 +227,7 @@ def render_agent_to_video():
     print(f"Total dense reward: {total_reward:.3f}")
     if "coverage" in final_info:
         print(f"Coverage: {float(final_info['coverage']):.3f}")
+    print(f"Rendered source: {args.source}")
     print(f"Video saved to '{video_folder}'.")
 
     env.close()

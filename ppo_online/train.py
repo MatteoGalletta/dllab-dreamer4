@@ -18,6 +18,7 @@ from gymnasium.wrappers import FrameStackObservation
 
 from .agent import PPOAgent
 from .buffer import PPOVectorBuffer
+from .model_paths import resolve_bc_prior_path, resolve_ppo_checkpoint_path, resolve_tokenizer_path
 from .tokenizer_utils import TokenizerZEncoder, load_tokenizer_from_ckpt
 
 
@@ -377,6 +378,9 @@ def make_env(rank: int, seed: int, config: TrainConfig, render_mode: str | None 
 
 def train_pusht():
     config = TrainConfig()
+    config.bc_prior_path = resolve_bc_prior_path(config.bc_prior_path)
+    config.tokenizer_path = resolve_tokenizer_path(config.tokenizer_path)
+    config.save_path = resolve_ppo_checkpoint_path(config.save_path)
     policy_device = resolve_device(config.device)
     tokenizer_device = resolve_device(config.tokenizer_device)
     config.device = str(policy_device)
@@ -395,6 +399,10 @@ def train_pusht():
 
     device = policy_device
     print(f"Training starts on policy_device={device}, tokenizer_device={tokenizer_device}")
+    print(
+        f"Model paths: bc_prior={config.bc_prior_path} "
+        f"tokenizer={config.tokenizer_path} save={config.save_path}"
+    )
     if config.network_type in {"bc_pixels", "bc_latent"}:
         _, tokenizer_info = load_tokenizer_from_ckpt(config.tokenizer_path, torch.device("cpu"))
         print(
