@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.amp import autocast, GradScaler
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, WeightedRandomSampler
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -30,8 +30,6 @@ from model import Encoder, temporal_patchify  # reuse tokenizer's encoder + patc
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-# Fixed input shapes every step (same seq_len/H/W) -> benchmark mode picks
-# faster cudnn kernels after a short warmup. Meaningful win on consumer GPUs.
 torch.backends.cudnn.benchmark = True
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -39,119 +37,101 @@ IS_WINDOWS = platform.system() == "Windows"
 
 # ----------------------------------------------------------------------------
 # Reward labeling
+#
+# Ground truth: PushT has a SINGLE FIXED goal pose (block position + angle)
+# for the whole dataset, not a per-episode/per-scene goal. Confirmed via a
+# teammate's probe-training script targeting the same dataset file, which
+# hardcodes objective_pos=(256,256), objective_angle=pi/4, and defines
+# success as pos_err<=20px AND angle_err<=pi/9 (separate thresholds, not a
+# blended distance). This replaces the earlier cluster_episode_goals()
+# approach, which *estimated* a goal per start-position cluster from a
+# handful of episodes each (some of which are failures) -- that estimation
+# noise was a real source of label noise/false positives. The empirical
+# medians found via clustering (~251,260,0.78 and ~240-247,244,~0.7) land
+# close to (256,256,0.785), consistent with this being the true fixed goal.
 # ----------------------------------------------------------------------------
-def cluster_episode_goals(h5_path: str, xy_tol: float = 10.0) -> tuple[dict, list]:
-    """
-    Estimates a goal pose (block x, y, theta) per "scene" (a cluster of
-    episodes sharing an identical/near-identical start block position -- this
-    dataset resets to a small number of fixed start configs, each implying a
-    fixed goal). Goal is estimated as the *median* final block pose across
-    all episodes in a scene cluster, which is robust to individual failed
-    episodes (confirmed present in this dataset -- e.g. incomplete pushes)
-    pulling the estimate off.
-
-    Reads only the 7 scalar values needed per episode (start/final block
-    pose), not full state trajectories, to keep memory low.
-    """
-    import h5py
-
-    with h5py.File(h5_path, "r") as f:
-        ep_offset = f["ep_offset"][:]
-        ep_len = f["ep_len"][:]
-        n_eps = len(ep_offset)
-
-        starts = np.zeros((n_eps, 2), dtype=np.float32)
-        finals = np.zeros((n_eps, 3), dtype=np.float32)
-
-        state_ds = f["state"]
-        for i in range(n_eps):
-            s = int(ep_offset[i])
-            e = s + int(ep_len[i])
-            starts[i] = state_ds[s, 2:4]
-            finals[i] = state_ds[e - 1, 2:5]
-
-    keys = [tuple(np.round(starts[i] / xy_tol).astype(int)) for i in range(n_eps)]
-
-    scene_to_finals = {}
-    for i, k in enumerate(keys):
-        scene_to_finals.setdefault(k, []).append(finals[i])
-
-    scene_to_goal = {
-        k: np.median(np.array(v, dtype=np.float32), axis=0)
-        for k, v in scene_to_finals.items()
-    }
-
-    del starts, finals
-    import gc
-    gc.collect()
-
-    return scene_to_goal, keys
+def angle_delta(angle: np.ndarray, reference: float) -> np.ndarray:
+    """Circular angle difference, wrapped to [-pi, pi]."""
+    return np.arctan2(np.sin(angle - reference), np.cos(angle - reference))
 
 
-def compute_coverage_reward_labels(
-    block_states: np.ndarray,
-    goal_pose: np.ndarray,
-    xy_norm: float = 100.0,
-    theta_norm: float = 1.0,
-    success_dist: float = 0.15,
+def compute_objective_reward(
+    block_xy: np.ndarray,
+    block_angle: np.ndarray,
+    objective_pos: np.ndarray,
+    objective_angle: float,
+    pos_tol: float,
+    angle_tol: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Dense shaped reward based on distance from the current block pose to the
-    estimated scene goal pose. Returns both a continuous reward in [0, 1]
-    (1 = at goal) and a binary success label (distance below threshold).
+    Vectorized reward computation against the fixed global goal.
 
-    block_states: (T, 3) [x, y, theta]
-    goal_pose: (3,) [goal_x, goal_y, goal_theta]
+    binary: pos_err<=pos_tol AND angle_err<=angle_tol (matches the
+        "objective_met" definition used elsewhere for this dataset).
+    dense: product of two clipped-linear terms (position closeness x angle
+        closeness), which softens the AND logic into something differentiable
+        -- both dimensions need to be reasonably good for the reward to be
+        high, rather than one bad dimension being averaged away by a good one
+        (the failure mode of the earlier sqrt(dx^2+dtheta^2) blended metric).
+
+    block_xy: (N, 2), block_angle: (N,)
+    Returns: (dense (N,) float32 in [0,1], binary (N,) float32 in {0,1})
     """
-    dxy = (block_states[:, :2] - goal_pose[:2]) / xy_norm
-    dtheta = (block_states[:, 2] - goal_pose[2]) / theta_norm
-    dtheta = np.abs(np.mod(dtheta + np.pi, 2 * np.pi) - np.pi) / np.pi
+    pos_err = np.linalg.norm(block_xy - objective_pos[None, :], axis=-1)
+    angle_err = np.abs(angle_delta(block_angle, objective_angle))
 
-    dist_ = np.sqrt((dxy ** 2).sum(axis=-1) + dtheta ** 2)
-    dense_reward = np.clip(1.0 - dist_, 0.0, 1.0).astype(np.float32)
-    binary_reward = (dist_ < success_dist).astype(np.float32)
-    return dense_reward, binary_reward
+    binary = (pos_err <= pos_tol) & (angle_err <= angle_tol)
+
+    dense_pos = np.clip(1.0 - pos_err / (2.0 * pos_tol), 0.0, 1.0)
+    dense_angle = np.clip(1.0 - angle_err / (2.0 * angle_tol), 0.0, 1.0)
+    dense = dense_pos * dense_angle
+
+    return dense.astype(np.float32), binary.astype(np.float32)
 
 
 class PushTRewardDataset(PushTSequenceDataset):
     """
     Wraps PushTSequenceDataset and attaches both a binary and a dense reward
-    label per timestep, using the goal pose estimated per-scene by
-    cluster_episode_goals(). Handles genuine failure episodes correctly
-    (they get low reward throughout, confirmed via manual inspection of
-    episodes 80 and 199 in this dataset).
+    label per timestep, computed against the fixed global goal pose.
+
+    Rewards for the ENTIRE dataset are precomputed once (vectorized) at
+    init time from state[:, 2:5] (block x, y, theta) -- this is both more
+    accurate (no per-scene estimation noise) and much faster than computing
+    per-window at __getitem__ time (no h5 re-reads, no episode/scene lookup
+    per sample).
     """
 
     def __init__(
         self, h5_path, seq_len=50, action_chunk_size=5,
-        xy_tol=10.0, xy_norm=100.0, success_dist=0.15,
+        objective_pos=(256.0, 256.0), objective_angle=float(np.pi / 4),
+        pos_tol=20.0, angle_tol=float(np.pi / 9),
     ):
         super().__init__(h5_path, seq_len=seq_len, action_chunk_size=action_chunk_size)
-        self.xy_norm = xy_norm
-        self.success_dist = success_dist
-        self.scene_to_goal, self.ep_to_scene_key = cluster_episode_goals(h5_path, xy_tol=xy_tol)
-        self.episode_starts = np.concatenate([[0], self.episode_ends[:-1]])
 
-    def _episode_index_for_frame(self, frame_idx: int) -> int:
-        ep_idx = np.searchsorted(self.episode_ends, frame_idx, side="right")
-        return int(ep_idx)
+        self.objective_pos = np.asarray(objective_pos, dtype=np.float32)
+        self.objective_angle = float(objective_angle)
+        self.pos_tol = float(pos_tol)
+        self.angle_tol = float(angle_tol)
+
+        import h5py
+        with h5py.File(h5_path, "r") as f:
+            state_block = f["state"][:, 2:5]  # (N, 3): block x, y, theta -- full column read
+
+        self.dense_reward_all, self.binary_reward_all = compute_objective_reward(
+            state_block[:, :2], state_block[:, 2],
+            self.objective_pos, self.objective_angle, self.pos_tol, self.angle_tol,
+        )
+        # valid_start_indices set by parent __init__; keep as numpy for fast
+        # vectorized indexing (used by the balanced sampler and pos_weight
+        # calc in train()).
+        self.valid_start_indices = np.asarray(self.valid_start_indices, dtype=np.int64)
 
     def __getitem__(self, idx):
         item = super().__getitem__(idx)
-        start_idx = self.valid_start_indices[idx]
-
-        ep_idx = self._episode_index_for_frame(start_idx)
-        scene_key = self.ep_to_scene_key[ep_idx]
-        goal_pose = self.scene_to_goal[scene_key]  # (3,) [x,y,theta]
-
-        block_states = item["state"][:, 2:5].numpy()  # (seq_len, 3)
-
-        dense_reward, binary_reward = compute_coverage_reward_labels(
-            block_states, goal_pose,
-            xy_norm=self.xy_norm, success_dist=self.success_dist,
-        )
-        item["reward"] = torch.from_numpy(binary_reward)
-        item["reward_dense"] = torch.from_numpy(dense_reward)
+        start_idx = int(self.valid_start_indices[idx])
+        frame_idx = start_idx + np.arange(self.seq_len) * self.action_chunk_size
+        item["reward"] = torch.from_numpy(self.binary_reward_all[frame_idx])
+        item["reward_dense"] = torch.from_numpy(self.dense_reward_all[frame_idx])
         return item
 
 
@@ -162,8 +142,7 @@ class RewardHead(nn.Module):
     """Small MLP on top of frozen tokenizer latents. Single-task (PushT has
     one task), so no task embedding needed -- just per-frame binary logit.
     The same logit is used for BCE (binary success), sigmoid-MSE (dense
-    coverage regression), and pairwise ranking (ordering) losses -- no need
-    for separate heads since all three targets live on [0, 1]."""
+    coverage regression), and pairwise ranking (ordering) losses."""
 
     def __init__(self, latent_dim: int, hidden: int = 256, dropout: float = 0.0):
         super().__init__()
@@ -181,11 +160,6 @@ class RewardHead(nn.Module):
 
 
 def pool_latents(z: torch.Tensor) -> torch.Tensor:
-    """
-    z from encoder is expected as (B, T, n_latents, d_bottleneck) or similar.
-    Mean-pool over the latent-token axis to get one vector per frame:
-    (B, T, d_bottleneck). Adjust if your Encoder returns a different shape.
-    """
     if z.dim() == 4:
         return z.mean(dim=2)
     return z
@@ -199,17 +173,9 @@ def pairwise_ranking_loss(
     min_gap: float = 0.05,
 ) -> torch.Tensor:
     """
-    Contrastive/ranking auxiliary loss (Bradley-Terry style, as used to train
-    RLHF reward models): rather than only fitting a hard binary threshold,
-    this supervises the RAW LOGIT ORDERING against the dense coverage-to-goal
-    reward for randomly sampled pairs of frames. This directly targets the
-    failure mode observed during training -- noisy precision caused by
-    frames right around the ambiguous success boundary (e.g. dense=0.59 but
-    still labeled 0) -- because it provides a training signal everywhere
-    along the trajectory, not just at the binary cutoff.
-
-    logits: (N,) flattened batch*time predicted logits
-    dense_reward: (N,) flattened ground-truth dense reward in [0, 1]
+    Contrastive/ranking auxiliary loss (Bradley-Terry style): supervises the
+    RAW LOGIT ORDERING against the dense reward for randomly sampled pairs,
+    rather than only fitting a hard binary threshold.
     """
     N = logits.shape[0]
     if N < 2:
@@ -273,10 +239,6 @@ def init_distributed() -> tuple[bool, int, int, int]:
     rank, world_size, local_rank = get_dist_info()
     ddp = world_size > 1
     if ddp:
-        # NCCL is not available on Windows at all -- fall back to gloo there.
-        # On a single 3070 Ti this path shouldn't trigger (world_size=1 for
-        # plain `python train_reward.py`), but it's a landmine if torchrun is
-        # ever used by habit, so guard it defensively.
         backend = "gloo" if IS_WINDOWS else "nccl"
         dist.init_process_group(backend=backend, init_method="env://")
         if torch.cuda.is_available():
@@ -287,8 +249,6 @@ def init_distributed() -> tuple[bool, int, int, int]:
 
 
 def load_tokenizer_encoder(ckpt_path: str, device: torch.device) -> Encoder:
-    """Loads just the encoder weights from a Tokenizer checkpoint saved by
-    train_tokenizer.py (which stores {"model": full_tokenizer_state_dict, ...})."""
     ckpt = torch.load(ckpt_path, map_location="cpu")
     args = ckpt["args"]
 
@@ -360,6 +320,47 @@ def compute_pr_metrics(logits: torch.Tensor, labels: torch.Tensor, threshold: fl
     return precision, recall, f1
 
 
+def roc_auc(labels: np.ndarray, probs: np.ndarray) -> float:
+    """Rank-based ROC-AUC, no sklearn dependency. Threshold-independent
+    measure of ranking quality -- useful alongside P/R/F1@0.5 to tell apart
+    'the model can't separate the classes' from 'the decision threshold is
+    miscalibrated' (the latter is fixable for free, see select_best_threshold)."""
+    y = labels.astype(np.int64)
+    pos = int(y.sum())
+    neg = len(y) - pos
+    if pos == 0 or neg == 0:
+        return float("nan")
+    order = np.argsort(probs)
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(1, len(probs) + 1)
+    return float((ranks[y == 1].sum() - pos * (pos + 1) / 2) / (pos * neg))
+
+
+def select_best_threshold(labels: np.ndarray, probs: np.ndarray) -> tuple[float, float]:
+    """Sweeps candidate thresholds (val-set probability quantiles) and picks
+    the one maximizing F1. The model's natural decision boundary often isn't
+    at 0.5 given class imbalance -- this recalibrates for free at eval time,
+    no retraining needed, and directly addresses 'too many false positives'
+    if that's a calibration issue rather than a ranking-quality issue."""
+    y = labels.astype(np.float32)
+    p = probs.astype(np.float32)
+    candidates = np.unique(np.quantile(p, np.linspace(0.01, 0.99, 99)))
+    candidates = np.concatenate([[0.5], candidates])
+    best_t, best_f1 = 0.5, -1.0
+    for t in candidates:
+        preds = (p >= t).astype(np.float32)
+        tp = float(((preds == 1) & (y == 1)).sum())
+        fp = float(((preds == 1) & (y == 0)).sum())
+        fn = float(((preds == 0) & (y == 1)).sum())
+        precision = tp / max(tp + fp, 1.0)
+        recall = tp / max(tp + fn, 1.0)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_t = float(t)
+    return best_t, best_f1
+
+
 # ----------------------------------------------------------------------------
 # Train
 # ----------------------------------------------------------------------------
@@ -376,9 +377,7 @@ def train(args):
         print(f"GPU: {props.name} | {props.total_memory / 1e9:.1f} GB VRAM")
         if props.total_memory < 10e9:
             print("Detected <10GB VRAM: if you hit CUDA OOM, lower --batch_size "
-                  "and/or --seq_len first (encoder is frozen, so no gradient "
-                  "memory there -- OOM most likely comes from activation memory "
-                  "in the frozen encoder's forward pass at large batch*seq_len).")
+                  "and/or --seq_len first.")
 
     # ---- frozen tokenizer encoder ----
     encoder, tok_args = load_tokenizer_encoder(args.tokenizer_ckpt, device)
@@ -391,13 +390,16 @@ def train(args):
         h5_path=args.dataset,
         seq_len=args.seq_len,
         action_chunk_size=args.action_chunk_size,
-        xy_tol=args.xy_tol,
-        xy_norm=args.xy_norm,
-        success_dist=args.success_dist,
+        objective_pos=(args.objective_x, args.objective_y),
+        objective_angle=args.objective_angle,
+        pos_tol=args.objective_pos_tol,
+        angle_tol=args.objective_angle_tol,
     )
     if is_rank0():
-        n_scenes = len(dataset.scene_to_goal)
-        print(f"Clustered {len(dataset.ep_to_scene_key)} episodes into {n_scenes} goal scenes")
+        print(f"Fixed goal: pos=({args.objective_x:.1f}, {args.objective_y:.1f}) "
+              f"angle={args.objective_angle:.3f} rad | "
+              f"pos_tol={args.objective_pos_tol:.1f}px angle_tol={args.objective_angle_tol:.3f} rad")
+        print(f"Global per-frame positive rate: {dataset.binary_reward_all.mean():.4f}")
 
     n_val = max(1, int(len(dataset) * args.val_frac))
     n_train = len(dataset) - n_val
@@ -405,12 +407,45 @@ def train(args):
         dataset, [n_train, n_val], generator=torch.Generator().manual_seed(args.seed)
     )
 
-    # On Windows, multiprocessing workers use 'spawn' (not 'fork'), which is
-    # slower to start and re-imports the module per worker. num_workers=8 from
-    # a Linux-tuned default can actually be SLOWER here than a lower count.
-    # If the DataLoader appears to hang on startup, try --num_workers 0 first
-    # to isolate whether it's a worker-spawn issue vs something else.
-    train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
+    # Exact per-frame positive rate over the TRAIN split (vectorized, no h5/
+    # image reads needed) -- used both for pos_weight and the balanced
+    # sampler. Replaces the earlier approach of probing 500 random windows
+    # via full __getitem__ calls (noisier estimate, and needlessly loaded
+    # images just to compute a label statistic).
+    train_indices = np.asarray(train_set.indices, dtype=np.int64)
+    train_starts = dataset.valid_start_indices[train_indices]
+    frame_offsets = np.arange(args.seq_len) * args.action_chunk_size
+    frame_idx_matrix = train_starts[:, None] + frame_offsets[None, :]  # (N_train, seq_len)
+
+    window_has_positive = dataset.binary_reward_all[frame_idx_matrix].any(axis=1)
+    pos_frac_exact = float(dataset.binary_reward_all[frame_idx_matrix].mean())
+    pos_frac_exact = max(pos_frac_exact, 1e-6)
+    pos_weight_val = max(1.0, (1.0 - pos_frac_exact) / pos_frac_exact)
+
+    if is_rank0():
+        print(f"Train split exact positive-frame rate={pos_frac_exact:.4f} -> pos_weight={pos_weight_val:.2f}")
+        print(f"{window_has_positive.mean()*100:.2f}% of training windows contain >=1 positive frame")
+
+    pos_weight = torch.tensor(pos_weight_val, device=device)
+
+    # ---- balanced sampler (simple data-balancing trick #1) ----
+    # Oversamples windows that contain at least one success frame. This is a
+    # DIFFERENT mechanism than pos_weight: pos_weight only reweights the loss
+    # gradient, but doesn't change what a batch actually contains -- with
+    # positives concentrated in the last few frames of each episode, many
+    # batches see zero positives by pure chance (this was the root cause of
+    # the noisy per-step train precision observed earlier). Oversampling
+    # actually changes batch composition, giving more stable gradient signal.
+    if ddp:
+        train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True)
+    elif args.balance_sampler:
+        weights = np.where(window_has_positive, args.positive_oversample, 1.0).astype(np.float64)
+        train_sampler = WeightedRandomSampler(
+            weights=torch.from_numpy(weights), num_samples=len(train_set), replacement=True
+        )
+    else:
+        train_sampler = None
+
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
@@ -442,22 +477,6 @@ def train(args):
     use_amp = device_type in {"cuda", "xpu"}
     scaler = GradScaler(device=device_type, enabled=use_amp)
 
-    # pos_weight from empirical class balance, sampled from a few hundred
-    # windows rather than guessed.
-    if is_rank0():
-        n_probe = min(500, len(train_set))
-        probe_idx = np.random.choice(len(train_set), n_probe, replace=False)
-        pos_frac = np.mean([train_set[i]["reward"].float().mean().item() for i in probe_idx])
-        pos_frac = max(pos_frac, 1e-3)
-        pos_weight_val = max(1.0, (1.0 - pos_frac) / pos_frac)
-        print(f"Probed positive rate={pos_frac:.4f} -> pos_weight={pos_weight_val:.2f}")
-    else:
-        pos_weight_val = 1.0
-    pos_weight_t = torch.tensor([pos_weight_val], device=device)
-    if ddp:
-        dist.broadcast(pos_weight_t, src=0)
-    pos_weight = pos_weight_t.squeeze(0)
-
     writer = None
     if is_rank0():
         from datetime import datetime
@@ -480,16 +499,16 @@ def train(args):
 
     while step < args.max_steps:
         for epoch in range(start_epoch, 10_000_000):
-            if train_sampler is not None:
+            if isinstance(train_sampler, DistributedSampler):
                 train_sampler.set_epoch(epoch)
 
             for batch in train_loader:
                 if step >= args.max_steps:
                     break
 
-                x = batch["image"].to(device, non_blocking=True)          # (B,T,C,H,W)
-                r = batch["reward"].to(device, non_blocking=True)         # (B,T)
-                r_dense = batch["reward_dense"].to(device, non_blocking=True)  # (B,T)
+                x = batch["image"].to(device, non_blocking=True)
+                r = batch["reward"].to(device, non_blocking=True)
+                r_dense = batch["reward_dense"].to(device, non_blocking=True)
 
                 patches = temporal_patchify(x, tok_args["patch"])
 
@@ -498,7 +517,7 @@ def train(args):
                     z = pool_latents(z)
 
                 with autocast(device_type=device_type, enabled=use_amp):
-                    logits = reward_head(z)  # (B,T)
+                    logits = reward_head(z)
                     bce = F.binary_cross_entropy_with_logits(logits, r, pos_weight=pos_weight)
 
                     logits_flat = logits.reshape(-1)
@@ -597,13 +616,18 @@ def evaluate(reward_head, encoder, val_loader, tok_args, device, device_type, us
     logits = torch.cat(all_logits)
     labels = torch.cat(all_labels)
     dense = torch.cat(all_dense)
+    probs = torch.sigmoid(logits)
 
     val_loss = total_loss / max(1, total_count)
-    val_mse = F.mse_loss(torch.sigmoid(logits), dense).item()
+    val_mse = F.mse_loss(probs, dense).item()
     precision, recall, f1 = compute_pr_metrics(logits, labels)
 
+    auc = roc_auc(labels.numpy().reshape(-1), probs.numpy().reshape(-1))
+    best_t, best_f1 = select_best_threshold(labels.numpy().reshape(-1), probs.numpy().reshape(-1))
+
     print(f"[eval @ step {step}] bce_loss={val_loss:.4f} dense_mse={val_mse:.4f} "
-          f"P={precision:.3f} R={recall:.3f} F1={f1:.3f}")
+          f"P={precision:.3f} R={recall:.3f} F1={f1:.3f} | "
+          f"roc_auc={auc:.3f} best_thresh={best_t:.3f} (f1={best_f1:.3f})")
 
     if is_rank0() and writer is not None:
         writer.add_scalar("val/loss", val_loss, global_step=step)
@@ -611,6 +635,10 @@ def evaluate(reward_head, encoder, val_loader, tok_args, device, device_type, us
         writer.add_scalar("val/precision", precision, global_step=step)
         writer.add_scalar("val/recall", recall, global_step=step)
         writer.add_scalar("val/f1", f1, global_step=step)
+        writer.add_scalar("val/roc_auc", auc, global_step=step)
+        writer.add_scalar("val/best_threshold", best_t, global_step=step)
+        writer.add_scalar("val/best_f1", best_f1, global_step=step)
+        writer.flush()
 
 
 if __name__ == "__main__":
@@ -620,21 +648,25 @@ if __name__ == "__main__":
     p.add_argument("--dataset", type=str, required=True)
     p.add_argument("--seq_len", type=int, default=32)
     p.add_argument("--action_chunk_size", type=int, default=5)
-    # Windows spawns workers slower than Linux forks; 4 is a safer default
-    # than 8 for a single consumer machine. Set to 0 first if the DataLoader
-    # seems to hang on startup, to isolate the issue.
     p.add_argument("--num_workers", type=int, default=4)
-    # 3070 Ti has 8GB VRAM. The reward head itself is tiny; memory pressure
-    # comes from activations in the frozen encoder's forward pass at
-    # batch_size * seq_len frames per step. 16 is a safer starting point than
-    # 32 -- raise it only if nvidia-smi shows comfortable headroom.
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--val_frac", type=float, default=0.05)
 
-    # reward labeling
-    p.add_argument("--xy_tol", type=float, default=10.0, help="tolerance (px) for clustering episodes into scenes by start block pose")
-    p.add_argument("--xy_norm", type=float, default=100.0, help="normalizer for xy distance-to-goal, ~matches observed block xy range")
-    p.add_argument("--success_dist", type=float, default=0.15, help="normalized-distance threshold below which block is considered at goal")
+    # reward labeling -- fixed global goal (see header comment). Defaults
+    # match a teammate's probe-training script targeting the same dataset
+    # file; double check these against your env config if unsure, but they
+    # are consistent with the empirical goal estimates found earlier.
+    p.add_argument("--objective_x", type=float, default=256.0)
+    p.add_argument("--objective_y", type=float, default=256.0)
+    p.add_argument("--objective_angle", type=float, default=float(np.pi / 4))
+    p.add_argument("--objective_pos_tol", type=float, default=20.0, help="pixels")
+    p.add_argument("--objective_angle_tol", type=float, default=float(np.pi / 9), help="radians (default 20 deg)")
+
+    # data balancing
+    p.add_argument("--balance_sampler", action="store_true", default=True)
+    p.add_argument("--no_balance_sampler", dest="balance_sampler", action="store_false")
+    p.add_argument("--positive_oversample", type=float, default=5.0,
+                    help="sampling weight multiplier for windows containing >=1 positive frame")
 
     # tokenizer
     p.add_argument("--tokenizer_ckpt", type=str, required=True)
@@ -650,9 +682,9 @@ if __name__ == "__main__":
     p.add_argument("--use_ranking_loss", action="store_true", default=True)
     p.add_argument("--no_ranking_loss", dest="use_ranking_loss", action="store_false")
     p.add_argument("--ranking_weight", type=float, default=0.5)
-    p.add_argument("--ranking_pairs", type=int, default=512, help="random pairs sampled per batch for the ranking loss")
+    p.add_argument("--ranking_pairs", type=int, default=512)
     p.add_argument("--ranking_margin", type=float, default=0.1)
-    p.add_argument("--ranking_min_gap", type=float, default=0.05, help="minimum dense-reward gap between a pair to count as a valid ranking signal")
+    p.add_argument("--ranking_min_gap", type=float, default=0.05)
 
     # optim
     p.add_argument("--lr", type=float, default=3e-4)
@@ -662,11 +694,8 @@ if __name__ == "__main__":
     # logging
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--print_every", type=int, default=100)
-    p.add_argument("--eval_every", type=int, default=2500)
-    p.add_argument("--max_eval_batches", type=int, default=20,
-                    help="cap on val batches per eval call (0 = full val set). "
-                         "20 batches * batch_size frames is plenty for a stable "
-                         "P/R/F1/loss estimate without paying for the full val set every time.")
+    p.add_argument("--eval_every", type=int, default=1000)
+    p.add_argument("--max_eval_batches", type=int, default=20)
 
     # ckpt
     p.add_argument("--ckpt_dir", type=str, default="./logs/reward_ckpts")
