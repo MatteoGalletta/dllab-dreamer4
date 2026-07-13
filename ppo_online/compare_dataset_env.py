@@ -14,6 +14,7 @@ import hdf5plugin  # noqa: F401
 import numpy as np
 import torch
 
+from ppo_online.env_config import DEFAULT_PUSHT_ENV_ID, make_pusht_env_kwargs, resolve_pusht_env_id
 from ppo_online.model_paths import resolve_tokenizer_path
 from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
 
@@ -52,13 +53,14 @@ def save_rgb(path: Path, image_rgb: np.ndarray):
 
 
 def make_env(image_hw: tuple[int, int], seed: int):
-    env = gym.make(
-        "gym_pusht/PushT-v0",
-        obs_type="state",
+    resolved_env_id = resolve_pusht_env_id(DEFAULT_PUSHT_ENV_ID)
+    env_kwargs = make_pusht_env_kwargs(
+        resolved_env_id,
         render_mode="rgb_array",
-        observation_width=int(image_hw[1]),
-        observation_height=int(image_hw[0]),
+        image_height=int(image_hw[0]),
+        image_width=int(image_hw[1]),
     )
+    env = gym.make(resolved_env_id, **env_kwargs)
     env.reset(seed=seed)
     return env
 

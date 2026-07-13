@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from gymnasium.wrappers import FrameStackObservation
 
+from ppo_online.env_config import make_pusht_env_kwargs, resolve_pusht_env_id
 from ppo_online.model_paths import resolve_bc_prior_path, resolve_ppo_checkpoint_path, resolve_tokenizer_path
 from ppo_online.networks import BCPixelActorCritic, BCStyleLatentActorCritic, VectorActorCritic
 from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
@@ -21,6 +22,7 @@ from ppo_online.train import (
     RenderedImageObsWrapper,
     TokenizerLatentObsWrapper,
     TrainConfig,
+    extract_state_array,
     resolve_device,
 )
 
@@ -89,23 +91,80 @@ def load_bc_prior_into_network(network: torch.nn.Module, path: str, device: torc
     )
 
 
-def make_render_env(config: TrainConfig, video_folder: str):
+class ChunkExecutionWrapper(gym.Wrapper):
+    """
+    Debug wrapper for BC checkpoints: interpret predicted action chunks without
+    PPO's ACT-style temporal ensembling.
+    """
+
+    def __init__(self, env: gym.Env, chunk_size: int, mode: str, max_step_pixels: float):
+        super().__init__(env)
+        self.chunk_size = chunk_size
+        self.mode = mode
+        self.max_step_pixels = max_step_pixels
+        low = np.full((chunk_size * 2,), -1.0, dtype=np.float32)
+        high = np.full((chunk_size * 2,), 1.0, dtype=np.float32)
+        self.action_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
+        self.current_eef = np.array([256.0, 256.0], dtype=np.float32)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        state = extract_state_array(obs)
+        self.current_eef = state[0:2].copy()
+        return obs, info
+
+    def _map_primitive_to_env_action(self, primitive: np.ndarray) -> np.ndarray:
+        if self.mode in {"first_absolute", "chunk_absolute"}:
+            return np.clip((primitive + 1.0) * 256.0, 0.0, 512.0)
+        if self.mode in {"first_delta", "chunk_delta"}:
+            return np.clip(self.current_eef + primitive * self.max_step_pixels, 0.0, 512.0)
+        raise ValueError(f"Unsupported chunk execution mode: {self.mode}")
+
+    def step(self, macro_action):
+        macro_action = np.asarray(macro_action, dtype=np.float32)
+        primitives = np.clip(macro_action, -1.0, 1.0).reshape(self.chunk_size, 2)
+
+        if self.mode.startswith("first_"):
+            primitives = primitives[:1]
+
+        total_reward = 0.0
+        terminated = False
+        truncated = False
+        info: dict = {}
+        executed_actions = []
+
+        for primitive in primitives:
+            env_action = self._map_primitive_to_env_action(primitive)
+            obs, reward, terminated, truncated, info = self.env.step(env_action)
+            state = extract_state_array(obs)
+            self.current_eef = state[0:2].copy()
+            total_reward += float(reward)
+            executed_actions.append(env_action.astype(np.float32))
+            if terminated or truncated:
+                break
+
+        info = dict(info)
+        info["executed_actions"] = np.asarray(executed_actions, dtype=np.float32)
+        info["executed_primitives"] = primitives[: len(executed_actions)].astype(np.float32)
+        return obs, float(total_reward), terminated, truncated, info
+
+
+def make_render_env(config: TrainConfig, video_folder: str, action_mode: str):
     tokenizer_info = None
     if config.network_type in {"bc_pixels", "bc_latent"}:
         _, tokenizer_info = load_tokenizer_from_ckpt(config.tokenizer_path, torch.device("cpu"))
 
-    env_kwargs = {
-        "obs_type": "state",
-        "render_mode": "rgb_array",
-    }
-    if tokenizer_info is not None:
-        env_kwargs["observation_width"] = int(tokenizer_info["W"])
-        env_kwargs["observation_height"] = int(tokenizer_info["H"])
-
-    env = gym.make(
-        "gym_pusht/PushT-v0",
-        **env_kwargs,
+    resolved_env_id = resolve_pusht_env_id(config.env_id)
+    image_height = int(tokenizer_info["H"]) if tokenizer_info is not None else None
+    image_width = int(tokenizer_info["W"]) if tokenizer_info is not None else None
+    env_kwargs = make_pusht_env_kwargs(
+        resolved_env_id,
+        render_mode="rgb_array",
+        image_height=image_height,
+        image_width=image_width,
     )
+
+    env = gym.make(resolved_env_id, **env_kwargs)
     env = gym.wrappers.RecordVideo(
         env,
         video_folder=video_folder,
@@ -114,12 +173,20 @@ def make_render_env(config: TrainConfig, video_folder: str):
         disable_logger=True,
     )
     env = PushTDenseRewardWrapper(env)
-    env = ActionChunkingTemporalEnsembleWrapper(
-        env,
-        chunk_size=config.chunk_size,
-        max_step_pixels=config.max_step_pixels,
-        ensemble_decay=config.ensemble_decay,
-    )
+    if action_mode == "ppo_chunk":
+        env = ActionChunkingTemporalEnsembleWrapper(
+            env,
+            chunk_size=config.chunk_size,
+            max_step_pixels=config.max_step_pixels,
+            ensemble_decay=config.ensemble_decay,
+        )
+    else:
+        env = ChunkExecutionWrapper(
+            env,
+            chunk_size=config.chunk_size,
+            mode=action_mode,
+            max_step_pixels=config.max_step_pixels,
+        )
     if config.network_type == "bc_pixels":
         env = RenderedImageObsWrapper(env, tokenizer_ckpt=config.tokenizer_path)
         env = FrameStackObservation(env, stack_size=config.obs_stack_size)
@@ -148,6 +215,12 @@ def parse_args():
         default=None,
         help="Optional override checkpoint path. Defaults to TrainConfig save_path or bc_prior_path based on --source.",
     )
+    parser.add_argument(
+        "--action-mode",
+        choices=("auto", "ppo_chunk", "first_absolute", "first_delta", "chunk_absolute", "chunk_delta"),
+        default="auto",
+        help="How to interpret the predicted action chunk during rendering.",
+    )
     return parser.parse_args()
 
 
@@ -164,11 +237,17 @@ def render_agent_to_video():
         model_path = resolve_bc_prior_path(model_path)
     else:
         model_path = resolve_ppo_checkpoint_path(model_path)
+    action_mode = args.action_mode
+    if action_mode == "auto":
+        action_mode = "chunk_delta" if args.source == "bc_prior" else "ppo_chunk"
     video_folder = "./videos"
     os.makedirs(video_folder, exist_ok=True)
-    print(f"Render paths: source={args.source} model={model_path} tokenizer={config.tokenizer_path}")
+    print(
+        f"Render paths: source={args.source} model={model_path} "
+        f"tokenizer={config.tokenizer_path} action_mode={action_mode}"
+    )
 
-    env = make_render_env(config, video_folder)
+    env = make_render_env(config, video_folder, action_mode=action_mode)
 
     obs_shape = tuple(env.observation_space.shape)
     state_dim = int(obs_shape[-1]) if config.network_type == "bc_latent" else int(np.prod(obs_shape))
@@ -228,6 +307,7 @@ def render_agent_to_video():
     if "coverage" in final_info:
         print(f"Coverage: {float(final_info['coverage']):.3f}")
     print(f"Rendered source: {args.source}")
+    print(f"Action interpretation: {action_mode}")
     print(f"Video saved to '{video_folder}'.")
 
     env.close()

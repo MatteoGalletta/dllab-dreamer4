@@ -17,6 +17,7 @@ import torch.nn.functional as F
 import wandb
 from gymnasium.wrappers import FrameStackObservation
 
+from .env_config import DEFAULT_PUSHT_ENV_ID, make_pusht_env_kwargs, resolve_pusht_env_id
 from .agent import PPOAgent
 from .buffer import PPOVectorBuffer
 from .model_paths import resolve_bc_prior_path, resolve_ppo_checkpoint_path, resolve_tokenizer_path
@@ -51,8 +52,8 @@ class ActionChunkingTemporalEnsembleWrapper(gym.Wrapper):
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        obs = np.asarray(obs, dtype=np.float32)
-        self.current_eef = obs[0:2].copy()
+        state = extract_state_array(obs)
+        self.current_eef = state[0:2].copy()
         self.pending_chunks.clear()
         return obs, info
 
@@ -82,8 +83,8 @@ class ActionChunkingTemporalEnsembleWrapper(gym.Wrapper):
         target_pos = np.clip(self.current_eef + delta, 0.0, 512.0)
 
         obs, reward, terminated, truncated, info = self.env.step(target_pos)
-        obs = np.asarray(obs, dtype=np.float32)
-        self.current_eef = obs[0:2].copy()
+        state = extract_state_array(obs)
+        self.current_eef = state[0:2].copy()
 
         for entry in self.pending_chunks:
             entry["offset"] += 1
@@ -108,8 +109,9 @@ class PushTDenseRewardWrapper(gym.Wrapper):
     def step(self, action):
         observation, original_reward, terminated, truncated, info = self.env.step(action)
 
-        eef_pos = observation[0:2].astype(np.float32)
-        block_pos = observation[2:4].astype(np.float32)
+        state = extract_state_array(observation)
+        eef_pos = state[0:2].astype(np.float32)
+        block_pos = state[2:4].astype(np.float32)
 
         dist_reach = float(np.linalg.norm(eef_pos - block_pos))
         dist_push = float(np.linalg.norm(block_pos - self.target_pos))
@@ -138,7 +140,7 @@ class PushTObsWrapper(gym.ObservationWrapper):
         )
 
     def observation(self, observation):
-        observation = np.asarray(observation, dtype=np.float32)
+        observation = extract_state_array(observation)
         eef_x = np.clip(observation[0] / 512.0, 0.0, 1.0)
         eef_y = np.clip(observation[1] / 512.0, 0.0, 1.0)
         block_x = np.clip(observation[2] / 512.0, 0.0, 1.0)
@@ -213,6 +215,14 @@ class RenderedImageObsWrapper(gym.ObservationWrapper):
         return self._render_frame()
 
 
+def extract_state_array(observation: Any) -> np.ndarray:
+    if isinstance(observation, dict):
+        if "state" in observation:
+            return np.asarray(observation["state"], dtype=np.float32)
+        raise KeyError("Expected observation dict to contain a 'state' entry.")
+    return np.asarray(observation, dtype=np.float32)
+
+
 def as_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(np.asarray(value).squeeze())
@@ -268,6 +278,7 @@ def add_timeout_bootstrap_rewards(rewards, terminations, truncations, infos, age
 
 @dataclass
 class TrainConfig:
+    env_id: str = DEFAULT_PUSHT_ENV_ID
     num_envs: int = 16
     rollout_steps: int = 256
     total_timesteps: int = 10_000_000
@@ -342,15 +353,20 @@ def make_env(rank: int, seed: int, config: TrainConfig, render_mode: str | None 
         if config.network_type in {"bc_pixels", "bc_latent"}:
             _, tokenizer_info = load_tokenizer_from_ckpt(config.tokenizer_path, torch.device("cpu"))
 
-        env_kwargs: dict[str, Any] = {
-            "obs_type": "state",
-            "render_mode": render_mode or "rgb_array",
-        }
+        resolved_env_id = resolve_pusht_env_id(config.env_id)
+        env_kwargs: dict[str, Any] = make_pusht_env_kwargs(
+            resolved_env_id,
+            render_mode=render_mode or "rgb_array",
+        )
         if tokenizer_info is not None:
-            env_kwargs["observation_width"] = int(tokenizer_info["W"])
-            env_kwargs["observation_height"] = int(tokenizer_info["H"])
+            env_kwargs = make_pusht_env_kwargs(
+                resolved_env_id,
+                render_mode=render_mode or "rgb_array",
+                image_height=int(tokenizer_info["H"]),
+                image_width=int(tokenizer_info["W"]),
+            )
 
-        env = gym.make("gym_pusht/PushT-v0", **env_kwargs)
+        env = gym.make(resolved_env_id, **env_kwargs)
         env = PushTDenseRewardWrapper(env)
         env = ActionChunkingTemporalEnsembleWrapper(
             env,
