@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import random
+from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -620,10 +621,12 @@ def train_pusht():
         )
 
         if (update + 1) % 50 == 0:
+            Path(config.save_path).parent.mkdir(parents=True, exist_ok=True)
             torch.save(agent.network.state_dict(), config.save_path)
             wandb.save(config.save_path)
 
     print("Saving final model weights...")
+    Path(config.save_path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(agent.network.state_dict(), config.save_path)
     wandb.save(config.save_path)
     print("Training finished.")
