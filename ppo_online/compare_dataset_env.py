@@ -62,18 +62,47 @@ def make_env(image_hw: tuple[int, int], seed: int):
     )
     env = gym.make(resolved_env_id, **env_kwargs)
     env.reset(seed=seed)
-    return env
+    return env, resolved_env_id
 
 
-def try_reset_to_dataset_state(env, state: np.ndarray):
+def try_reset_to_dataset_state(env, state: np.ndarray, env_id: str):
     state = np.asarray(state, dtype=np.float32).reshape(-1)
     if state.shape[0] < 5:
         return False
-    try:
-        env.reset(options={"reset_to_state": state[:5].tolist()})
-        return True
-    except Exception:
-        return False
+
+    option_candidates = []
+    if env_id.startswith("swm/"):
+        # SWM PushT reset() accepts "state" (and optionally "goal_state").
+        option_candidates.extend(
+            [
+                {"state": state.tolist()},
+                {"state": state[:5].tolist()},
+            ]
+        )
+    else:
+        option_candidates.append({"reset_to_state": state[:5].tolist()})
+
+    # Try both conventions defensively in case the installed env differs.
+    option_candidates.extend(
+        [
+            {"state": state.tolist()},
+            {"state": state[:5].tolist()},
+            {"reset_to_state": state[:5].tolist()},
+        ]
+    )
+
+    seen = set()
+    for options in option_candidates:
+        key = json.dumps(options, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            env.reset(options=options)
+            return True
+        except Exception:
+            continue
+    return False
 
 
 def main():
@@ -94,7 +123,7 @@ def main():
         sample_indices = np.linspace(0, num_frames - 1, num=num_samples, dtype=int)
         matched_resets = 0
 
-        env = make_env(image_hw=image_hw, seed=args.seed)
+        env, resolved_env_id = make_env(image_hw=image_hw, seed=args.seed)
 
         for sample_no, frame_idx in enumerate(sample_indices):
             dataset_frame = np.asarray(pixels[frame_idx], dtype=np.uint8)
@@ -103,7 +132,7 @@ def main():
 
             matched_state = False
             if states is not None:
-                matched_state = try_reset_to_dataset_state(env, np.asarray(states[frame_idx]))
+                matched_state = try_reset_to_dataset_state(env, np.asarray(states[frame_idx]), resolved_env_id)
                 matched_resets += int(matched_state)
             if not matched_state:
                 env.reset(seed=args.seed + sample_no)
@@ -122,6 +151,7 @@ def main():
         summary = {
             "dataset_path": str(Path(args.dataset).resolve()),
             "tokenizer_checkpoint": tokenizer_path,
+            "resolved_env_id": resolved_env_id,
             "tokenizer_resolution": {"H": image_hw[0], "W": image_hw[1]},
             "keys": sorted(list(dataset.keys())),
             "pixels_shape": list(pixels.shape),

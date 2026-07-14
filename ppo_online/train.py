@@ -9,6 +9,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
+import cv2
 import gymnasium as gym
 import gym_pusht
 import numpy as np
@@ -99,12 +100,73 @@ class ActionChunkingTemporalEnsembleWrapper(gym.Wrapper):
 
 
 class PushTDenseRewardWrapper(gym.Wrapper):
-    def __init__(self, env: gym.Env):
+    def __init__(self, env: gym.Env, env_id: str | None = None):
         super().__init__(env)
         self.target_pos = np.array([256.0, 256.0], dtype=np.float32)
+        self.env_id = env_id or getattr(getattr(env, "spec", None), "id", "") or ""
+        self.base_env = self._find_pusht_base_env()
 
     def reset(self, **kwargs):
         return self.env.reset(**kwargs)
+
+    def _find_pusht_base_env(self):
+        env = self.env
+        visited = set()
+        while env is not None and id(env) not in visited:
+            visited.add(id(env))
+            if hasattr(env, "window_size") and (
+                hasattr(env, "block")
+                or hasattr(env, "_setup")
+                or hasattr(env, "_get_info")
+            ):
+                return env
+            env = getattr(env, "env", None)
+        return None
+
+    def _rasterize_block_mask(self, pose: np.ndarray) -> np.ndarray | None:
+        if self.base_env is None:
+            self.base_env = self._find_pusht_base_env()
+        if self.base_env is None or not hasattr(self.base_env, "block"):
+            return None
+
+        canvas_size = int(getattr(self.base_env, "window_size", 512))
+        mask = np.zeros((canvas_size, canvas_size), dtype=np.uint8)
+        position = np.asarray(pose[:2], dtype=np.float32)
+        angle = float(pose[2])
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        rotation = np.asarray([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float32)
+
+        for shape in self.base_env.block.shapes:
+            if hasattr(shape, "get_vertices"):
+                vertices = np.asarray([[vertex.x, vertex.y] for vertex in shape.get_vertices()], dtype=np.float32)
+                world_vertices = (vertices @ rotation.T) + position[None, :]
+                polygon = np.round(world_vertices).astype(np.int32)
+                cv2.fillPoly(mask, [polygon], 255)
+            elif hasattr(shape, "radius") and hasattr(shape, "offset"):
+                offset = np.asarray([shape.offset.x, shape.offset.y], dtype=np.float32)
+                center = (rotation @ offset) + position
+                cv2.circle(mask, tuple(np.round(center).astype(np.int32)), int(round(float(shape.radius))), 255, -1)
+
+        return mask
+
+    def _compute_visual_coverage(self, info: dict) -> float | None:
+        goal_pose = info.get("goal_pose")
+        block_pose = info.get("block_pose")
+        if goal_pose is None or block_pose is None:
+            return None
+
+        goal_mask = self._rasterize_block_mask(np.asarray(goal_pose, dtype=np.float32))
+        block_mask = self._rasterize_block_mask(np.asarray(block_pose, dtype=np.float32))
+        if goal_mask is None or block_mask is None:
+            return None
+
+        goal_pixels = goal_mask > 0
+        if not np.any(goal_pixels):
+            return None
+
+        overlap_pixels = goal_pixels & (block_mask > 0)
+        return float(overlap_pixels.sum() / max(1, goal_pixels.sum()))
 
     def step(self, action):
         observation, original_reward, terminated, truncated, info = self.env.step(action)
@@ -120,12 +182,24 @@ class PushTDenseRewardWrapper(gym.Wrapper):
         dist_reach_eff = max(0.0, dist_reach - 60.0)
         r_reach = math.exp(-dist_reach_eff / 100.0)
 
-        dense_reward = (1.0 * r_reach) + (3.0 * r_push) + (50.0 * float(original_reward))
-
         info = dict(info)
-        info["dense_reward"] = float(dense_reward)
         info["original_reward"] = float(original_reward)
-        info["coverage"] = float(original_reward)
+        info["reach_reward"] = float(r_reach)
+        info["push_reward"] = float(r_push)
+        info["distance_to_block"] = dist_reach
+        info["distance_to_target"] = dist_push
+
+        if self.env_id.startswith("swm/"):
+            dense_reward = (1.0 * r_reach) + (3.0 * r_push)
+            visual_coverage = self._compute_visual_coverage(info)
+            if visual_coverage is not None:
+                info["coverage"] = float(visual_coverage)
+            info["coverage_proxy"] = float(r_push)
+        else:
+            dense_reward = (1.0 * r_reach) + (3.0 * r_push) + (50.0 * float(original_reward))
+            info["coverage"] = float(original_reward)
+
+        info["dense_reward"] = float(dense_reward)
 
         return observation, float(dense_reward), terminated, truncated, info
 
@@ -367,7 +441,7 @@ def make_env(rank: int, seed: int, config: TrainConfig, render_mode: str | None 
             )
 
         env = gym.make(resolved_env_id, **env_kwargs)
-        env = PushTDenseRewardWrapper(env)
+        env = PushTDenseRewardWrapper(env, env_id=resolved_env_id)
         env = ActionChunkingTemporalEnsembleWrapper(
             env,
             chunk_size=config.chunk_size,
@@ -499,6 +573,7 @@ def train_pusht():
         action_abs_max = 0.0
         rollout_returns = []
         rollout_coverages = []
+        rollout_coverage_proxies = []
         rollout_chunks = []
 
         for _ in range(config.rollout_steps):
@@ -551,6 +626,16 @@ def train_pusht():
                         rollout_returns.append(ep_return)
                         if coverage is not None:
                             rollout_coverages.append(float(coverage))
+                        coverage_proxy = None
+                        if "final_info" in infos and infos["final_info"][i] is not None:
+                            coverage_proxy = infos["final_info"][i].get("coverage_proxy")
+                        elif "coverage_proxy" in infos:
+                            try:
+                                coverage_proxy = infos["coverage_proxy"][i]
+                            except Exception:
+                                coverage_proxy = None
+                        if coverage_proxy is not None:
+                            rollout_coverage_proxies.append(float(coverage_proxy))
             elif "final_info" in infos:
                 for final_info in infos["final_info"]:
                     if final_info is not None and "episode" in final_info:
@@ -558,6 +643,8 @@ def train_pusht():
                         rollout_returns.append(ep_return)
                         if "coverage" in final_info:
                             rollout_coverages.append(float(final_info["coverage"]))
+                        if "coverage_proxy" in final_info:
+                            rollout_coverage_proxies.append(float(final_info["coverage_proxy"]))
 
             buffer.store(
                 states,
@@ -616,6 +703,11 @@ def train_pusht():
         if rollout_coverages:
             wandb_log_dict["Environment/Mean_Coverage"] = sum(rollout_coverages) / len(rollout_coverages)
             wandb_log_dict["Environment/Max_Coverage"] = max(rollout_coverages)
+        if rollout_coverage_proxies:
+            wandb_log_dict["Environment/Mean_Coverage_Proxy"] = (
+                sum(rollout_coverage_proxies) / len(rollout_coverage_proxies)
+            )
+            wandb_log_dict["Environment/Max_Coverage_Proxy"] = max(rollout_coverage_proxies)
         if rollout_chunks:
             wandb_log_dict["Chunking/Mean_Active_Chunks"] = sum(rollout_chunks) / len(rollout_chunks)
 
@@ -623,6 +715,8 @@ def train_pusht():
 
         mean_episode_return = wandb_log_dict.get("Environment/Mean_Episode_Return", float("nan"))
         mean_coverage = wandb_log_dict.get("Environment/Mean_Coverage", float("nan"))
+        max_coverage = wandb_log_dict.get("Environment/Max_Coverage", float("nan"))
+        mean_coverage_proxy = wandb_log_dict.get("Environment/Mean_Coverage_Proxy", float("nan"))
         mean_active_chunks = wandb_log_dict.get("Chunking/Mean_Active_Chunks", float("nan"))
         print(
             f"update={update + 1}/{num_updates} "
@@ -630,6 +724,8 @@ def train_pusht():
             f"episodes={len(rollout_returns)} "
             f"mean_return={mean_episode_return:.2f} "
             f"mean_cov={mean_coverage:.3f} "
+            f"max_cov={max_coverage:.3f} "
+            f"mean_cov_proxy={mean_coverage_proxy:.3f} "
             f"step_reward={mean_step_reward:.3f} "
             f"kl={stats['approx_kl']:.5f} "
             f"entropy={stats['entropy']:.3f} "

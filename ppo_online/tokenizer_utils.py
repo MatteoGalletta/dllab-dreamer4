@@ -39,7 +39,7 @@ def _clean_state_dict_keys(state_dict: dict[str, torch.Tensor]) -> dict[str, tor
     cleaned = {}
     for key, value in state_dict.items():
         clean_key = key
-        for prefix in ("module.", "tokenizer."):
+        for prefix in ("module.", "_orig_mod.", "tokenizer."):
             if clean_key.startswith(prefix):
                 clean_key = clean_key[len(prefix):]
         cleaned[clean_key] = value

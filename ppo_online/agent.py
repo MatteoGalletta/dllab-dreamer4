@@ -36,7 +36,7 @@ def _normalize_prior_keys(state_dict: dict[str, torch.Tensor]) -> dict[str, torc
     normalized: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
         clean_key = key
-        for prefix in ("module.", "network."):
+        for prefix in ("module.", "_orig_mod.", "network."):
             if clean_key.startswith(prefix):
                 clean_key = clean_key[len(prefix):]
 

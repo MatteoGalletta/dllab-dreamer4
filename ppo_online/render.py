@@ -58,7 +58,7 @@ def load_bc_prior_into_network(network: torch.nn.Module, path: str, device: torc
     cleaned = {}
     for key, value in state_dict.items():
         clean_key = key
-        for prefix in ("module.", "network."):
+        for prefix in ("module.", "_orig_mod.", "network."):
             if clean_key.startswith(prefix):
                 clean_key = clean_key[len(prefix):]
         cleaned[clean_key] = value
@@ -149,7 +149,7 @@ class ChunkExecutionWrapper(gym.Wrapper):
         return obs, float(total_reward), terminated, truncated, info
 
 
-def make_render_env(config: TrainConfig, video_folder: str, action_mode: str):
+def make_render_env(config: TrainConfig, video_folder: str, action_mode: str, record_video: bool = True):
     tokenizer_info = None
     if config.network_type in {"bc_pixels", "bc_latent"}:
         _, tokenizer_info = load_tokenizer_from_ckpt(config.tokenizer_path, torch.device("cpu"))
@@ -165,14 +165,15 @@ def make_render_env(config: TrainConfig, video_folder: str, action_mode: str):
     )
 
     env = gym.make(resolved_env_id, **env_kwargs)
-    env = gym.wrappers.RecordVideo(
-        env,
-        video_folder=video_folder,
-        name_prefix="ppo_pusht_test",
-        episode_trigger=lambda episode_id: True,
-        disable_logger=True,
-    )
-    env = PushTDenseRewardWrapper(env)
+    if record_video:
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder=video_folder,
+            name_prefix="ppo_pusht_test",
+            episode_trigger=lambda episode_id: True,
+            disable_logger=True,
+        )
+    env = PushTDenseRewardWrapper(env, env_id=resolved_env_id)
     if action_mode == "ppo_chunk":
         env = ActionChunkingTemporalEnsembleWrapper(
             env,
@@ -202,6 +203,16 @@ def make_render_env(config: TrainConfig, video_folder: str, action_mode: str):
     return env
 
 
+def count_env_steps(info: dict) -> int:
+    executed_actions = info.get("executed_actions")
+    if executed_actions is None:
+        return 1
+    try:
+        return max(1, int(len(executed_actions)))
+    except TypeError:
+        return 1
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Render PPO or BC-prior policy on PushT.")
     parser.add_argument(
@@ -221,6 +232,29 @@ def parse_args():
         default="auto",
         help="How to interpret the predicted action chunk during rendering.",
     )
+    parser.add_argument(
+        "--no-video",
+        action="store_true",
+        help="Disable video recording for faster debugging.",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=0,
+        help="Maximum number of env steps to run before stopping. 0 means no limit.",
+    )
+    parser.add_argument(
+        "--max-step-pixels",
+        type=float,
+        default=None,
+        help="Optional override for delta action scaling.",
+    )
+    parser.add_argument(
+        "--print-every",
+        type=int,
+        default=0,
+        help="Print rollout progress every N policy decisions. Default 0 disables intermediate logs.",
+    )
     return parser.parse_args()
 
 
@@ -230,6 +264,8 @@ def render_agent_to_video():
     config.bc_prior_path = resolve_bc_prior_path(config.bc_prior_path)
     config.tokenizer_path = resolve_tokenizer_path(config.tokenizer_path)
     config.save_path = resolve_ppo_checkpoint_path(config.save_path)
+    if args.max_step_pixels is not None:
+        config.max_step_pixels = float(args.max_step_pixels)
     device = resolve_device(config.device)
     config.tokenizer_device = str(resolve_device(config.tokenizer_device))
     model_path = args.model_path or (config.bc_prior_path if args.source == "bc_prior" else config.save_path)
@@ -241,13 +277,17 @@ def render_agent_to_video():
     if action_mode == "auto":
         action_mode = "chunk_delta" if args.source == "bc_prior" else "ppo_chunk"
     video_folder = "./videos"
-    os.makedirs(video_folder, exist_ok=True)
+    record_video = not args.no_video
+    if record_video:
+        os.makedirs(video_folder, exist_ok=True)
     print(
         f"Render paths: source={args.source} model={model_path} "
-        f"tokenizer={config.tokenizer_path} action_mode={action_mode}"
+        f"tokenizer={config.tokenizer_path} action_mode={action_mode} "
+        f"record_video={record_video} max_steps={args.max_steps} "
+        f"max_step_pixels={config.max_step_pixels}"
     )
 
-    env = make_render_env(config, video_folder, action_mode=action_mode)
+    env = make_render_env(config, video_folder, action_mode=action_mode, record_video=record_video)
 
     obs_shape = tuple(env.observation_space.shape)
     state_dim = int(obs_shape[-1]) if config.network_type == "bc_latent" else int(np.prod(obs_shape))
@@ -287,6 +327,7 @@ def render_agent_to_video():
     state, _ = env.reset()
     done = False
     step_count = 0
+    decision_count = 0
     total_reward = 0.0
     final_info = {}
 
@@ -300,15 +341,35 @@ def render_agent_to_video():
         final_info = info
         total_reward += float(reward)
         done = terminated or truncated
-        step_count += 1
+        decision_count += 1
+        step_count += count_env_steps(info)
+        if args.print_every > 0 and (
+            decision_count % args.print_every == 0 or done or (args.max_steps > 0 and step_count >= args.max_steps)
+        ):
+            coverage = info.get("coverage")
+            coverage_proxy = info.get("coverage_proxy")
+            coverage_text = "n/a" if coverage is None else f"{float(coverage):.3f}"
+            proxy_text = "n/a" if coverage_proxy is None else f"{float(coverage_proxy):.3f}"
+            print(
+                f"decision={decision_count:04d} env_steps={step_count:04d} "
+                f"reward={float(reward):8.3f} total_reward={total_reward:8.3f} "
+                f"coverage={coverage_text} coverage_proxy={proxy_text}"
+            )
+        if args.max_steps > 0 and step_count >= args.max_steps:
+            print(f"Stopped early after reaching max_steps={args.max_steps}.")
+            break
 
     print(f"Episode length: {step_count}")
+    print(f"Policy decisions: {decision_count}")
     print(f"Total dense reward: {total_reward:.3f}")
     if "coverage" in final_info:
         print(f"Coverage: {float(final_info['coverage']):.3f}")
     print(f"Rendered source: {args.source}")
     print(f"Action interpretation: {action_mode}")
-    print(f"Video saved to '{video_folder}'.")
+    if record_video:
+        print(f"Video saved to '{video_folder}'.")
+    else:
+        print("Video recording disabled.")
 
     env.close()
 

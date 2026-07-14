@@ -34,9 +34,9 @@ def resolve_tokenizer_path(path: str | None = None) -> str:
             return str(explicit)
 
     candidates = [
-        PROJECT_ROOT / "logs" / "tokenizer_ckpts" / "latest.pt",
         PROJECT_ROOT / "local_models" / "tokenizer" / "tokenizer.pt",
         PROJECT_ROOT / "local_models" / "tokenizer" / "latest.pt",
+        PROJECT_ROOT / "logs" / "tokenizer_ckpts" / "latest.pt",
     ]
     return str(_first_existing(candidates))
 

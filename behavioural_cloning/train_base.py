@@ -217,6 +217,13 @@ def _strip_prefix(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str,
     return {key[len(prefix):]: value for key, value in state_dict.items() if key.startswith(prefix)}
 
 
+def _clean_state_dict_keys(state_dict: dict[str, torch.Tensor], prefixes: tuple[str, ...]) -> dict[str, torch.Tensor]:
+    cleaned = state_dict
+    for prefix in prefixes:
+        cleaned = _strip_prefix(cleaned, prefix)
+    return cleaned
+
+
 def load_tokenizer_encoder(tokenizer_ckpt_name: str) -> nn.Module:
     ckpt_path = Path(tokenizer_ckpt_name)
     if not ckpt_path.is_absolute():
@@ -267,8 +274,7 @@ def load_tokenizer_encoder(tokenizer_ckpt_name: str) -> nn.Module:
 
     state_dict = ckpt.get("model", ckpt)
     if isinstance(state_dict, dict):
-        state_dict = _strip_prefix(state_dict, "module.")
-        state_dict = _strip_prefix(state_dict, "encoder.")
+        state_dict = _clean_state_dict_keys(state_dict, ("module.", "_orig_mod.", "encoder."))
     encoder.load_state_dict(state_dict, strict=True)
     encoder.requires_grad_(False)
     encoder.eval()
