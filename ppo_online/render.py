@@ -118,8 +118,6 @@ class ChunkExecutionWrapper(gym.Wrapper):
             return np.clip((primitive + 1.0) * 256.0, 0.0, 512.0)
         if self.mode in {"first_delta", "chunk_delta"}:
             return np.clip(self.current_eef + primitive * self.max_step_pixels, 0.0, 512.0)
-        if self.mode in {"first_relative", "chunk_relative"}:
-            return np.asarray(primitive, dtype=np.float32)
         raise ValueError(f"Unsupported chunk execution mode: {self.mode}")
 
     def step(self, macro_action):
@@ -165,8 +163,6 @@ def make_render_env(config: TrainConfig, video_folder: str, action_mode: str, re
         image_height=image_height,
         image_width=image_width,
     )
-    if resolved_env_id.startswith("swm/") and action_mode in {"first_relative", "chunk_relative"}:
-        env_kwargs["relative"] = True
 
     env = gym.make(resolved_env_id, **env_kwargs)
     if record_video:
@@ -232,16 +228,7 @@ def parse_args():
     )
     parser.add_argument(
         "--action-mode",
-        choices=(
-            "auto",
-            "ppo_chunk",
-            "first_absolute",
-            "first_delta",
-            "first_relative",
-            "chunk_absolute",
-            "chunk_delta",
-            "chunk_relative",
-        ),
+        choices=("auto", "ppo_chunk", "first_absolute", "first_delta", "chunk_absolute", "chunk_delta"),
         default="auto",
         help="How to interpret the predicted action chunk during rendering.",
     )
@@ -287,12 +274,8 @@ def render_agent_to_video():
     else:
         model_path = resolve_ppo_checkpoint_path(model_path)
     action_mode = args.action_mode
-    resolved_env_id = resolve_pusht_env_id(config.env_id)
     if action_mode == "auto":
-        if args.source == "bc_prior" and resolved_env_id.startswith("swm/"):
-            action_mode = "chunk_relative"
-        else:
-            action_mode = "chunk_delta" if args.source == "bc_prior" else "ppo_chunk"
+        action_mode = "chunk_delta" if args.source == "bc_prior" else "ppo_chunk"
     video_folder = "./videos"
     record_video = not args.no_video
     if record_video:

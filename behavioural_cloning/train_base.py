@@ -177,16 +177,7 @@ class TokenizerBackbone(nn.Module):
 
 
 class ActionClassifier(nn.Module):
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        action_dim: int,
-        dropout: float,
-        temporal_layers: int = 2,
-        temporal_heads: int = 4,
-        max_seq_len: int = 64,
-    ):
+    def __init__(self, in_dim: int, hidden_dim: int, action_dim: int, dropout: float):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
@@ -197,45 +188,10 @@ class ActionClassifier(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, action_dim),
         )
-        self.hidden_dim = int(hidden_dim)
-        self.action_dim = int(action_dim)
-        self.max_seq_len = int(max_seq_len)
-        self.temporal_in = nn.Linear(in_dim, hidden_dim)
-        self.temporal_pos = nn.Parameter(torch.zeros(1, self.max_seq_len, hidden_dim))
-        self.temporal_blocks = nn.ModuleList(
-            [
-                nn.TransformerEncoderLayer(
-                    d_model=hidden_dim,
-                    nhead=temporal_heads,
-                    dim_feedforward=hidden_dim * 4,
-                    dropout=dropout,
-                    activation="gelu",
-                    batch_first=True,
-                    norm_first=True,
-                )
-                for _ in range(max(0, int(temporal_layers)))
-            ]
-        )
-        self.temporal_norm = nn.LayerNorm(hidden_dim)
-        self.temporal_out = nn.Linear(hidden_dim, action_dim)
-        nn.init.zeros_(self.temporal_out.weight)
-        nn.init.zeros_(self.temporal_out.bias)
-
-    def _positional_encoding(self, seq_len: int) -> torch.Tensor:
-        if seq_len <= self.max_seq_len:
-            return self.temporal_pos[:, :seq_len, :]
-        pos = self.temporal_pos.transpose(1, 2)
-        pos = F.interpolate(pos, size=seq_len, mode="linear", align_corners=False)
-        return pos.transpose(1, 2)
 
     def forward(self, features_btD: torch.Tensor) -> torch.Tensor:
         B, T, D = features_btD.shape
-        base_logits = self.net(features_btD.reshape(B * T, D)).view(B, T, -1)
-        temporal_features = self.temporal_in(features_btD) + self._positional_encoding(T)
-        for block in self.temporal_blocks:
-            temporal_features = block(temporal_features)
-        temporal_logits = self.temporal_out(self.temporal_norm(temporal_features))
-        logits = base_logits + temporal_logits
+        logits = self.net(features_btD.reshape(B * T, D))
         actions = torch.tanh(logits)
         return actions.view(B, T, -1)
 
@@ -398,9 +354,6 @@ def train(args):
         hidden_dim=args.hidden_dim,
         action_dim=action_dim,
         dropout=args.dropout,
-        temporal_layers=args.temporal_layers,
-        temporal_heads=args.temporal_heads,
-        max_seq_len=args.seq_len,
     )
     model = Policy(backbone=backbone, classifier=classifier).to(device)
 
@@ -553,8 +506,6 @@ if __name__ == "__main__":
     # model
     p.add_argument("--hidden_dim", type=int, default=512)
     p.add_argument("--dropout", type=float, default=0.05)
-    p.add_argument("--temporal_layers", type=int, default=2)
-    p.add_argument("--temporal_heads", type=int, default=4)
     p.add_argument(
         "--tokenizer_ckpt_name",
         type=str,
