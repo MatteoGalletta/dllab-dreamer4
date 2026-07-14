@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = Path(__file__).resolve().parent
-LOCAL_MODEL_ROOT = PROJECT_ROOT / "local_models"
+LOCAL_MODEL_ROOT = PROJECT_ROOT / "logs"
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 if str(PROJECT_ROOT) not in sys.path:
@@ -275,9 +275,9 @@ def load_tokenizer_encoder(tokenizer_ckpt_name: str) -> nn.Module:
     ckpt_path = Path(tokenizer_ckpt_name)
     if not ckpt_path.is_absolute():
         candidate_paths = [
-            LOCAL_MODEL_ROOT / "tokenizer" / tokenizer_ckpt_name,
-            LOCAL_MODEL_ROOT / "tokenizer" / "tokenizer.pt",
-            LOCAL_MODEL_ROOT / "tokenizer" / "latest.pt",
+            LOCAL_MODEL_ROOT / "tokenizer_ckpts" / tokenizer_ckpt_name,
+            LOCAL_MODEL_ROOT / "tokenizer_ckpts" / "tokenizer.pt",
+            LOCAL_MODEL_ROOT / "tokenizer_ckpts" / "latest.pt",
         ]
         ckpt_path = next((path for path in candidate_paths if path.exists()), candidate_paths[0])
     ckpt = torch.load(ckpt_path, map_location="cpu")
