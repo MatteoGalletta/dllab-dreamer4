@@ -325,6 +325,7 @@ def render_agent_to_video():
             action_dim=action_dim,
             hidden_dim=config.actor_hidden_dim,
             dropout=config.actor_dropout,
+            max_seq_len=obs_shape[0] if len(obs_shape) >= 1 else 64,
         ).to(device)
     else:
         network = VectorActorCritic(

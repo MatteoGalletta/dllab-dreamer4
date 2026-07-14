@@ -79,6 +79,9 @@ class BCActionClassifier(nn.Module):
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, action_dim),
         )
         self.hidden_dim = int(hidden_dim)
@@ -256,6 +259,7 @@ class BCStyleLatentActorCritic(nn.Module):
         action_dim: int,
         hidden_dim: int = 512,
         dropout: float = 0.05,
+        max_seq_len: int = 64,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -266,7 +270,7 @@ class BCStyleLatentActorCritic(nn.Module):
             hidden_dim=hidden_dim,
             action_dim=action_dim,
             dropout=dropout,
-            max_seq_len=64,
+            max_seq_len=max_seq_len,
         )
         self.log_std = nn.Parameter(torch.full((1, action_dim), -1.0))
         self.critic = nn.Sequential(

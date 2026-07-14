@@ -192,6 +192,9 @@ class ActionClassifier(nn.Module):
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, action_dim),
         )
         self.hidden_dim = int(hidden_dim)

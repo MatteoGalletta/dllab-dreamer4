@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import math
 import random
 from pathlib import Path
@@ -496,8 +497,24 @@ def make_env(rank: int, seed: int, config: TrainConfig, render_mode: str | None 
     return _thunk
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train PPO on PushT with optional BC/tokenizer overrides.")
+    parser.add_argument("--bc-prior-path", type=str, default=None)
+    parser.add_argument("--tokenizer-path", type=str, default=None)
+    parser.add_argument("--save-path", type=str, default=None)
+    parser.add_argument("--wandb-mode", type=str, default=None)
+    return parser.parse_args()
+
+
 def train_pusht():
+    args = parse_args()
     config = TrainConfig()
+    if args.bc_prior_path is not None:
+        config.bc_prior_path = args.bc_prior_path
+    if args.tokenizer_path is not None:
+        config.tokenizer_path = args.tokenizer_path
+    if args.save_path is not None:
+        config.save_path = args.save_path
     config.bc_prior_path = resolve_bc_prior_path(config.bc_prior_path)
     config.tokenizer_path = resolve_tokenizer_path(config.tokenizer_path)
     config.save_path = resolve_ppo_checkpoint_path(config.save_path)
@@ -509,6 +526,7 @@ def train_pusht():
         project="pusht-ppo",
         name=f"ppo_bc_chunk{config.chunk_size}_seed{config.seed}",
         config=config.__dict__,
+        mode=args.wandb_mode,
     )
 
     random.seed(config.seed)

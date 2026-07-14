@@ -104,6 +104,7 @@ class PPOAgent:
                 action_dim=action_dim,
                 hidden_dim=actor_hidden_dim,
                 dropout=actor_dropout,
+                max_seq_len=obs_shape[0] if obs_shape is not None and len(obs_shape) >= 1 else 64,
             ).to(self.device_override)
         else:
             self.network = VectorActorCritic(
@@ -244,6 +245,7 @@ class PPOAgent:
                 action_dim=action_dim,
                 hidden_dim=getattr(self.network, "hidden_dim", 512),
                 dropout=0.0,
+                max_seq_len=self.obs_shape[0] if self.obs_shape is not None and len(self.obs_shape) >= 1 else 64,
             ).to(self.device)
         else:
             prior_network = VectorActorCritic(
