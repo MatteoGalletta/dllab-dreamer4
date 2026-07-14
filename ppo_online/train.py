@@ -168,29 +168,58 @@ class PushTDenseRewardWrapper(gym.Wrapper):
         overlap_pixels = goal_pixels & (block_mask > 0)
         return float(overlap_pixels.sum() / max(1, goal_pixels.sum()))
 
+    def _resolve_goal_block_pose(self, info: dict, state: np.ndarray) -> np.ndarray | None:
+        goal_pose = info.get("goal_pose")
+        if goal_pose is not None:
+            goal_pose = np.asarray(goal_pose, dtype=np.float32).reshape(-1)
+            if goal_pose.shape[0] >= 3:
+                return goal_pose[:3]
+
+        goal_state = info.get("goal_state")
+        if goal_state is not None:
+            goal_state = np.asarray(goal_state, dtype=np.float32).reshape(-1)
+            if goal_state.shape[0] >= 5:
+                return np.array([goal_state[2], goal_state[3], goal_state[4]], dtype=np.float32)
+
+        if state.shape[0] >= 5:
+            return np.array([self.target_pos[0], self.target_pos[1], state[4]], dtype=np.float32)
+        return None
+
+    def _angle_distance(self, angle_a: float, angle_b: float) -> float:
+        diff = abs(angle_a - angle_b) % (2.0 * math.pi)
+        return min(diff, (2.0 * math.pi) - diff)
+
     def step(self, action):
         observation, original_reward, terminated, truncated, info = self.env.step(action)
 
         state = extract_state_array(observation)
         eef_pos = state[0:2].astype(np.float32)
         block_pos = state[2:4].astype(np.float32)
+        block_angle = float(state[4]) if state.shape[0] >= 5 else 0.0
+        goal_block_pose = self._resolve_goal_block_pose(info, state)
+        goal_block_pos = goal_block_pose[:2] if goal_block_pose is not None else self.target_pos
+        goal_block_angle = float(goal_block_pose[2]) if goal_block_pose is not None else block_angle
 
         dist_reach = float(np.linalg.norm(eef_pos - block_pos))
-        dist_push = float(np.linalg.norm(block_pos - self.target_pos))
+        dist_push = float(np.linalg.norm(block_pos - goal_block_pos))
+        angle_error = self._angle_distance(block_angle, goal_block_angle)
 
         r_push = math.exp(-dist_push / 100.0)
         dist_reach_eff = max(0.0, dist_reach - 60.0)
         r_reach = math.exp(-dist_reach_eff / 100.0)
+        r_angle = math.exp(-angle_error / (math.pi / 6.0))
 
         info = dict(info)
         info["original_reward"] = float(original_reward)
         info["reach_reward"] = float(r_reach)
         info["push_reward"] = float(r_push)
+        info["angle_reward"] = float(r_angle)
         info["distance_to_block"] = dist_reach
         info["distance_to_target"] = dist_push
+        info["angle_error"] = angle_error
 
         if self.env_id.startswith("swm/"):
-            dense_reward = (1.0 * r_reach) + (3.0 * r_push)
+            dense_reward = (1.0 * r_reach) + (3.0 * r_push) + (1.0 * r_angle)
             visual_coverage = self._compute_visual_coverage(info)
             if visual_coverage is not None:
                 info["coverage"] = float(visual_coverage)
