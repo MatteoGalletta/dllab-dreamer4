@@ -64,7 +64,16 @@ class VectorActorCritic(nn.Module):
 
 
 class BCActionClassifier(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int, action_dim: int, dropout: float):
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        action_dim: int,
+        dropout: float,
+        temporal_layers: int = 2,
+        temporal_heads: int = 4,
+        max_seq_len: int = 64,
+    ):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
@@ -72,6 +81,36 @@ class BCActionClassifier(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, action_dim),
         )
+        self.hidden_dim = int(hidden_dim)
+        self.action_dim = int(action_dim)
+        self.max_seq_len = int(max_seq_len)
+        self.temporal_in = nn.Linear(in_dim, hidden_dim)
+        self.temporal_pos = nn.Parameter(torch.zeros(1, self.max_seq_len, hidden_dim))
+        self.temporal_blocks = nn.ModuleList(
+            [
+                nn.TransformerEncoderLayer(
+                    d_model=hidden_dim,
+                    nhead=temporal_heads,
+                    dim_feedforward=hidden_dim * 4,
+                    dropout=dropout,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                for _ in range(max(0, int(temporal_layers)))
+            ]
+        )
+        self.temporal_norm = nn.LayerNorm(hidden_dim)
+        self.temporal_out = nn.Linear(hidden_dim, action_dim)
+        nn.init.zeros_(self.temporal_out.weight)
+        nn.init.zeros_(self.temporal_out.bias)
+
+    def _positional_encoding(self, seq_len: int) -> torch.Tensor:
+        if seq_len <= self.max_seq_len:
+            return self.temporal_pos[:, :seq_len, :]
+        pos = self.temporal_pos.transpose(1, 2)
+        pos = torch.nn.functional.interpolate(pos, size=seq_len, mode="linear", align_corners=False)
+        return pos.transpose(1, 2)
 
     def forward(self, features_btD: torch.Tensor) -> torch.Tensor:
         if features_btD.ndim == 2:
@@ -79,7 +118,12 @@ class BCActionClassifier(nn.Module):
         if features_btD.ndim != 3:
             raise ValueError(f"Expected latent sequence with shape (B, T, D), got {tuple(features_btD.shape)}")
         B, T, D = features_btD.shape
-        logits = self.net(features_btD.reshape(B * T, D))
+        base_logits = self.net(features_btD.reshape(B * T, D)).view(B, T, -1)
+        temporal_features = self.temporal_in(features_btD) + self._positional_encoding(T)
+        for block in self.temporal_blocks:
+            temporal_features = block(temporal_features)
+        temporal_logits = self.temporal_out(self.temporal_norm(temporal_features))
+        logits = base_logits + temporal_logits
         actions = torch.tanh(logits)
         return actions.view(B, T, -1)
 
@@ -149,6 +193,7 @@ class BCPixelActorCritic(nn.Module):
             hidden_dim=hidden_dim,
             action_dim=action_dim,
             dropout=dropout,
+            max_seq_len=self.image_shape[0] if len(self.image_shape) >= 1 else 64,
         )
         self.log_std = nn.Parameter(torch.full((1, action_dim), -1.0))
         self.critic = nn.Sequential(
@@ -221,6 +266,7 @@ class BCStyleLatentActorCritic(nn.Module):
             hidden_dim=hidden_dim,
             action_dim=action_dim,
             dropout=dropout,
+            max_seq_len=64,
         )
         self.log_std = nn.Parameter(torch.full((1, action_dim), -1.0))
         self.critic = nn.Sequential(
