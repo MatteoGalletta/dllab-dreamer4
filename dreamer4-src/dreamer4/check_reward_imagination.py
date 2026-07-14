@@ -54,21 +54,22 @@ def get_device():
     return torch.device("cpu")
 
 
-def load_dynamics_from_ckpt(ckpt_path: str, tokenizer_ckpt: str, device: torch.device):
+def load_dynamics_from_ckpt(ckpt_path: str, device: torch.device, tokenizer_ckpt_override: str = None):
     """Reconstructs the Dynamics model exactly from a checkpoint saved by
     train_dynamics.py -- all hyperparams needed are in ckpt['args']."""
     ckpt = torch.load(ckpt_path, map_location="cpu")
     dyn_args = ckpt["args"]
 
-    # Re-load the tokenizer this dynamics model was trained against (its
-    # own path is stored in dyn_args). Filter None override values so we
-    # don't clobber the tokenizer's own saved args with unset CLI defaults.
+    # Use explicitly passed tokenizer checkpoint if available to avoid relative path errors
+    tokenizer_path = tokenizer_ckpt_override if tokenizer_ckpt_override is not None else dyn_args["tokenizer_ckpt"]
+
+    # Filter None override values so we don't clobber the tokenizer's own saved args with unset CLI defaults.
     override = {
         k: dyn_args[k] for k in ("H", "W", "C", "patch")
         if dyn_args.get(k) is not None
     }
     encoder, decoder, tok_args = load_frozen_tokenizer_from_pt_ckpt(
-        tokenizer_ckpt, device=device, override=override
+        tokenizer_path, device=device, override=override
     )
 
     n_latents = int(tok_args.get("n_latents", 16))
@@ -206,6 +207,7 @@ def run_aggregate(
 ):
     imag_success_flags, real_success_flags, gt_success_flags = [], [], []
     offsets_matched = []  # imagined-vs-gt frame offset, only when both cross
+    horizons = []  # imagined horizon length per episode (n - ctx_len)
     skipped = 0
 
     for i, ep_idx in enumerate(episode_indices):
@@ -233,6 +235,7 @@ def run_aggregate(
         imag_success_flags.append(imag_success)
         real_success_flags.append(real_success)
         gt_success_flags.append(gt_success)
+        horizons.append(max(0, n - ctx_len))
 
         if imag_success and gt_success:
             imag_idx = int(np.where(pred_imagined[:n] >= threshold)[0][0])
@@ -245,6 +248,7 @@ def run_aggregate(
     imag_success_flags = np.array(imag_success_flags)
     real_success_flags = np.array(real_success_flags)
     gt_success_flags = np.array(gt_success_flags)
+    horizons = np.array(horizons)
 
     n_done = len(gt_success_flags)
     print(f"\n=== Aggregate results over {n_done} episodes (skipped {skipped}) ===")
@@ -262,6 +266,36 @@ def run_aggregate(
     print(f"  -> False positives (imagination hallucinated success): {imag_cm['fp']}/{n_done}")
     print(f"  -> False negatives (imagination missed a real success): {imag_cm['fn']}/{n_done}")
 
+    # ---- horizon-stratified breakdown ----
+    gt_pos_mask = gt_success_flags == 1
+    if gt_pos_mask.sum() > 0:
+        print("\n-- Recall (on imagination) stratified by imagined horizon length --")
+        print("   (only episodes where gt_success=1 are included -- this is recall, not full P/R/F1)")
+        h_pos = horizons[gt_pos_mask]
+        imag_pos = imag_success_flags[gt_pos_mask]
+
+        n_buckets = 4
+        edges = np.quantile(h_pos, np.linspace(0, 1, n_buckets + 1))
+        edges[-1] += 1e-6  # ensure the max value falls in the last bucket
+        edges = np.unique(edges)  # guard against duplicate edges
+
+        print(f"   {'horizon range':<18}{'n_episodes':>12}{'recall':>10}")
+        for b in range(len(edges) - 1):
+            lo, hi = edges[b], edges[b + 1]
+            mask = (h_pos >= lo) & (h_pos < hi)
+            n_bucket = int(mask.sum())
+            if n_bucket == 0:
+                continue
+            bucket_recall = float(imag_pos[mask].mean())
+            print(f"   [{lo:.0f}, {hi:.0f}){'':<8}{n_bucket:>12}{bucket_recall:>10.3f}")
+
+        # simple correlation check: horizon length vs. miss (1=missed)
+        missed = 1.0 - imag_pos
+        if h_pos.std() > 0 and missed.std() > 0:
+            corr = float(np.corrcoef(h_pos, missed)[0, 1])
+            print(f"\n   correlation(horizon length, miss): {corr:+.3f} "
+                  f"(positive => longer horizon, more misses => consistent with rollout drift)")
+
     if len(offsets_matched) > 0:
         offsets_matched = np.array(offsets_matched)
         print(f"\n-- Timing, for the {len(offsets_matched)} episodes where imagination correctly detects success --")
@@ -276,7 +310,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", type=str, required=True)
     p.add_argument("--tokenizer_ckpt", type=str, required=True,
-                   help="Tokenizer path to pass to decoder/encoder setup logic inside the loader")
+                   help="Tokenizer checkpoint path (now actively used to override broken relative paths in dynamics ckpt)")
     p.add_argument("--dynamics_ckpt", type=str, required=True)
     p.add_argument("--reward_ckpt", type=str, required=True)
     p.add_argument("--episodes", type=int, nargs="+", default=[0, 1, 2, 80, 199])
@@ -293,16 +327,16 @@ def main():
     p.add_argument("--aggregate", action="store_true",
                    help="run over many episodes and report a confusion matrix instead of per-episode detail")
     p.add_argument("--num_episodes", type=int, default=100,
-                   help="number of random episodes to sample when --aggregate is set")
+                   help="number of random episodes to sample when --aggregate is set (ignored if --episodes is explicitly meaningful and --aggregate not set)")
     p.add_argument("--random_seed", type=int, default=0)
     args = p.parse_args()
 
     device = get_device()
 
+    # Pass the CLI's tokenizer_ckpt explicitly to override relative metadata paths
     dyn, dyn_args, encoder, decoder, tok_args, packing_factor = load_dynamics_from_ckpt(
-        args.dynamics_ckpt, args.tokenizer_ckpt, device
+        args.dynamics_ckpt, device, tokenizer_ckpt_override=args.tokenizer_ckpt
     )
-
     print(f"Loaded dynamics model from {args.dynamics_ckpt} "
           f"(k_max={dyn_args['k_max']}, action_chunk_size={dyn_args['action_chunk_size']}, "
           f"use_actions={dyn_args.get('use_actions', False)})")
@@ -330,14 +364,10 @@ def main():
         return
 
     for ep_idx in args.episodes:
-        try:
-            pred_real, pred_imagined, states, ctx_length = run_episode_in_imagination(
-                ep_idx, args.dataset, dyn, dyn_args, encoder, decoder, tok_args, packing_factor,
-                reward_head, device, args.ctx_length, args.schedule, args.eval_d,
-            )
-        except Exception as e:
-            print(f"  [skip] episode {ep_idx}: {e}")
-            continue
+        pred_real, pred_imagined, states, ctx_length = run_episode_in_imagination(
+            ep_idx, args.dataset, dyn, dyn_args, encoder, decoder, tok_args, packing_factor,
+            reward_head, device, args.ctx_length, args.schedule, args.eval_d,
+        )
 
         n = min(len(pred_real), len(pred_imagined), len(states))
         block_states = states[:n, 2:5]
@@ -348,13 +378,11 @@ def main():
 
         print(f"\n=== Episode {ep_idx} (len={n}, ctx_length={ctx_length}) ===")
         print(f"{'frame':<8}{'pred_real':>12}{'pred_imag':>12}{'gt_dense':>12}{'gt_binary':>10}{'in_ctx':>8}")
-
         checkpoints = sorted(set(list(range(0, n, max(1, n // 12))) + list(range(max(0, n - 6), n))))
         for t in checkpoints:
-            if t >= n:
-                continue
             in_ctx = "yes" if t < ctx_length else ""
-            print(f"{t:<8}{pred_real[t]:>12.4f}{pred_imagined[t]:>12.4f}{gt_dense[t]:>12.4f}{gt_binary[t]:>10.0f}{in_ctx:>8}")
+            print(
+                f"{t:<8}{pred_real[t]:>12.4f}{pred_imagined[t]:>12.4f}{gt_dense[t]:>12.4f}{gt_binary[t]:>10.0f}{in_ctx:>8}")
 
         # first frame (after context) each signal crosses threshold, if any
         def first_crossing(arr, thresh, start=0):
