@@ -132,16 +132,18 @@ class BCActionClassifier(nn.Module):
             raise ValueError(f"Expected latent sequence with shape (B, T, D), got {tuple(features_btD.shape)}")
         B, T, D = features_btD.shape
         base_logits = self.net(features_btD.reshape(B * T, D)).view(B, T, -1)
-        temporal_features = self.temporal_in(features_btD).to(torch.float32)
-        temporal_pos = self._positional_encoding(T).to(
-            device=temporal_features.device,
-            dtype=torch.float32,
-        )
-        temporal_features = temporal_features + temporal_pos
-        attn_mask = self._causal_local_mask(T, temporal_features.device)
-        for block in self.temporal_blocks:
-            temporal_features = block(temporal_features, src_mask=attn_mask)
-        temporal_logits = self.temporal_out(self.temporal_norm(temporal_features)).to(base_logits.dtype)
+        with torch.autocast(device_type=features_btD.device.type, enabled=False):
+            temporal_features = self.temporal_in(features_btD.float())
+            temporal_pos = self._positional_encoding(T).to(
+                device=temporal_features.device,
+                dtype=torch.float32,
+            )
+            temporal_features = temporal_features + temporal_pos
+            attn_mask = self._causal_local_mask(T, temporal_features.device)
+            for block in self.temporal_blocks:
+                temporal_features = block(temporal_features, src_mask=attn_mask)
+            temporal_logits = self.temporal_out(self.temporal_norm(temporal_features))
+        temporal_logits = temporal_logits.to(base_logits.dtype)
         logits = base_logits + temporal_logits
         actions = torch.tanh(logits)
         return actions.view(B, T, -1)
