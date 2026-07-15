@@ -282,11 +282,23 @@ class RenderedImageObsWrapper(gym.ObservationWrapper):
     tokenizer/BC training resolution so PPO can reuse the full BC image prior.
     """
 
-    def __init__(self, env: gym.Env, tokenizer_ckpt: str):
+    def __init__(
+        self,
+        env: gym.Env,
+        tokenizer_ckpt: str | None = None,
+        target_height: int | None = None,
+        target_width: int | None = None,
+    ):
         super().__init__(env)
-        _, info = load_tokenizer_from_ckpt(tokenizer_ckpt, torch.device("cpu"))
-        self.target_height = int(info["H"])
-        self.target_width = int(info["W"])
+        if tokenizer_ckpt is not None:
+            _, info = load_tokenizer_from_ckpt(tokenizer_ckpt, torch.device("cpu"))
+            self.target_height = int(info["H"])
+            self.target_width = int(info["W"])
+        else:
+            if target_height is None or target_width is None:
+                raise ValueError("RenderedImageObsWrapper needs either tokenizer_ckpt or explicit target_height/target_width.")
+            self.target_height = int(target_height)
+            self.target_width = int(target_width)
         self.observation_space = gym.spaces.Box(
             low=0,
             high=255,

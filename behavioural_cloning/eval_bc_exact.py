@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from collections import deque
 from pathlib import Path
 import sys
@@ -148,6 +149,8 @@ def parse_args():
         help="Output video path. Pass empty string to disable video saving.",
     )
     parser.add_argument("--print-every", type=int, default=25)
+    parser.add_argument("--temporal-ensemble", action="store_true")
+    parser.add_argument("--temporal-ensemble-decay", type=float, default=0.35)
     return parser.parse_args()
 
 
@@ -208,6 +211,28 @@ def map_primitive_to_env_action(
     if mode == "absolute":
         return np.clip((primitive + 1.0) * 256.0, 0.0, 512.0)
     raise ValueError(f"Unsupported action mode: {mode}")
+
+
+def ensemble_primitive(
+    pending_chunks: deque[dict[str, np.ndarray | int]],
+    chunk_size: int,
+    decay: float,
+) -> np.ndarray:
+    candidates = []
+    weights = []
+    for age, entry in enumerate(reversed(pending_chunks)):
+        offset = int(entry["offset"])
+        if offset >= chunk_size:
+            continue
+        candidates.append(np.asarray(entry["chunk"], dtype=np.float32)[offset])
+        weights.append(math.exp(-decay * age))
+
+    if not candidates:
+        return np.zeros(2, dtype=np.float32)
+
+    weights_np = np.asarray(weights, dtype=np.float32)
+    weights_np /= max(weights_np.sum(), 1e-8)
+    return np.sum(np.asarray(candidates, dtype=np.float32) * weights_np[:, None], axis=0)
 
 
 def save_video(frames: list[np.ndarray], video_path: str, fps: int = 15):
@@ -274,7 +299,7 @@ def main():
     print(
         f"Loaded BC checkpoint from {checkpoint_path} | tokenizer={tokenizer_path} "
         f"| seq_len={model_cfg['seq_len']} chunk={model_cfg['action_chunk_size']} "
-        f"| action_mode={args.action_mode} | device={device}"
+        f"| action_mode={args.action_mode} | temporal_ensemble={args.temporal_ensemble} | device={device}"
     )
 
     all_returns: list[float] = []
@@ -287,6 +312,7 @@ def main():
         del info
         frame_history: deque[np.ndarray] = deque(maxlen=model_cfg["seq_len"])
         action_buffer: deque[np.ndarray] = deque()
+        pending_chunks: deque[dict[str, np.ndarray | int]] = deque()
         done = False
         total_reward = 0.0
         step_count = 0
@@ -299,15 +325,25 @@ def main():
             if episode_idx == 0 and args.video_path:
                 saved_frames.append(frame.copy())
 
-            if not action_buffer:
+            if args.temporal_ensemble or not action_buffer:
                 stacked_frames = pad_history(frame_history, model_cfg["seq_len"])
                 input_tensor = torch.as_tensor(stacked_frames[None], dtype=torch.uint8, device=device)
                 with torch.no_grad():
                     action_chunk = model.predict_action_chunk(input_tensor).squeeze(0).cpu().numpy()
                 action_chunk = np.clip(action_chunk, -1.0, 1.0)
-                action_buffer.extend(action_chunk)
+                if args.temporal_ensemble:
+                    pending_chunks.append({"chunk": action_chunk, "offset": 0})
+                else:
+                    action_buffer.extend(action_chunk)
 
-            primitive = np.asarray(action_buffer.popleft(), dtype=np.float32)
+            if args.temporal_ensemble:
+                primitive = ensemble_primitive(
+                    pending_chunks,
+                    chunk_size=model_cfg["action_chunk_size"],
+                    decay=args.temporal_ensemble_decay,
+                )
+            else:
+                primitive = np.asarray(action_buffer.popleft(), dtype=np.float32)
             env_action = map_primitive_to_env_action(
                 primitive,
                 mode=args.action_mode,
@@ -321,6 +357,12 @@ def main():
             step_count += 1
             final_info = dict(info)
             done = bool(terminated or truncated)
+
+            if args.temporal_ensemble:
+                for entry in pending_chunks:
+                    entry["offset"] = int(entry["offset"]) + 1
+                while pending_chunks and int(pending_chunks[0]["offset"]) >= model_cfg["action_chunk_size"]:
+                    pending_chunks.popleft()
 
             if args.print_every > 0 and (step_count % args.print_every == 0 or done):
                 coverage = final_info.get("coverage")

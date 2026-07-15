@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
+from collections import deque
 
 import gymnasium as gym
 import numpy as np
@@ -162,15 +164,84 @@ class ChunkExecutionWrapper(gym.Wrapper):
         return obs, float(total_reward), terminated, truncated, info
 
 
+class TemporalEnsembleChunkExecutionWrapper(gym.Wrapper):
+    def __init__(self, env: gym.Env, chunk_size: int, mode: str, max_step_pixels: float, ensemble_decay: float):
+        super().__init__(env)
+        self.chunk_size = chunk_size
+        self.mode = mode
+        self.max_step_pixels = max_step_pixels
+        self.ensemble_decay = ensemble_decay
+        low = np.full((chunk_size * 2,), -1.0, dtype=np.float32)
+        high = np.full((chunk_size * 2,), 1.0, dtype=np.float32)
+        self.action_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
+        self.current_eef = np.array([256.0, 256.0], dtype=np.float32)
+        self.pending_chunks: deque[dict[str, object]] = deque()
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        state = extract_state_array(obs)
+        self.current_eef = state[0:2].copy()
+        self.pending_chunks.clear()
+        return obs, info
+
+    def _ensemble_primitive(self) -> np.ndarray:
+        candidates = []
+        weights = []
+        for age, entry in enumerate(reversed(self.pending_chunks)):
+            offset = int(entry["offset"])
+            if offset >= self.chunk_size:
+                continue
+            candidates.append(np.asarray(entry["chunk"], dtype=np.float32)[offset])
+            weights.append(math.exp(-self.ensemble_decay * age))
+
+        if not candidates:
+            return np.zeros(2, dtype=np.float32)
+
+        weights_np = np.asarray(weights, dtype=np.float32)
+        weights_np /= max(weights_np.sum(), 1e-8)
+        return np.sum(np.asarray(candidates, dtype=np.float32) * weights_np[:, None], axis=0)
+
+    def _map_primitive_to_env_action(self, primitive: np.ndarray) -> np.ndarray:
+        if self.mode == "ensemble_absolute":
+            return np.clip((primitive + 1.0) * 256.0, 0.0, 512.0)
+        if self.mode == "ensemble_delta":
+            return np.clip(self.current_eef + primitive * self.max_step_pixels, 0.0, 512.0)
+        if self.mode == "ensemble_relative":
+            return np.asarray(primitive, dtype=np.float32)
+        raise ValueError(f"Unsupported temporal ensemble mode: {self.mode}")
+
+    def step(self, macro_action):
+        macro_action = np.asarray(macro_action, dtype=np.float32)
+        primitives = np.clip(macro_action, -1.0, 1.0).reshape(self.chunk_size, 2)
+        self.pending_chunks.append({"chunk": primitives, "offset": 0})
+
+        primitive = self._ensemble_primitive()
+        env_action = self._map_primitive_to_env_action(primitive)
+        obs, reward, terminated, truncated, info = self.env.step(env_action)
+        state = extract_state_array(obs)
+        self.current_eef = state[0:2].copy()
+
+        for entry in self.pending_chunks:
+            entry["offset"] = int(entry["offset"]) + 1
+        while self.pending_chunks and int(self.pending_chunks[0]["offset"]) >= self.chunk_size:
+            self.pending_chunks.popleft()
+
+        info = dict(info)
+        info["executed_actions"] = np.asarray([env_action], dtype=np.float32)
+        info["executed_primitives"] = np.asarray([primitive], dtype=np.float32)
+        info["num_active_chunks"] = len(self.pending_chunks)
+        return obs, float(reward), terminated, truncated, info
+
+
 def make_render_env(config: TrainConfig, video_folder: str, action_mode: str, record_video: bool = True):
     tokenizer_info = None
-    if config.network_type in {"bc_pixels", "bc_latent"}:
+    if config.network_type == "bc_latent":
         _, tokenizer_info = load_tokenizer_from_ckpt(config.tokenizer_path, torch.device("cpu"))
 
     resolved_env_id = resolve_pusht_env_id(config.env_id)
-    image_height = int(tokenizer_info["H"]) if tokenizer_info is not None else None
-    image_width = int(tokenizer_info["W"]) if tokenizer_info is not None else None
-    relative = action_mode in {"first_relative", "chunk_relative"}
+    image_height = int(tokenizer_info["H"]) if tokenizer_info is not None else int(getattr(config, "image_height", 224))
+    image_width = int(tokenizer_info["W"]) if tokenizer_info is not None else int(getattr(config, "image_width", 224))
+    relative = action_mode in {"first_relative", "chunk_relative", "ensemble_relative"}
     env = make_pusht_env(
         env_id=resolved_env_id,
         render_mode="rgb_array",
@@ -197,6 +268,14 @@ def make_render_env(config: TrainConfig, video_folder: str, action_mode: str, re
             max_step_pixels=config.max_step_pixels,
             ensemble_decay=config.ensemble_decay,
         )
+    elif action_mode.startswith("ensemble_"):
+        env = TemporalEnsembleChunkExecutionWrapper(
+            env,
+            chunk_size=config.chunk_size,
+            mode=action_mode,
+            max_step_pixels=config.max_step_pixels,
+            ensemble_decay=config.ensemble_decay,
+        )
     else:
         env = ChunkExecutionWrapper(
             env,
@@ -205,7 +284,7 @@ def make_render_env(config: TrainConfig, video_folder: str, action_mode: str, re
             max_step_pixels=config.max_step_pixels,
         )
     if config.network_type == "bc_pixels":
-        env = RenderedImageObsWrapper(env, tokenizer_ckpt=config.tokenizer_path)
+        env = RenderedImageObsWrapper(env, target_height=image_height, target_width=image_width)
         env = FrameStackObservation(env, stack_size=config.obs_stack_size)
     elif config.network_type == "bc_latent":
         env = TokenizerLatentObsWrapper(
@@ -253,6 +332,9 @@ def parse_args():
             "chunk_absolute",
             "chunk_delta",
             "chunk_relative",
+            "ensemble_absolute",
+            "ensemble_delta",
+            "ensemble_relative",
         ),
         default="auto",
         help="How to interpret the predicted action chunk during rendering.",
@@ -303,7 +385,10 @@ def render_agent_to_video():
         bc_args = extract_checkpoint_args(bc_payload)
         tokenizer_name = bc_args.get("tokenizer_ckpt_name")
         config.network_type = "bc_latent" if tokenizer_name else "bc_pixels"
-        config.tokenizer_path = resolve_tokenizer_path(str(tokenizer_name)) if tokenizer_name else resolve_tokenizer_path(config.tokenizer_path)
+        if tokenizer_name:
+            config.tokenizer_path = resolve_tokenizer_path(str(tokenizer_name))
+        config.image_height = int(bc_args.get("H", 224))
+        config.image_width = int(bc_args.get("W", 224))
         if bc_args.get("seq_len") is not None:
             config.obs_stack_size = int(bc_args["seq_len"])
         if bc_args.get("action_chunk_size") is not None:
@@ -314,15 +399,17 @@ def render_agent_to_video():
             config.actor_dropout = float(bc_args["dropout"])
         temporal_layers = int(bc_args.get("temporal_layers", 2))
         temporal_heads = int(bc_args.get("temporal_heads", 4))
+        temporal_context = int(bc_args.get("temporal_context", 3))
     else:
         config.tokenizer_path = resolve_tokenizer_path(config.tokenizer_path)
         temporal_layers = 2
         temporal_heads = 4
+        temporal_context = 3
 
     action_mode = args.action_mode
     resolved_env_id = resolve_pusht_env_id(config.env_id)
     if action_mode == "auto":
-        action_mode = "chunk_relative" if args.source == "bc_prior" else "ppo_chunk"
+        action_mode = "ensemble_relative" if args.source == "bc_prior" else "ppo_chunk"
     video_folder = "./videos"
     record_video = not args.no_video
     if record_video:
@@ -345,12 +432,11 @@ def render_agent_to_video():
         network = BCPixelActorCritic(
             image_shape=obs_shape,
             action_dim=action_dim,
-            tokenizer_ckpt=config.tokenizer_path,
             hidden_dim=config.actor_hidden_dim,
             dropout=config.actor_dropout,
-            backbone_device=config.tokenizer_device,
             temporal_layers=temporal_layers,
             temporal_heads=temporal_heads,
+            temporal_context=temporal_context,
         ).to(device)
     elif config.network_type == "bc_latent":
         network = BCStyleLatentActorCritic(
@@ -361,6 +447,7 @@ def render_agent_to_video():
             temporal_layers=temporal_layers,
             temporal_heads=temporal_heads,
             max_seq_len=obs_shape[0] if len(obs_shape) >= 1 else 64,
+            temporal_context=temporal_context,
         ).to(device)
     else:
         network = VectorActorCritic(

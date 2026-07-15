@@ -88,15 +88,11 @@ class PPOAgent:
         if network_type == "bc_pixels":
             if obs_shape is None:
                 raise ValueError("obs_shape is required for bc_pixels PPO.")
-            if tokenizer_path is None:
-                raise ValueError("tokenizer_path is required for bc_pixels PPO.")
             self.network = BCPixelActorCritic(
                 image_shape=obs_shape,
                 action_dim=action_dim,
-                tokenizer_ckpt=tokenizer_path,
                 hidden_dim=actor_hidden_dim,
                 dropout=actor_dropout,
-                backbone_device=backbone_device,
             ).to(self.device_override)
         elif network_type == "bc_latent":
             self.network = BCStyleLatentActorCritic(
@@ -234,10 +230,8 @@ class PPOAgent:
             prior_network = BCPixelActorCritic(
                 image_shape=self.obs_shape or getattr(self.network, "image_shape"),
                 action_dim=action_dim,
-                tokenizer_ckpt=self.tokenizer_path or bc_prior_path,
                 hidden_dim=getattr(self.network, "hidden_dim", 512),
                 dropout=0.0,
-                backbone_device=self.backbone_device,
             ).to(self.device)
         elif self.network_type == "bc_latent":
             prior_network = BCStyleLatentActorCritic(

@@ -36,10 +36,8 @@ def build_network(config: TrainConfig, obs_shape: tuple[int, ...], action_dim: i
         return BCPixelActorCritic(
             image_shape=obs_shape,
             action_dim=action_dim,
-            tokenizer_ckpt=config.tokenizer_path,
             hidden_dim=config.actor_hidden_dim,
             dropout=config.actor_dropout,
-            backbone_device=config.tokenizer_device,
         ).to(device)
     if config.network_type == "bc_latent":
         return BCStyleLatentActorCritic(
