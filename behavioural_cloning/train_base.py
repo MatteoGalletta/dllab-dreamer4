@@ -250,7 +250,12 @@ class ActionClassifier(nn.Module):
     def forward(self, features_btD: torch.Tensor) -> torch.Tensor:
         B, T, D = features_btD.shape
         base_logits = self.net(features_btD.reshape(B * T, D)).view(B, T, -1)
-        temporal_features = self.temporal_in(features_btD) + self._positional_encoding(T)
+        temporal_features = self.temporal_in(features_btD)
+        temporal_pos = self._positional_encoding(T).to(
+            device=temporal_features.device,
+            dtype=temporal_features.dtype,
+        )
+        temporal_features = temporal_features + temporal_pos
         attn_mask = self._causal_local_mask(T, temporal_features.device)
         for block in self.temporal_blocks:
             temporal_features = block(temporal_features, src_mask=attn_mask)
