@@ -341,6 +341,19 @@ def load_ckpt(path: Path, *, model, opt, scaler) -> tuple[int, int]:
     return int(ckpt.get("step", 0)), int(ckpt.get("epoch", 0))
 
 
+def log_checkpoint_artifact(path: Path, *, step: int, epoch: int, aliases: list[str] | None = None):
+    run = getattr(wandb, "run", None)
+    if run is None or not path.exists():
+        return
+    artifact = wandb.Artifact(
+        name=f"{(run.name or 'bc').replace(' ', '-')}-checkpoint",
+        type="model",
+        metadata={"step": int(step), "epoch": int(epoch), "path": str(path)},
+    )
+    artifact.add_file(str(path), name=path.name)
+    run.log_artifact(artifact, aliases=aliases or [])
+
+
 def get_base_model(model: nn.Module) -> nn.Module:
     return model.module if hasattr(model, "module") else model
 
@@ -768,27 +781,28 @@ def train(args):
                         f"| mae={mae.item():.6f} | pred_mean={pred.mean().item():.4f}"
                     )
 
-                if (
-                    is_rank0()
-                    and args.eval_every > 0
-                    and step > 0
-                    and (step % args.eval_every == 0)
-                    and do_step
-                ):
-                    eval_log_dict: dict[str, object] = {}
-                    eval_log_dict.update(
-                        evaluate_validation(
-                            model,
-                            val_loader,
-                            device=device,
-                            device_type=device_type,
-                            action_dim=action_dim,
-                            use_amp=use_amp,
-                            max_batches=args.val_max_batches,
+                if is_rank0() and step > 0 and do_step:
+                    if args.eval_every > 0 and (step % args.eval_every == 0):
+                        eval_log_dict: dict[str, object] = {}
+                        eval_log_dict.update(
+                            evaluate_validation(
+                                model,
+                                val_loader,
+                                device=device,
+                                device_type=device_type,
+                                action_dim=action_dim,
+                                use_amp=use_amp,
+                                max_batches=args.val_max_batches,
+                            )
                         )
-                    )
-                    eval_log_dict.update(
-                        evaluate_rollouts(
+                        if eval_log_dict:
+                            wandb.log(eval_log_dict, step=step)
+                            val_loss = eval_log_dict.get("validation/loss")
+                            val_text = "n/a" if val_loss is None else f"{float(val_loss):.6f}"
+                            print(f"eval step {step:07d} | val_loss={val_text}")
+
+                    if args.rollout_eval_every > 0 and (step % args.rollout_eval_every == 0):
+                        rollout_log_dict = evaluate_rollouts(
                             model,
                             device=device,
                             image_hw=(args.H, args.W),
@@ -804,52 +818,58 @@ def train(args):
                             temporal_ensemble_decay=args.eval_temporal_ensemble_decay,
                             video_fps=args.eval_video_fps,
                         )
-                    )
-                    if eval_log_dict:
-                        wandb.log(eval_log_dict, step=step)
-                        val_loss = eval_log_dict.get("validation/loss")
-                        success_rate = eval_log_dict.get("rollout/success_rate")
-                        val_text = "n/a" if val_loss is None else f"{float(val_loss):.6f}"
-                        success_text = "n/a" if success_rate is None else f"{float(success_rate):.3f}"
-                        print(f"eval step {step:07d} | val_loss={val_text} | rollout_success={success_text}")
-                        if success_rate is not None:
-                            success_value = float(success_rate)
-                            val_value = float(val_loss) if val_loss is not None else float("inf")
-                            improved = success_value > best_rollout_success
-                            tied_better_val = success_value == best_rollout_success and val_value < best_val_loss
-                            if improved or tied_better_val:
-                                best_rollout_success = success_value
-                                best_val_loss = val_value
-                                best_path = ckpt_dir / "best_rollout.pt"
-                                save_ckpt(
-                                    best_path,
-                                    step=step,
-                                    epoch=epoch,
-                                    model=model,
-                                    opt=opt,
-                                    scaler=scaler,
-                                    args=args,
-                                )
-                                wandb.log(
-                                    {
-                                        "best_rollout/success_rate": best_rollout_success,
-                                        "best_rollout/validation_loss": best_val_loss,
-                                        "best_rollout/step": float(step),
-                                    },
-                                    step=step,
-                                )
-                                print(
-                                    f"saved best rollout checkpoint at step {step:07d} "
-                                    f"| success={best_rollout_success:.3f} | val_loss={best_val_loss:.6f}"
-                                )
+                        if rollout_log_dict:
+                            wandb.log(rollout_log_dict, step=step)
+                            success_rate = rollout_log_dict.get("rollout/success_rate")
+                            success_text = "n/a" if success_rate is None else f"{float(success_rate):.3f}"
+                            print(f"rollout step {step:07d} | rollout_success={success_text}")
+                            if success_rate is not None:
+                                val_loss = None
+                                success_value = float(success_rate)
+                                val_value = float("inf") if val_loss is None else float(val_loss)
+                                improved = success_value > best_rollout_success
+                                tied_better_val = success_value == best_rollout_success and val_value < best_val_loss
+                                if improved or tied_better_val:
+                                    best_rollout_success = success_value
+                                    best_val_loss = val_value
+                                    best_path = ckpt_dir / "best_rollout.pt"
+                                    save_ckpt(
+                                        best_path,
+                                        step=step,
+                                        epoch=epoch,
+                                        model=model,
+                                        opt=opt,
+                                        scaler=scaler,
+                                        args=args,
+                                    )
+                                    log_checkpoint_artifact(
+                                        best_path,
+                                        step=step,
+                                        epoch=epoch,
+                                        aliases=["best_rollout", f"step-{step:07d}"],
+                                    )
+                                    wandb.log(
+                                        {
+                                            "best_rollout/success_rate": best_rollout_success,
+                                            "best_rollout/validation_loss": best_val_loss,
+                                            "best_rollout/step": float(step),
+                                        },
+                                        step=step,
+                                    )
+                                    print(
+                                        f"saved best rollout checkpoint at step {step:07d} "
+                                        f"| success={best_rollout_success:.3f}"
+                                    )
 
                 # ---- ckpt ----
-                if is_rank0() and args.save_every > 0 and (step % args.save_every == 0) and do_step:
+                if is_rank0() and args.save_every > 0 and step > 0 and (step % args.save_every == 0) and do_step:
                     ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
                     save_ckpt(ckpt_path, step=step, epoch=epoch, model=model, opt=opt, scaler=scaler, args=args)
                     # also update a "latest" pointer
                     latest = ckpt_dir / "latest.pt"
                     save_ckpt(latest, step=step, epoch=epoch, model=model, opt=opt, scaler=scaler, args=args)
+                    log_checkpoint_artifact(ckpt_path, step=step, epoch=epoch, aliases=[f"step-{step:07d}"])
+                    log_checkpoint_artifact(latest, step=step, epoch=epoch, aliases=["latest"])
 
                 step += 1
 
@@ -913,6 +933,7 @@ if __name__ == "__main__":
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--val_max_batches", type=int, default=0, help="0 evaluates the full validation loader")
     p.add_argument("--eval_every", type=int, default=2000)
+    p.add_argument("--rollout_eval_every", type=int, default=0, help="0 disables rollout eval during training")
     p.add_argument("--eval_batch_size", type=int, default=0)
     p.add_argument("--eval_episodes", type=int, default=3)
     p.add_argument("--eval_seed", type=int, default=123)
@@ -931,7 +952,7 @@ if __name__ == "__main__":
 
     # ckpt
     p.add_argument("--ckpt_dir", type=str, default="./local_models/behavior_cloning")
-    p.add_argument("--save_every", type=int, default=5_000)
+    p.add_argument("--save_every", type=int, default=2_000)
     p.add_argument("--resume", type=str, default=None)
 
     # misc
