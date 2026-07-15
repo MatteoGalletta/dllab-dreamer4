@@ -797,7 +797,7 @@ def train(args):
                             chunk_size=args.action_chunk_size,
                             episodes=args.eval_episodes,
                             max_steps=args.eval_max_steps,
-                            seed=args.seed + step,
+                            seed=args.eval_seed,
                             action_mode=args.eval_action_mode,
                             max_step_pixels=args.eval_max_step_pixels,
                             temporal_ensemble=args.eval_temporal_ensemble,
@@ -915,6 +915,7 @@ if __name__ == "__main__":
     p.add_argument("--eval_every", type=int, default=2000)
     p.add_argument("--eval_batch_size", type=int, default=0)
     p.add_argument("--eval_episodes", type=int, default=3)
+    p.add_argument("--eval_seed", type=int, default=123)
     p.add_argument("--eval_max_steps", type=int, default=300)
     p.add_argument("--eval_action_mode", type=str, default="relative", choices=["relative", "delta", "absolute"])
     p.add_argument("--eval_max_step_pixels", type=float, default=15.0)
