@@ -21,6 +21,10 @@ if str(SCRIPT_DIR) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from ppo_online.env_config import ensure_swm_compat
+
+ensure_swm_compat()
+
 import stable_worldmodel as swm
 
 from behavioural_cloning.eval_bc_exact import (

@@ -47,6 +47,10 @@ def _try_patch_pymunk_for_swm() -> None:
     pymunk.Space.on_collision = on_collision
 
 
+def ensure_swm_compat() -> None:
+    _try_patch_pymunk_for_swm()
+
+
 def _wrap_angle(angle):
     return float(angle % (2 * np.pi))
 
