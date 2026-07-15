@@ -392,13 +392,14 @@ def evaluate_validation(
                 break
             x = normalize_image_batch(batch["image"].to(device, non_blocking=True))
             target_actions = batch["action"].to(device, non_blocking=True).to(torch.float32)
-            if target_actions.ndim != 3 or target_actions.shape[-1] != action_dim:
-                raise RuntimeError(f"Expected actions shape (B,T,{action_dim}), got {tuple(target_actions.shape)}")
+            if target_actions.ndim != 2 or target_actions.shape[-1] != action_dim:
+                raise RuntimeError(f"Expected actions shape (B,{action_dim}), got {tuple(target_actions.shape)}")
 
             with autocast(device_type=device_type, enabled=use_amp):
                 pred = base_model(x)
-                loss = F.mse_loss(pred, target_actions)
-                mae = torch.mean(torch.abs(pred - target_actions))
+                pred_last = pred[:, -1, :]
+                loss = F.mse_loss(pred_last, target_actions)
+                mae = torch.mean(torch.abs(pred_last - target_actions))
 
             loss_sum += float(loss.item())
             mae_sum += float(mae.item())
@@ -444,12 +445,12 @@ def _map_primitive_to_env_action(
     raise ValueError(f"Unsupported eval action mode: {mode}")
 
 
-def _pad_history(frames: list[np.ndarray], seq_len: int) -> np.ndarray:
+def _pad_history(frames: list[np.ndarray], seq_len: int, frame_stride: int) -> np.ndarray:
     if not frames:
         raise ValueError("frame history is empty")
-    history = list(frames[-seq_len:])
-    if len(history) < seq_len:
-        history = [history[0]] * (seq_len - len(history)) + history
+    newest = len(frames) - 1
+    indices = [max(0, newest - i * frame_stride) for i in range(seq_len - 1, -1, -1)]
+    history = [frames[idx] for idx in indices]
     return np.stack(history, axis=0)
 
 
@@ -480,6 +481,7 @@ def evaluate_rollouts(
     device: torch.device,
     image_hw: tuple[int, int],
     seq_len: int,
+    frame_stride: int,
     chunk_size: int,
     episodes: int,
     max_steps: int,
@@ -530,7 +532,7 @@ def evaluate_rollouts(
                     video_frames.append(frame.copy())
 
                 if temporal_ensemble or not action_buffer:
-                    stacked_frames = _pad_history(frame_history, seq_len)
+                    stacked_frames = _pad_history(frame_history, seq_len, frame_stride)
                     input_tensor = torch.as_tensor(stacked_frames[None], dtype=torch.uint8, device=device)
                     action_seq = base_model(input_tensor.permute(0, 1, 4, 2, 3).to(torch.float32) / 255.0)
                     action_chunk = action_seq[:, -1, :].view(1, chunk_size, 2).squeeze(0).cpu().numpy()
@@ -605,6 +607,7 @@ def train(args):
         h5_path=args.dataset,
         seq_len=args.seq_len,
         action_chunk_size=args.action_chunk_size,
+        frame_stride=args.frame_stride,
     )
     train_indices, val_indices = split_indices(len(full_dataset), args.val_frac, args.seed)
     dataset = Subset(full_dataset, train_indices)
@@ -716,11 +719,13 @@ def train(args):
                     pred = model(x)
 
                 target_actions = batch["action"].to(device, non_blocking=True).to(torch.float32)
-                if target_actions.ndim != 3 or target_actions.shape[-1] != action_dim:
-                    raise RuntimeError(f"Expected actions shape (B,T,{action_dim}), got {tuple(target_actions.shape)}")
+                if target_actions.ndim != 2 or target_actions.shape[-1] != action_dim:
+                    raise RuntimeError(f"Expected actions shape (B,{action_dim}), got {tuple(target_actions.shape)}")
 
-                loss = F.mse_loss(pred, target_actions)
-                mae = torch.mean(torch.abs(pred - target_actions))
+                pred_last = pred[:, -1, :]
+
+                loss = F.mse_loss(pred_last, target_actions)
+                mae = torch.mean(torch.abs(pred_last - target_actions))
 
                 if not torch.isfinite(loss):
                     raise RuntimeError(f"Non-finite loss at step {step}: loss={loss}")
@@ -788,6 +793,7 @@ def train(args):
                             device=device,
                             image_hw=(args.H, args.W),
                             seq_len=args.seq_len,
+                            frame_stride=args.frame_stride,
                             chunk_size=args.action_chunk_size,
                             episodes=args.eval_episodes,
                             max_steps=args.eval_max_steps,
@@ -864,6 +870,7 @@ if __name__ == "__main__":
         type=str,
     )
     p.add_argument("--seq_len", type=int, default=8)
+    p.add_argument("--frame_stride", type=int, default=5)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--action_chunk_size", type=int, default=5)

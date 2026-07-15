@@ -8,11 +8,12 @@ import torch
 from torch.utils.data import DataLoader
 
 class PushTSequenceDataset(Dataset):
-    def __init__(self, h5_path, seq_len=50, action_chunk_size=5):
+    def __init__(self, h5_path, seq_len=50, action_chunk_size=5, frame_stride=5):
         self.h5_path = h5_path
         self.seq_len = seq_len
         self.action_chunk_size = action_chunk_size
-        self.raw_seq_len = seq_len * action_chunk_size
+        self.frame_stride = frame_stride
+        self.raw_seq_len = (seq_len - 1) * frame_stride + action_chunk_size
         
         # Öffne die Datei einmal kurz, um die Metadaten zu lesen
         with h5py.File(self.h5_path, 'r') as f:
@@ -45,10 +46,12 @@ class PushTSequenceDataset(Dataset):
             actions = f['action'][start_idx:end_idx]  # Shape: (raw_seq_len, 2)
             states = f['state'][start_idx:end_idx]    # Shape: (raw_seq_len, 7) - falls vorhanden
 
-        # One image/state per action chunk (first frame of each chunk).
-        images = images[::self.action_chunk_size]
-        states = states[::self.action_chunk_size]
-        actions = actions.reshape(self.seq_len, -1)
+        obs_indices = np.arange(self.seq_len, dtype=np.int64) * self.frame_stride
+        action_start = int(obs_indices[-1])
+        action_end = action_start + self.action_chunk_size
+        images = images[obs_indices]
+        states = states[obs_indices]
+        actions = actions[action_start:action_end].reshape(-1)
         
         # Konvertierung in PyTorch-Tensoren
         # Dreamer erwartet Bilder meist im Format (Sequence, Channels, Height, Width)
@@ -59,7 +62,7 @@ class PushTSequenceDataset(Dataset):
         
         return {
             "image": images,   # [seq_len, 3, 224, 224]
-            "action": actions, # [seq_len, action_chunk_size*2]
+            "action": actions, # [action_chunk_size*2]
             "state": states    # [seq_len, state_dim]
         }
         
@@ -70,6 +73,7 @@ def create_pusht_dataloader(
     batch_size=1,
     seq_len=64,
     action_chunk_size=5,
+    frame_stride=5,
     num_workers=2,
 ):
 
@@ -77,6 +81,7 @@ def create_pusht_dataloader(
         h5_path=h5_path,
         seq_len=seq_len,
         action_chunk_size=action_chunk_size,
+        frame_stride=frame_stride,
     )
     
     loader = DataLoader(
