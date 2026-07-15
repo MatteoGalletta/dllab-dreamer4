@@ -168,6 +168,7 @@ def clean_state_dict_keys(state_dict: dict[str, torch.Tensor]) -> dict[str, torc
 def resolve_model_config(ckpt_args: dict, cleaned_state: dict[str, torch.Tensor]):
     tokenizer_name = ckpt_args.get("tokenizer_ckpt_name")
     seq_len = int(ckpt_args.get("seq_len", 8))
+    frame_stride = int(ckpt_args.get("frame_stride", 1))
     action_chunk_size = int(ckpt_args.get("action_chunk_size", 5))
     hidden_dim = int(ckpt_args.get("hidden_dim", 512))
     dropout = float(ckpt_args.get("dropout", 0.05))
@@ -177,6 +178,7 @@ def resolve_model_config(ckpt_args: dict, cleaned_state: dict[str, torch.Tensor]
     return {
         "tokenizer_name": tokenizer_name,
         "seq_len": seq_len,
+        "frame_stride": frame_stride,
         "action_chunk_size": action_chunk_size,
         "hidden_dim": hidden_dim,
         "dropout": dropout,
@@ -185,15 +187,13 @@ def resolve_model_config(ckpt_args: dict, cleaned_state: dict[str, torch.Tensor]
     }
 
 
-def pad_history(frames: deque[np.ndarray], seq_len: int) -> np.ndarray:
+def pad_history(frames: deque[np.ndarray], seq_len: int, frame_stride: int) -> np.ndarray:
     history = list(frames)
     if not history:
         raise ValueError("frame history is empty")
-    if len(history) >= seq_len:
-        history = history[-seq_len:]
-    else:
-        history = [history[0]] * (seq_len - len(history)) + history
-    return np.stack(history, axis=0)
+    newest = len(history) - 1
+    indices = [max(0, newest - i * int(frame_stride)) for i in range(seq_len - 1, -1, -1)]
+    return np.stack([history[idx] for idx in indices], axis=0)
 
 
 def map_primitive_to_env_action(
@@ -298,7 +298,8 @@ def main():
 
     print(
         f"Loaded BC checkpoint from {checkpoint_path} | tokenizer={tokenizer_path} "
-        f"| seq_len={model_cfg['seq_len']} chunk={model_cfg['action_chunk_size']} "
+        f"| seq_len={model_cfg['seq_len']} frame_stride={model_cfg['frame_stride']} "
+        f"chunk={model_cfg['action_chunk_size']} "
         f"| action_mode={args.action_mode} | temporal_ensemble={args.temporal_ensemble} | device={device}"
     )
 
@@ -326,7 +327,11 @@ def main():
                 saved_frames.append(frame.copy())
 
             if args.temporal_ensemble or not action_buffer:
-                stacked_frames = pad_history(frame_history, model_cfg["seq_len"])
+                stacked_frames = pad_history(
+                    frame_history,
+                    model_cfg["seq_len"],
+                    model_cfg["frame_stride"],
+                )
                 input_tensor = torch.as_tensor(stacked_frames[None], dtype=torch.uint8, device=device)
                 with torch.no_grad():
                     action_chunk = model.predict_action_chunk(input_tensor).squeeze(0).cpu().numpy()

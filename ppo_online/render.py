@@ -28,6 +28,36 @@ from ppo_online.train import (
 )
 
 
+class StridedObservationStackWrapper(gym.ObservationWrapper):
+    def __init__(self, env: gym.Env, stack_size: int, frame_stride: int):
+        super().__init__(env)
+        self.stack_size = int(stack_size)
+        self.frame_stride = max(1, int(frame_stride))
+        self.history: deque[np.ndarray] = deque()
+        base_space = env.observation_space
+        self.observation_space = gym.spaces.Box(
+            low=np.repeat(np.expand_dims(base_space.low, axis=0), self.stack_size, axis=0),
+            high=np.repeat(np.expand_dims(base_space.high, axis=0), self.stack_size, axis=0),
+            dtype=base_space.dtype,
+        )
+
+    def _stack_history(self) -> np.ndarray:
+        history = list(self.history)
+        newest = len(history) - 1
+        indices = [max(0, newest - i * self.frame_stride) for i in range(self.stack_size - 1, -1, -1)]
+        return np.stack([history[idx] for idx in indices], axis=0)
+
+    def observation(self, observation):
+        self.history.append(np.asarray(observation, dtype=self.observation_space.dtype))
+        return self._stack_history()
+
+    def reset(self, **kwargs):
+        observation, info = self.env.reset(**kwargs)
+        self.history.clear()
+        self.history.append(np.asarray(observation, dtype=self.observation_space.dtype))
+        return self._stack_history(), info
+
+
 def load_state_dict_safe(path: str, device: torch.device):
     try:
         return torch.load(path, map_location=device, weights_only=True)
@@ -285,14 +315,22 @@ def make_render_env(config: TrainConfig, video_folder: str, action_mode: str, re
         )
     if config.network_type == "bc_pixels":
         env = RenderedImageObsWrapper(env, target_height=image_height, target_width=image_width)
-        env = FrameStackObservation(env, stack_size=config.obs_stack_size)
+        env = StridedObservationStackWrapper(
+            env,
+            stack_size=config.obs_stack_size,
+            frame_stride=int(getattr(config, "frame_stride", 1)),
+        )
     elif config.network_type == "bc_latent":
         env = TokenizerLatentObsWrapper(
             env,
             tokenizer_ckpt=config.tokenizer_path,
             tokenizer_device=config.tokenizer_device,
         )
-        env = FrameStackObservation(env, stack_size=config.obs_stack_size)
+        env = StridedObservationStackWrapper(
+            env,
+            stack_size=config.obs_stack_size,
+            frame_stride=int(getattr(config, "frame_stride", 1)),
+        )
     else:
         env = PushTObsWrapper(env)
     return env
@@ -391,6 +429,7 @@ def render_agent_to_video():
         config.image_width = int(bc_args.get("W", 224))
         if bc_args.get("seq_len") is not None:
             config.obs_stack_size = int(bc_args["seq_len"])
+        config.frame_stride = int(bc_args.get("frame_stride", 1))
         if bc_args.get("action_chunk_size") is not None:
             config.chunk_size = int(bc_args["action_chunk_size"])
         if bc_args.get("hidden_dim") is not None:
@@ -405,6 +444,7 @@ def render_agent_to_video():
         temporal_layers = 2
         temporal_heads = 4
         temporal_context = 3
+        config.frame_stride = int(getattr(config, "frame_stride", 1))
 
     action_mode = args.action_mode
     resolved_env_id = resolve_pusht_env_id(config.env_id)
@@ -419,7 +459,8 @@ def render_agent_to_video():
         f"tokenizer={config.tokenizer_path} action_mode={action_mode} "
         f"record_video={record_video} max_steps={args.max_steps} "
         f"max_step_pixels={config.max_step_pixels} "
-        f"network_type={config.network_type} obs_stack={config.obs_stack_size} chunk_size={config.chunk_size}"
+        f"network_type={config.network_type} obs_stack={config.obs_stack_size} "
+        f"frame_stride={getattr(config, 'frame_stride', 1)} chunk_size={config.chunk_size}"
     )
 
     env = make_render_env(config, video_folder, action_mode=action_mode, record_video=record_video)

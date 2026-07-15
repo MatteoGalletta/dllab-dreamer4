@@ -197,9 +197,18 @@ def sample_world_eval_starts(dataset: PushTH5WorldDataset, num_episodes: int, go
 
 
 class BCWorldPolicy:
-    def __init__(self, *, policy: BCImagePolicy, seq_len: int, action_chunk_size: int, device: torch.device):
+    def __init__(
+        self,
+        *,
+        policy: BCImagePolicy,
+        seq_len: int,
+        frame_stride: int,
+        action_chunk_size: int,
+        device: torch.device,
+    ):
         self.policy = policy
         self.seq_len = int(seq_len)
+        self.frame_stride = max(1, int(frame_stride))
         self.action_chunk_size = int(action_chunk_size)
         self.device = device
         self.env = None
@@ -213,12 +222,9 @@ class BCWorldPolicy:
 
     def _stack_history(self, env_index: int) -> np.ndarray:
         history = list(self.frame_histories[env_index])
-        oldest = history[0]
-        if len(history) < self.seq_len:
-            history = [oldest] * (self.seq_len - len(history)) + history
-        else:
-            history = history[-self.seq_len :]
-        return np.stack(history, axis=0)
+        newest = len(history) - 1
+        indices = [max(0, newest - i * self.frame_stride) for i in range(self.seq_len - 1, -1, -1)]
+        return np.stack([history[idx] for idx in indices], axis=0)
 
     def get_action(self, info_dict, **kwargs):
         del kwargs
@@ -379,6 +385,7 @@ def main():
             world_policy = BCWorldPolicy(
                 policy=policy,
                 seq_len=model_cfg["seq_len"],
+                frame_stride=model_cfg["frame_stride"],
                 action_chunk_size=model_cfg["action_chunk_size"],
                 device=device,
             )
