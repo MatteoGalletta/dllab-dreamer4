@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import wandb
 from gymnasium.wrappers import FrameStackObservation
 
-from .env_config import DEFAULT_PUSHT_ENV_ID, make_pusht_env_kwargs, resolve_pusht_env_id
+from .env_config import DEFAULT_PUSHT_ENV_ID, make_pusht_env, resolve_pusht_env_id
 from .agent import PPOAgent
 from .buffer import PPOVectorBuffer
 from .model_paths import resolve_bc_prior_path, resolve_ppo_checkpoint_path, resolve_tokenizer_path
@@ -219,15 +219,11 @@ class PushTDenseRewardWrapper(gym.Wrapper):
         info["distance_to_target"] = dist_push
         info["angle_error"] = angle_error
 
-        if self.env_id.startswith("swm/"):
-            dense_reward = (1.0 * r_reach) + (3.0 * r_push) + (1.0 * r_angle)
-            visual_coverage = self._compute_visual_coverage(info)
-            if visual_coverage is not None:
-                info["coverage"] = float(visual_coverage)
-            info["coverage_proxy"] = float(r_push)
-        else:
-            dense_reward = (1.0 * r_reach) + (3.0 * r_push) + (50.0 * float(original_reward))
-            info["coverage"] = float(original_reward)
+        dense_reward = (1.0 * r_reach) + (3.0 * r_push) + (1.0 * r_angle)
+        visual_coverage = self._compute_visual_coverage(info)
+        if visual_coverage is not None:
+            info["coverage"] = float(visual_coverage)
+        info["coverage_proxy"] = float(r_push)
 
         info["dense_reward"] = float(dense_reward)
 
@@ -458,19 +454,17 @@ def make_env(rank: int, seed: int, config: TrainConfig, render_mode: str | None 
             _, tokenizer_info = load_tokenizer_from_ckpt(config.tokenizer_path, torch.device("cpu"))
 
         resolved_env_id = resolve_pusht_env_id(config.env_id)
-        env_kwargs: dict[str, Any] = make_pusht_env_kwargs(
-            resolved_env_id,
+        image_height = int(tokenizer_info["H"]) if tokenizer_info is not None else None
+        image_width = int(tokenizer_info["W"]) if tokenizer_info is not None else None
+        env = make_pusht_env(
+            env_id=resolved_env_id,
             render_mode=render_mode or "rgb_array",
+            image_height=image_height,
+            image_width=image_width,
+            sync_goal_pose=True,
+            align_sampled_goal_to_fixed_target=True,
+            render_obs=False,
         )
-        if tokenizer_info is not None:
-            env_kwargs = make_pusht_env_kwargs(
-                resolved_env_id,
-                render_mode=render_mode or "rgb_array",
-                image_height=int(tokenizer_info["H"]),
-                image_width=int(tokenizer_info["W"]),
-            )
-
-        env = gym.make(resolved_env_id, **env_kwargs)
         env = PushTDenseRewardWrapper(env, env_id=resolved_env_id)
         env = ActionChunkingTemporalEnsembleWrapper(
             env,

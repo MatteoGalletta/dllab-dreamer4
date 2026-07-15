@@ -25,6 +25,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from data_pipeline.PushTDataLoader import PushTSequenceDataset
+from ppo_online.model_paths import resolve_tokenizer_path
+from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
 
 DREAMER4_MODEL_PATH = PROJECT_ROOT / "dreamer4-src" / "dreamer4" / "model.py"
 
@@ -229,59 +231,19 @@ def _clean_state_dict_keys(state_dict: dict[str, torch.Tensor], prefixes: tuple[
 
 def load_tokenizer_encoder(tokenizer_ckpt_name: str) -> nn.Module:
     ckpt_path = Path(tokenizer_ckpt_name)
-    if not ckpt_path.is_absolute():
-        candidate_paths = [
+    if not ckpt_path.is_absolute() and not ckpt_path.exists():
+        log_candidates = [
             LOCAL_MODEL_ROOT / "tokenizer_ckpts" / tokenizer_ckpt_name,
             LOCAL_MODEL_ROOT / "tokenizer_ckpts" / "tokenizer.pt",
             LOCAL_MODEL_ROOT / "tokenizer_ckpts" / "latest.pt",
         ]
-        ckpt_path = next((path for path in candidate_paths if path.exists()), candidate_paths[0])
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    ckpt_args = ckpt.get("args", {})
-    if not isinstance(ckpt_args, dict):
-        ckpt_args = vars(ckpt_args)
+        ckpt_path = next((path for path in log_candidates if path.exists()), Path(resolve_tokenizer_path(tokenizer_ckpt_name)))
 
-    patch = int(ckpt_args.get("patch", 16))
-    h = int(ckpt_args.get("H", 224))
-    w = int(ckpt_args.get("W", 224))
-    c = int(ckpt_args.get("C", 3))
-    d_model = int(ckpt_args.get("d_model", 256))
-    n_heads = int(ckpt_args.get("n_heads", 4))
-    depth = int(ckpt_args.get("depth", 8))
-    n_latents = int(ckpt_args.get("n_latents", 16))
-    d_bottleneck = int(ckpt_args.get("d_bottleneck", 32))
-    dropout = float(ckpt_args.get("dropout", 0.0))
-    mlp_ratio = float(ckpt_args.get("mlp_ratio", 4.0))
-    time_every = int(ckpt_args.get("time_every", 1))
-    mae_p_min = float(ckpt_args.get("mae_p_min", 0.0))
-    mae_p_max = float(ckpt_args.get("mae_p_max", 0.9))
-    scale_pos_embeds = bool(ckpt_args.get("scale_pos_embeds", False))
-
-    n_patches = (h // patch) * (w // patch)
-    patch_dim = patch * patch * c
-    encoder = Dreamer4Encoder(
-        patch_dim=patch_dim,
-        d_model=d_model,
-        n_latents=n_latents,
-        n_patches=n_patches,
-        n_heads=n_heads,
-        depth=depth,
-        d_bottleneck=d_bottleneck,
-        dropout=dropout,
-        mlp_ratio=mlp_ratio,
-        time_every=time_every,
-        mae_p_min=mae_p_min,
-        mae_p_max=mae_p_max,
-        scale_pos_embeds=scale_pos_embeds,
-    )
-
-    state_dict = ckpt.get("model", ckpt)
-    if isinstance(state_dict, dict):
-        state_dict = _clean_state_dict_keys(state_dict, ("module.", "_orig_mod.", "encoder."))
-    encoder.load_state_dict(state_dict, strict=True)
+    tokenizer, info = load_tokenizer_from_ckpt(str(ckpt_path), torch.device("cpu"))
+    encoder = tokenizer.encoder
     encoder.requires_grad_(False)
     encoder.eval()
-    encoder.patch = patch
+    encoder.patch = int(info["patch"])
     return encoder
 
 

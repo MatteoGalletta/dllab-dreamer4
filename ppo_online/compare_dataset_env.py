@@ -8,13 +8,12 @@ from pathlib import Path
 
 import cv2
 import gymnasium as gym
-import gym_pusht
 import h5py
 import hdf5plugin  # noqa: F401
 import numpy as np
 import torch
 
-from ppo_online.env_config import DEFAULT_PUSHT_ENV_ID, make_pusht_env_kwargs, resolve_pusht_env_id
+from ppo_online.env_config import DEFAULT_PUSHT_ENV_ID, make_pusht_env, resolve_pusht_env_id
 from ppo_online.model_paths import resolve_tokenizer_path
 from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
 
@@ -59,15 +58,16 @@ def save_rgb(path: Path, image_rgb: np.ndarray):
 
 def make_env(image_hw: tuple[int, int], seed: int, relative: bool | None = None):
     resolved_env_id = resolve_pusht_env_id(DEFAULT_PUSHT_ENV_ID)
-    env_kwargs = make_pusht_env_kwargs(
-        resolved_env_id,
+    env = make_pusht_env(
+        env_id=resolved_env_id,
         render_mode="rgb_array",
         image_height=int(image_hw[0]),
         image_width=int(image_hw[1]),
+        relative=bool(relative) if relative is not None else False,
+        sync_goal_pose=True,
+        align_sampled_goal_to_fixed_target=True,
+        render_obs=False,
     )
-    if relative is not None and resolved_env_id.startswith("swm/"):
-        env_kwargs["relative"] = bool(relative)
-    env = gym.make(resolved_env_id, **env_kwargs)
     env.reset(seed=seed)
     return env, resolved_env_id
 
@@ -77,26 +77,11 @@ def try_reset_to_dataset_state(env, state: np.ndarray, env_id: str):
     if state.shape[0] < 5:
         return False
 
-    option_candidates = []
-    if env_id.startswith("swm/"):
-        # SWM PushT reset() accepts "state" (and optionally "goal_state").
-        option_candidates.extend(
-            [
-                {"state": state.tolist()},
-                {"state": state[:5].tolist()},
-            ]
-        )
-    else:
-        option_candidates.append({"reset_to_state": state[:5].tolist()})
-
-    # Try both conventions defensively in case the installed env differs.
-    option_candidates.extend(
-        [
-            {"state": state.tolist()},
-            {"state": state[:5].tolist()},
-            {"reset_to_state": state[:5].tolist()},
-        ]
-    )
+    del env_id
+    option_candidates = [
+        {"state": state.tolist()},
+        {"state": state[:5].tolist()},
+    ]
 
     seen = set()
     for options in option_candidates:
@@ -182,7 +167,7 @@ def main():
         env, resolved_env_id = make_env(image_hw=image_hw, seed=args.seed)
         semantic_envs: dict[str, gym.Env] = {}
         semantic_metrics: dict[str, list[dict[str, float]]] = {}
-        if args.check_action_semantics and actions is not None and states is not None and resolved_env_id.startswith("swm/"):
+        if args.check_action_semantics and actions is not None and states is not None:
             semantic_envs = {
                 "raw_relative": make_env(image_hw=image_hw, seed=args.seed, relative=True)[0],
                 "raw_absolute": make_env(image_hw=image_hw, seed=args.seed, relative=False)[0],

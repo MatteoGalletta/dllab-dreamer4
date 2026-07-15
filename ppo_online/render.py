@@ -6,12 +6,11 @@ import argparse
 import os
 
 import gymnasium as gym
-import gym_pusht
 import numpy as np
 import torch
 from gymnasium.wrappers import FrameStackObservation
 
-from ppo_online.env_config import make_pusht_env_kwargs, resolve_pusht_env_id
+from ppo_online.env_config import make_pusht_env, resolve_pusht_env_id
 from ppo_online.model_paths import resolve_bc_prior_path, resolve_ppo_checkpoint_path, resolve_tokenizer_path
 from ppo_online.networks import BCPixelActorCritic, BCStyleLatentActorCritic, VectorActorCritic
 from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
@@ -47,6 +46,18 @@ def extract_checkpoint_state_dict(payload):
                 if state_dict is not None:
                     return state_dict
     return None
+
+
+def extract_checkpoint_args(payload):
+    if not isinstance(payload, dict):
+        return {}
+    args = payload.get("args", {}) or {}
+    if isinstance(args, dict):
+        return args
+    try:
+        return vars(args)
+    except TypeError:
+        return {}
 
 
 def load_bc_prior_into_network(network: torch.nn.Module, path: str, device: torch.device, network_type: str):
@@ -118,6 +129,8 @@ class ChunkExecutionWrapper(gym.Wrapper):
             return np.clip((primitive + 1.0) * 256.0, 0.0, 512.0)
         if self.mode in {"first_delta", "chunk_delta"}:
             return np.clip(self.current_eef + primitive * self.max_step_pixels, 0.0, 512.0)
+        if self.mode in {"first_relative", "chunk_relative"}:
+            return np.asarray(primitive, dtype=np.float32)
         raise ValueError(f"Unsupported chunk execution mode: {self.mode}")
 
     def step(self, macro_action):
@@ -157,14 +170,17 @@ def make_render_env(config: TrainConfig, video_folder: str, action_mode: str, re
     resolved_env_id = resolve_pusht_env_id(config.env_id)
     image_height = int(tokenizer_info["H"]) if tokenizer_info is not None else None
     image_width = int(tokenizer_info["W"]) if tokenizer_info is not None else None
-    env_kwargs = make_pusht_env_kwargs(
-        resolved_env_id,
+    relative = action_mode in {"first_relative", "chunk_relative"}
+    env = make_pusht_env(
+        env_id=resolved_env_id,
         render_mode="rgb_array",
         image_height=image_height,
         image_width=image_width,
+        relative=relative,
+        sync_goal_pose=True,
+        align_sampled_goal_to_fixed_target=True,
+        render_obs=False,
     )
-
-    env = gym.make(resolved_env_id, **env_kwargs)
     if record_video:
         env = gym.wrappers.RecordVideo(
             env,
@@ -228,7 +244,16 @@ def parse_args():
     )
     parser.add_argument(
         "--action-mode",
-        choices=("auto", "ppo_chunk", "first_absolute", "first_delta", "chunk_absolute", "chunk_delta"),
+        choices=(
+            "auto",
+            "ppo_chunk",
+            "first_absolute",
+            "first_delta",
+            "first_relative",
+            "chunk_absolute",
+            "chunk_delta",
+            "chunk_relative",
+        ),
         default="auto",
         help="How to interpret the predicted action chunk during rendering.",
     )
@@ -262,7 +287,6 @@ def render_agent_to_video():
     args = parse_args()
     config = TrainConfig()
     config.bc_prior_path = resolve_bc_prior_path(config.bc_prior_path)
-    config.tokenizer_path = resolve_tokenizer_path(config.tokenizer_path)
     config.save_path = resolve_ppo_checkpoint_path(config.save_path)
     if args.max_step_pixels is not None:
         config.max_step_pixels = float(args.max_step_pixels)
@@ -273,9 +297,32 @@ def render_agent_to_video():
         model_path = resolve_bc_prior_path(model_path)
     else:
         model_path = resolve_ppo_checkpoint_path(model_path)
+
+    if args.source == "bc_prior":
+        bc_payload = load_state_dict_safe(model_path, torch.device("cpu"))
+        bc_args = extract_checkpoint_args(bc_payload)
+        tokenizer_name = bc_args.get("tokenizer_ckpt_name")
+        config.network_type = "bc_latent" if tokenizer_name else "bc_pixels"
+        config.tokenizer_path = resolve_tokenizer_path(str(tokenizer_name)) if tokenizer_name else resolve_tokenizer_path(config.tokenizer_path)
+        if bc_args.get("seq_len") is not None:
+            config.obs_stack_size = int(bc_args["seq_len"])
+        if bc_args.get("action_chunk_size") is not None:
+            config.chunk_size = int(bc_args["action_chunk_size"])
+        if bc_args.get("hidden_dim") is not None:
+            config.actor_hidden_dim = int(bc_args["hidden_dim"])
+        if bc_args.get("dropout") is not None:
+            config.actor_dropout = float(bc_args["dropout"])
+        temporal_layers = int(bc_args.get("temporal_layers", 2))
+        temporal_heads = int(bc_args.get("temporal_heads", 4))
+    else:
+        config.tokenizer_path = resolve_tokenizer_path(config.tokenizer_path)
+        temporal_layers = 2
+        temporal_heads = 4
+
     action_mode = args.action_mode
+    resolved_env_id = resolve_pusht_env_id(config.env_id)
     if action_mode == "auto":
-        action_mode = "chunk_delta" if args.source == "bc_prior" else "ppo_chunk"
+        action_mode = "chunk_relative" if args.source == "bc_prior" else "ppo_chunk"
     video_folder = "./videos"
     record_video = not args.no_video
     if record_video:
@@ -284,7 +331,8 @@ def render_agent_to_video():
         f"Render paths: source={args.source} model={model_path} "
         f"tokenizer={config.tokenizer_path} action_mode={action_mode} "
         f"record_video={record_video} max_steps={args.max_steps} "
-        f"max_step_pixels={config.max_step_pixels}"
+        f"max_step_pixels={config.max_step_pixels} "
+        f"network_type={config.network_type} obs_stack={config.obs_stack_size} chunk_size={config.chunk_size}"
     )
 
     env = make_render_env(config, video_folder, action_mode=action_mode, record_video=record_video)
@@ -301,6 +349,8 @@ def render_agent_to_video():
             hidden_dim=config.actor_hidden_dim,
             dropout=config.actor_dropout,
             backbone_device=config.tokenizer_device,
+            temporal_layers=temporal_layers,
+            temporal_heads=temporal_heads,
         ).to(device)
     elif config.network_type == "bc_latent":
         network = BCStyleLatentActorCritic(
@@ -308,6 +358,8 @@ def render_agent_to_video():
             action_dim=action_dim,
             hidden_dim=config.actor_hidden_dim,
             dropout=config.actor_dropout,
+            temporal_layers=temporal_layers,
+            temporal_heads=temporal_heads,
             max_seq_len=obs_shape[0] if len(obs_shape) >= 1 else 64,
         ).to(device)
     else:
