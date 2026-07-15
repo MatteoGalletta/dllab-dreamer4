@@ -248,6 +248,38 @@ class BCWorldPolicy:
         return np.asarray(actions, dtype=np.float32)
 
 
+class DatasetOracleWorldPolicy:
+    def __init__(self):
+        self.env = None
+        self.action_buffers = None
+
+    def set_env(self, env):
+        self.env = env
+        self.action_buffers = [deque() for _ in range(env.num_envs)]
+
+    def get_action(self, info_dict, **kwargs):
+        del kwargs
+        if self.env is None:
+            raise RuntimeError("DatasetOracleWorldPolicy.set_env must be called before get_action")
+
+        needs_flush = info_dict.get("_needs_flush")
+        if needs_flush is not None:
+            needs_flush = np.asarray(needs_flush).reshape(-1)
+            for env_index, should_flush in enumerate(needs_flush):
+                if should_flush:
+                    self.action_buffers[env_index].clear()
+
+        dataset_actions = np.asarray(info_dict["action"], dtype=np.float32)
+        actions = []
+        for env_index in range(self.env.num_envs):
+            if not self.action_buffers[env_index]:
+                self.action_buffers[env_index].extend(np.asarray(dataset_actions[env_index], dtype=np.float32))
+            if not self.action_buffers[env_index]:
+                raise RuntimeError("Dataset oracle received an empty action sequence from world info_dict.")
+            actions.append(np.asarray(self.action_buffers[env_index].popleft(), dtype=np.float32))
+        return np.asarray(actions, dtype=np.float32)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate BC checkpoint through swm.World like the other group's BC eval.")
     parser.add_argument("--checkpoint", type=str, default="local_models/behavior_cloning/bc_best.pt")
@@ -258,6 +290,12 @@ def parse_args():
     parser.add_argument("--eval-budget", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--video-path", type=str, default=None)
+    parser.add_argument(
+        "--policy-source",
+        choices=("bc", "dataset_oracle"),
+        default="bc",
+        help="Use the BC checkpoint or replay ground-truth dataset actions under the same world eval setup.",
+    )
     return parser.parse_args()
 
 
@@ -265,34 +303,46 @@ def main():
     args = parse_args()
     device = resolve_device("auto")
     checkpoint_path = resolve_bc_prior_path(args.checkpoint)
-    payload = load_state_dict_safe(checkpoint_path, torch.device("cpu"))
-    state_dict = extract_checkpoint_state_dict(payload)
-    if state_dict is None:
-        raise ValueError(f"Unsupported BC checkpoint format in {checkpoint_path}")
-    cleaned_state = clean_state_dict_keys(state_dict)
-    ckpt_args = extract_checkpoint_args(payload)
-    model_cfg = resolve_model_config(ckpt_args, cleaned_state)
-
     tokenizer_path = None
     image_hw = (224, 224)
-    if model_cfg["tokenizer_name"] is not None:
-        tokenizer_path = resolve_tokenizer_path(args.tokenizer_path or str(model_cfg["tokenizer_name"]))
-        _, tokenizer_info = load_tokenizer_from_ckpt(tokenizer_path, torch.device("cpu"))
-        image_hw = (int(tokenizer_info["H"]), int(tokenizer_info["W"]))
+    if args.policy_source == "bc":
+        payload = load_state_dict_safe(checkpoint_path, torch.device("cpu"))
+        state_dict = extract_checkpoint_state_dict(payload)
+        if state_dict is None:
+            raise ValueError(f"Unsupported BC checkpoint format in {checkpoint_path}")
+        cleaned_state = clean_state_dict_keys(state_dict)
+        ckpt_args = extract_checkpoint_args(payload)
+        model_cfg = resolve_model_config(ckpt_args, cleaned_state)
 
-    policy = BCImagePolicy(
-        image_shape=(image_hw[0], image_hw[1], 3),
-        hidden_dim=model_cfg["hidden_dim"],
-        dropout=model_cfg["dropout"],
-        action_chunk_size=model_cfg["action_chunk_size"],
-        seq_len=model_cfg["seq_len"],
-        tokenizer_ckpt=tokenizer_path,
-        temporal_layers=model_cfg["temporal_layers"],
-        temporal_heads=model_cfg["temporal_heads"],
-        backbone_device=device,
-    ).to(device)
-    policy.load_state_dict(cleaned_state, strict=True)
-    policy.eval()
+        if model_cfg["tokenizer_name"] is not None:
+            tokenizer_path = resolve_tokenizer_path(args.tokenizer_path or str(model_cfg["tokenizer_name"]))
+            _, tokenizer_info = load_tokenizer_from_ckpt(tokenizer_path, torch.device("cpu"))
+            image_hw = (int(tokenizer_info["H"]), int(tokenizer_info["W"]))
+
+        policy = BCImagePolicy(
+            image_shape=(image_hw[0], image_hw[1], 3),
+            hidden_dim=model_cfg["hidden_dim"],
+            dropout=model_cfg["dropout"],
+            action_chunk_size=model_cfg["action_chunk_size"],
+            seq_len=model_cfg["seq_len"],
+            tokenizer_ckpt=tokenizer_path,
+            temporal_layers=model_cfg["temporal_layers"],
+            temporal_heads=model_cfg["temporal_heads"],
+            backbone_device=device,
+        ).to(device)
+        policy.load_state_dict(cleaned_state, strict=True)
+        policy.eval()
+    else:
+        model_cfg = {
+            "seq_len": 1,
+            "action_chunk_size": 1,
+            "hidden_dim": 0,
+            "dropout": 0.0,
+            "temporal_layers": 0,
+            "temporal_heads": 0,
+            "tokenizer_name": None,
+        }
+        policy = None
 
     world_dataset = PushTH5WorldDataset(args.dataset, image_size=image_hw)
     episode_indices, start_steps = sample_world_eval_starts(
@@ -304,7 +354,7 @@ def main():
     _install_pusht_goal_pose_setter()
 
     print(
-        "Using swm.World.evaluate(dataset=...) for our BC checkpoint: "
+        f"Using swm.World.evaluate(dataset=...) for policy_source={args.policy_source}: "
         f"episodes={args.episodes}, goal_offset_steps={args.goal_offset_steps}, "
         f"eval_budget={args.eval_budget}, seed={args.seed}."
     )
@@ -325,12 +375,15 @@ def main():
             image_shape=image_hw,
             max_episode_steps=2 * args.eval_budget,
         )
-        world_policy = BCWorldPolicy(
-            policy=policy,
-            seq_len=model_cfg["seq_len"],
-            action_chunk_size=model_cfg["action_chunk_size"],
-            device=device,
-        )
+        if args.policy_source == "bc":
+            world_policy = BCWorldPolicy(
+                policy=policy,
+                seq_len=model_cfg["seq_len"],
+                action_chunk_size=model_cfg["action_chunk_size"],
+                device=device,
+            )
+        else:
+            world_policy = DatasetOracleWorldPolicy()
         world.set_policy(world_policy)
         try:
             metrics = world.evaluate(
