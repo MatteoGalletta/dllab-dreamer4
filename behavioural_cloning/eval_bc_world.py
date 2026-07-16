@@ -217,7 +217,8 @@ class BCWorldPolicy:
 
     def set_env(self, env):
         self.env = env
-        self.frame_histories = [deque(maxlen=self.seq_len) for _ in range(env.num_envs)]
+        max_history_len = (self.seq_len - 1) * self.frame_stride + 1
+        self.frame_histories = [deque(maxlen=max_history_len) for _ in range(env.num_envs)]
         self.action_buffers = [deque() for _ in range(env.num_envs)]
 
     def _stack_history(self, env_index: int) -> np.ndarray:
@@ -332,8 +333,10 @@ def main():
             action_chunk_size=model_cfg["action_chunk_size"],
             seq_len=model_cfg["seq_len"],
             tokenizer_ckpt=tokenizer_path,
+            policy_style=model_cfg["policy_style"],
             temporal_layers=model_cfg["temporal_layers"],
             temporal_heads=model_cfg["temporal_heads"],
+            temporal_context=model_cfg["temporal_context"],
             backbone_device=device,
         ).to(device)
         policy.load_state_dict(cleaned_state, strict=True)

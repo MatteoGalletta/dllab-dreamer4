@@ -66,6 +66,30 @@ class CNNBackbone(nn.Module):
         return features.view(batch, steps, -1)
 
 
+class DirectChunkPolicyHead(nn.Module):
+    def __init__(self, *, in_dim: int, seq_len: int, hidden_dim: int, action_dim: int, dropout: float):
+        super().__init__()
+        self.seq_len = int(seq_len)
+        self.action_dim = int(action_dim)
+        self.net = nn.Sequential(
+            nn.Linear(int(in_dim) * self.seq_len, int(hidden_dim)),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), int(hidden_dim)),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), self.action_dim),
+        )
+
+    def forward(self, features_btD: torch.Tensor) -> torch.Tensor:
+        if features_btD.ndim != 3:
+            raise ValueError(f"Expected feature sequence with shape (B, T, D), got {tuple(features_btD.shape)}")
+        batch, steps, feature_dim = features_btD.shape
+        if steps != self.seq_len:
+            raise ValueError(f"Expected seq_len={self.seq_len}, got {steps}")
+        return torch.tanh(self.net(features_btD.reshape(batch, steps * feature_dim)))
+
+
 class BCImagePolicy(nn.Module):
     def __init__(
         self,
@@ -76,8 +100,10 @@ class BCImagePolicy(nn.Module):
         action_chunk_size: int,
         seq_len: int,
         tokenizer_ckpt: str | None,
+        policy_style: str,
         temporal_layers: int,
         temporal_heads: int,
+        temporal_context: int,
         backbone_device: torch.device | str,
     ):
         super().__init__()
@@ -86,15 +112,26 @@ class BCImagePolicy(nn.Module):
             self.backbone = TokenizerBackbone(tokenizer_ckpt=tokenizer_ckpt, device=backbone_device)
         else:
             self.backbone = CNNBackbone(in_channels=int(image_shape[2]))
-        self.classifier = BCActionClassifier(
-            in_dim=self.backbone.feature_dim,
-            hidden_dim=int(hidden_dim),
-            action_dim=action_dim,
-            dropout=float(dropout),
-            temporal_layers=int(temporal_layers),
-            temporal_heads=int(temporal_heads),
-            max_seq_len=int(seq_len),
-        )
+        self.policy_style = str(policy_style)
+        if self.policy_style == "direct_chunk_cnn":
+            self.classifier = DirectChunkPolicyHead(
+                in_dim=self.backbone.feature_dim,
+                seq_len=int(seq_len),
+                hidden_dim=int(hidden_dim),
+                action_dim=action_dim,
+                dropout=float(dropout),
+            )
+        else:
+            self.classifier = BCActionClassifier(
+                in_dim=self.backbone.feature_dim,
+                hidden_dim=int(hidden_dim),
+                action_dim=action_dim,
+                dropout=float(dropout),
+                temporal_layers=int(temporal_layers),
+                temporal_heads=int(temporal_heads),
+                max_seq_len=int(seq_len),
+                temporal_context=int(temporal_context),
+            )
         self.action_chunk_size = int(action_chunk_size)
 
     def _ensure_sequence(self, image_obs: torch.Tensor) -> torch.Tensor:
@@ -120,7 +157,9 @@ class BCImagePolicy(nn.Module):
 
     def predict_action_chunk(self, image_obs: torch.Tensor) -> torch.Tensor:
         actions = self.forward(image_obs)
-        return actions[:, -1, :].view(actions.shape[0], self.action_chunk_size, 2)
+        if actions.ndim == 3:
+            actions = actions[:, -1, :]
+        return actions.view(actions.shape[0], self.action_chunk_size, 2)
 
 
 def parse_args():
@@ -173,8 +212,12 @@ def resolve_model_config(ckpt_args: dict, cleaned_state: dict[str, torch.Tensor]
     hidden_dim = int(ckpt_args.get("hidden_dim", 512))
     dropout = float(ckpt_args.get("dropout", 0.05))
     has_temporal = any(key.startswith("classifier.temporal_") for key in cleaned_state)
+    policy_style = ckpt_args.get("policy_style")
+    if policy_style is None:
+        policy_style = "sequence_classifier" if has_temporal else "direct_chunk_cnn"
     temporal_layers = int(ckpt_args.get("temporal_layers", 2 if has_temporal else 0))
     temporal_heads = int(ckpt_args.get("temporal_heads", 4))
+    temporal_context = int(ckpt_args.get("temporal_context", 3))
     return {
         "tokenizer_name": tokenizer_name,
         "seq_len": seq_len,
@@ -182,8 +225,10 @@ def resolve_model_config(ckpt_args: dict, cleaned_state: dict[str, torch.Tensor]
         "action_chunk_size": action_chunk_size,
         "hidden_dim": hidden_dim,
         "dropout": dropout,
+        "policy_style": policy_style,
         "temporal_layers": temporal_layers,
         "temporal_heads": temporal_heads,
+        "temporal_context": temporal_context,
     }
 
 
@@ -278,8 +323,10 @@ def main():
         action_chunk_size=model_cfg["action_chunk_size"],
         seq_len=model_cfg["seq_len"],
         tokenizer_ckpt=tokenizer_path,
+        policy_style=model_cfg["policy_style"],
         temporal_layers=model_cfg["temporal_layers"],
         temporal_heads=model_cfg["temporal_heads"],
+        temporal_context=model_cfg["temporal_context"],
         backbone_device=device,
     ).to(device)
     model.load_state_dict(cleaned_state, strict=True)
@@ -311,7 +358,8 @@ def main():
     for episode_idx in range(args.episodes):
         _, info = env.reset(seed=args.seed + episode_idx)
         del info
-        frame_history: deque[np.ndarray] = deque(maxlen=model_cfg["seq_len"])
+        max_history_len = (int(model_cfg["seq_len"]) - 1) * int(model_cfg["frame_stride"]) + 1
+        frame_history: deque[np.ndarray] = deque(maxlen=max_history_len)
         action_buffer: deque[np.ndarray] = deque()
         pending_chunks: deque[dict[str, np.ndarray | int]] = deque()
         done = False

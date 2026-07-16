@@ -426,7 +426,10 @@ def make_pusht_env(
         image_width=image_width,
     )
     env_kwargs.update(kwargs)
-    env = gym.make(resolved_env_id, **env_kwargs)
+    # The upstream SWM PushT env can emit observations that violate its own
+    # declared Gym space slightly, which triggers noisy passive checker
+    # warnings during BC/PPO rollouts even though our wrappers handle the data.
+    env = gym.make(resolved_env_id, disable_env_checker=True, **env_kwargs)
     if align_sampled_goal_to_fixed_target:
         env = PushTAlignSampledGoalToFixedTargetWrapper(
             env,

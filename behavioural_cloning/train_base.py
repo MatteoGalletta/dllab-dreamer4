@@ -89,8 +89,13 @@ def is_rank0() -> bool:
 
 def get_wandb_mode(args: argparse.Namespace) -> str:
     mode = getattr(args, "wandb_mode", "disabled") or "disabled"
-    # if mode == "online" and not os.environ.get("WANDB_API_KEY") and not (Path.home() / ".netrc").exists():
-        # return "disabled"
+    if mode == "online":
+        has_api_key = bool(os.environ.get("WANDB_API_KEY"))
+        has_netrc = (Path.home() / ".netrc").exists()
+        if not has_api_key and not has_netrc:
+            if is_rank0():
+                print("WANDB_API_KEY/.netrc not found, falling back from wandb online mode to offline mode.")
+            return "offline"
     return mode
 
 def get_runtime_device() -> tuple[torch.device, str]:
@@ -186,25 +191,20 @@ class TokenizerBackbone(nn.Module):
         return z.reshape(z.shape[0], z.shape[1], -1)
 
 
-class ActionClassifier(nn.Module):
+class ActionChunkPolicyHead(nn.Module):
     def __init__(
         self,
         in_dim: int,
+        seq_len: int,
         hidden_dim: int,
         action_dim: int,
         dropout: float,
-        temporal_layers: int = 2,
-        temporal_heads: int = 4,
-        max_seq_len: int = 64,
-        temporal_context: int = 3,
     ):
         super().__init__()
-        self.hidden_dim = int(hidden_dim)
+        self.seq_len = int(seq_len)
         self.action_dim = int(action_dim)
-        self.max_seq_len = int(max_seq_len)
-        self.temporal_context = max(1, int(temporal_context))
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
+            nn.Linear(int(in_dim) * self.seq_len, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
@@ -212,63 +212,19 @@ class ActionClassifier(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, action_dim),
         )
-        self.temporal_in = nn.Linear(in_dim, hidden_dim)
-        self.temporal_pos = nn.Parameter(torch.zeros(1, self.max_seq_len, hidden_dim))
-        self.temporal_blocks = nn.ModuleList(
-            [
-                nn.TransformerEncoderLayer(
-                    d_model=hidden_dim,
-                    nhead=temporal_heads,
-                    dim_feedforward=hidden_dim * 4,
-                    dropout=dropout,
-                    activation="gelu",
-                    batch_first=True,
-                    norm_first=True,
-                )
-                for _ in range(max(0, int(temporal_layers)))
-            ]
-        )
-        self.temporal_norm = nn.LayerNorm(hidden_dim)
-        self.temporal_out = nn.Linear(hidden_dim, action_dim)
-        nn.init.zeros_(self.temporal_out.weight)
-        nn.init.zeros_(self.temporal_out.bias)
-
-    def _positional_encoding(self, seq_len: int) -> torch.Tensor:
-        if seq_len <= self.max_seq_len:
-            return self.temporal_pos[:, :seq_len, :]
-        pos = self.temporal_pos.transpose(1, 2)
-        pos = F.interpolate(pos, size=seq_len, mode="linear", align_corners=False)
-        return pos.transpose(1, 2)
-
-    def _causal_local_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        query_idx = torch.arange(seq_len, device=device).unsqueeze(1)
-        key_idx = torch.arange(seq_len, device=device).unsqueeze(0)
-        future_mask = key_idx > query_idx
-        history_mask = key_idx < (query_idx - (self.temporal_context - 1))
-        return future_mask | history_mask
 
     def forward(self, features_btD: torch.Tensor) -> torch.Tensor:
+        if features_btD.ndim != 3:
+            raise ValueError(f"Expected feature sequence with shape (B, T, D), got {tuple(features_btD.shape)}")
         B, T, D = features_btD.shape
-        base_logits = self.net(features_btD.reshape(B * T, D)).view(B, T, -1)
-        with torch.autocast(device_type=features_btD.device.type, enabled=False):
-            temporal_features = self.temporal_in(features_btD.float())
-            temporal_pos = self._positional_encoding(T).to(
-                device=temporal_features.device,
-                dtype=torch.float32,
-            )
-            temporal_features = temporal_features + temporal_pos
-            attn_mask = self._causal_local_mask(T, temporal_features.device)
-            for block in self.temporal_blocks:
-                temporal_features = block(temporal_features, src_mask=attn_mask)
-            temporal_logits = self.temporal_out(self.temporal_norm(temporal_features))
-        temporal_logits = temporal_logits.to(base_logits.dtype)
-        logits = base_logits + temporal_logits
-        actions = torch.tanh(logits)
-        return actions.view(B, T, -1)
+        if T != self.seq_len:
+            raise ValueError(f"Expected seq_len={self.seq_len}, got {T}")
+        logits = self.net(features_btD.reshape(B, T * D))
+        return torch.tanh(logits)
 
 
 class Policy(nn.Module):
-    def __init__(self, backbone: nn.Module, classifier: ActionClassifier):
+    def __init__(self, backbone: nn.Module, classifier: ActionChunkPolicyHead):
         super().__init__()
         self.backbone = backbone
         self.classifier = classifier
@@ -410,9 +366,8 @@ def evaluate_validation(
 
             with autocast(device_type=device_type, enabled=use_amp):
                 pred = base_model(x)
-                pred_last = pred[:, -1, :]
-                loss = F.mse_loss(pred_last, target_actions)
-                mae = torch.mean(torch.abs(pred_last - target_actions))
+                loss = F.mse_loss(pred, target_actions)
+                mae = torch.mean(torch.abs(pred - target_actions))
 
             loss_sum += float(loss.item())
             mae_sum += float(mae.item())
@@ -529,7 +484,8 @@ def evaluate_rollouts(
     with torch.no_grad():
         for episode_idx in range(int(episodes)):
             env.reset(seed=int(seed) + episode_idx)
-            frame_history: list[np.ndarray] = []
+            max_history_len = (int(seq_len) - 1) * int(frame_stride) + 1
+            frame_history: deque[np.ndarray] = deque(maxlen=max_history_len)
             action_buffer: list[np.ndarray] = []
             pending_chunks: list[dict[str, object]] = []
             total_reward = 0.0
@@ -547,8 +503,8 @@ def evaluate_rollouts(
                 if temporal_ensemble or not action_buffer:
                     stacked_frames = _pad_history(frame_history, seq_len, frame_stride)
                     input_tensor = torch.as_tensor(stacked_frames[None], dtype=torch.uint8, device=device)
-                    action_seq = base_model(input_tensor.permute(0, 1, 4, 2, 3).to(torch.float32) / 255.0)
-                    action_chunk = action_seq[:, -1, :].view(1, chunk_size, 2).squeeze(0).cpu().numpy()
+                    action_chunk_flat = base_model(input_tensor.permute(0, 1, 4, 2, 3).to(torch.float32) / 255.0)
+                    action_chunk = action_chunk_flat.view(1, chunk_size, 2).squeeze(0).cpu().numpy()
                     action_chunk = np.clip(action_chunk, -1.0, 1.0)
                     if temporal_ensemble:
                         pending_chunks.append({"chunk": action_chunk, "offset": 0})
@@ -615,6 +571,12 @@ def train(args):
 
     seed_everything(args.seed + rank)
 
+    if is_rank0() and args.num_workers > 0:
+        print(
+            "Warning: num_workers > 0 can segfault with h5py/HDF5 plugin datasets like pusht_expert_train.h5. "
+            "If training crashes early, rerun with --num_workers 0."
+        )
+
     # ---- data ----
     full_dataset = PushTSequenceDataset(
         h5_path=args.dataset,
@@ -657,18 +619,20 @@ def train(args):
     if args.tokenizer_ckpt_name and is_rank0():
         print("Ignoring --tokenizer_ckpt_name. This BC run uses raw image pixels only.")
     args.tokenizer_ckpt_name = None
+    args.policy_style = "direct_chunk_cnn"
+    args.action_space = "swm_relative"
+    args.image_normalization = "div255"
+    if is_rank0() and (args.temporal_layers != 0 or args.temporal_heads != 0 or args.temporal_context != 0):
+        print("Ignoring temporal transformer args. This BC run matches the other group's direct chunk policy contract.")
     backbone = CNNBackbone(in_channels=args.C)
     backbone_dim = backbone.feature_dim
 
-    classifier = ActionClassifier(
+    classifier = ActionChunkPolicyHead(
         in_dim=backbone_dim,
+        seq_len=args.seq_len,
         hidden_dim=args.hidden_dim,
         action_dim=action_dim,
         dropout=args.dropout,
-        temporal_layers=args.temporal_layers,
-        temporal_heads=args.temporal_heads,
-        max_seq_len=args.seq_len,
-        temporal_context=args.temporal_context,
     )
     model = Policy(backbone=backbone, classifier=classifier).to(device)
 
@@ -735,10 +699,8 @@ def train(args):
                 if target_actions.ndim != 2 or target_actions.shape[-1] != action_dim:
                     raise RuntimeError(f"Expected actions shape (B,{action_dim}), got {tuple(target_actions.shape)}")
 
-                pred_last = pred[:, -1, :]
-
-                loss = F.mse_loss(pred_last, target_actions)
-                mae = torch.mean(torch.abs(pred_last - target_actions))
+                loss = F.mse_loss(pred, target_actions)
+                mae = torch.mean(torch.abs(pred - target_actions))
 
                 if not torch.isfinite(loss):
                     raise RuntimeError(f"Non-finite loss at step {step}: loss={loss}")
@@ -889,9 +851,9 @@ if __name__ == "__main__":
         dest="dataset",
         type=str,
     )
-    p.add_argument("--seq_len", type=int, default=8)
+    p.add_argument("--seq_len", type=int, default=3)
     p.add_argument("--frame_stride", type=int, default=5)
-    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--action_chunk_size", type=int, default=5)
 
@@ -902,10 +864,10 @@ if __name__ == "__main__":
 
     # model
     p.add_argument("--hidden_dim", type=int, default=512)
-    p.add_argument("--dropout", type=float, default=0.05)
-    p.add_argument("--temporal_layers", type=int, default=2)
-    p.add_argument("--temporal_heads", type=int, default=4)
-    p.add_argument("--temporal_context", type=int, default=3)
+    p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--temporal_layers", type=int, default=0)
+    p.add_argument("--temporal_heads", type=int, default=0)
+    p.add_argument("--temporal_context", type=int, default=0)
     p.add_argument(
         "--tokenizer_ckpt_name",
         type=str,
