@@ -651,7 +651,7 @@ def train(args):
         )
 
     # ---- optim ----
-    opt = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
+    opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
     use_amp = device_type in {"cuda", "xpu"}
     scaler = GradScaler(device=device_type, enabled=use_amp)
 
@@ -876,8 +876,8 @@ if __name__ == "__main__":
     )
 
     # optim
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--weight_decay", type=float, default=1e-2)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=0.0, help="unused; kept for CLI compatibility")
     p.add_argument("--max_steps", type=int, default=10_000_000)
     p.add_argument("--grad_accum", type=int, default=1)
 

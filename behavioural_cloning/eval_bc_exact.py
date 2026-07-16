@@ -190,6 +190,11 @@ def parse_args():
     parser.add_argument("--print-every", type=int, default=25)
     parser.add_argument("--temporal-ensemble", action="store_true")
     parser.add_argument("--temporal-ensemble-decay", type=float, default=0.35)
+    parser.add_argument(
+        "--fixed-target-eval",
+        action="store_true",
+        help="Rigidly align sampled PushT tasks to the fixed target pose, matching the other group's optional eval mode.",
+    )
     return parser.parse_args()
 
 
@@ -339,7 +344,7 @@ def main():
         image_width=image_hw[1],
         relative=(args.action_mode == "relative"),
         sync_goal_pose=True,
-        align_sampled_goal_to_fixed_target=True,
+        align_sampled_goal_to_fixed_target=args.fixed_target_eval,
         render_obs=False,
     )
 
@@ -347,7 +352,8 @@ def main():
         f"Loaded BC checkpoint from {checkpoint_path} | tokenizer={tokenizer_path} "
         f"| seq_len={model_cfg['seq_len']} frame_stride={model_cfg['frame_stride']} "
         f"chunk={model_cfg['action_chunk_size']} "
-        f"| action_mode={args.action_mode} | temporal_ensemble={args.temporal_ensemble} | device={device}"
+        f"| action_mode={args.action_mode} | temporal_ensemble={args.temporal_ensemble} "
+        f"| fixed_target_eval={args.fixed_target_eval} | device={device}"
     )
 
     all_returns: list[float] = []
