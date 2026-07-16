@@ -7,6 +7,7 @@ import importlib
 import importlib.util
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -14,7 +15,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
-from torch.utils.data import DataLoader, DistributedSampler, Subset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -177,18 +178,29 @@ class CNNBackbone(nn.Module):
 
 
 class TokenizerBackbone(nn.Module):
-    def __init__(self, encoder: nn.Module, patch: int):
+    def __init__(self, encoder: nn.Module, patch: int, *, output_dim: int):
         super().__init__()
         self.encoder = encoder
         self.patch = int(patch)
-        latent_dim = int(self.encoder.n_latents) * int(self.encoder.bottleneck_proj.out_features)
-        self.feature_dim = latent_dim
+        self.raw_feature_dim = int(self.encoder.n_latents) * int(self.encoder.bottleneck_proj.out_features)
+        self.feature_dim = int(output_dim)
+        self.projector = nn.Sequential(
+            nn.LayerNorm(self.raw_feature_dim),
+            nn.Linear(self.raw_feature_dim, self.feature_dim),
+            nn.ReLU(),
+        )
 
-    def forward(self, x_btchw: torch.Tensor) -> torch.Tensor:
+    def extract_features(self, x_btchw: torch.Tensor) -> torch.Tensor:
         patches = temporal_patchify(x_btchw, self.patch)
         with torch.no_grad():
             z, _ = self.encoder(patches)
         return z.reshape(z.shape[0], z.shape[1], -1)
+
+    def forward(self, x_btchw: torch.Tensor) -> torch.Tensor:
+        return self.projector(self.extract_features(x_btchw))
+
+    def project_features(self, features_btD: torch.Tensor) -> torch.Tensor:
+        return self.projector(features_btD)
 
 
 class ActionChunkPolicyHead(nn.Module):
@@ -229,16 +241,43 @@ class Policy(nn.Module):
         self.backbone = backbone
         self.classifier = classifier
 
-    def forward(self, x_btchw: torch.Tensor) -> torch.Tensor:
-        features = self.backbone(x_btchw)
+    def forward(self, x_or_features: torch.Tensor) -> torch.Tensor:
+        if x_or_features.ndim == 5:
+            features = self.backbone(x_or_features)
+        elif x_or_features.ndim == 3:
+            if not isinstance(self.backbone, TokenizerBackbone):
+                raise ValueError("Precomputed features are only supported with the tokenizer backbone.")
+            features = self.backbone.project_features(x_or_features)
+        else:
+            raise ValueError(f"Unsupported policy input shape: {tuple(x_or_features.shape)}")
         return self.classifier(features)
 
     def train(self, mode: bool = True):
         super().train(mode)
         if isinstance(self.backbone, TokenizerBackbone):
-            self.backbone.eval()
-            self.backbone.requires_grad_(False)
+            self.backbone.encoder.eval()
+            self.backbone.encoder.requires_grad_(False)
         return self
+
+
+class CachedFeatureDataset(Dataset):
+    def __init__(self, base_dataset: Dataset, cached_features: torch.Tensor):
+        if len(base_dataset) != int(cached_features.shape[0]):
+            raise ValueError(
+                f"Cached feature length mismatch: dataset={len(base_dataset)} cache={int(cached_features.shape[0])}"
+            )
+        self.base_dataset = base_dataset
+        self.cached_features = cached_features.contiguous()
+
+    def __len__(self) -> int:
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        item = self.base_dataset[idx]
+        return {
+            **item,
+            "features": self.cached_features[idx],
+        }
 
 
 def _strip_prefix(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
@@ -336,6 +375,74 @@ def split_indices(num_items: int, val_frac: float, seed: int) -> tuple[list[int]
     return train_indices, val_indices
 
 
+def tokenizer_feature_cache_path(args: argparse.Namespace, tokenizer_path: str) -> Path:
+    dataset_stem = Path(args.dataset).stem
+    tokenizer_stem = Path(tokenizer_path).stem
+    cache_dir = PROJECT_ROOT / "logs" / "tokenizer_feature_cache"
+    cache_name = (
+        f"{dataset_stem}_{tokenizer_stem}_seq{int(args.seq_len)}"
+        f"_stride{int(args.frame_stride)}_chunk{int(args.action_chunk_size)}.pt"
+    )
+    return cache_dir / cache_name
+
+
+def load_feature_cache(path: Path) -> torch.Tensor | None:
+    if not path.exists():
+        return None
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict) or "features" not in payload:
+        return None
+    features = payload["features"]
+    if not torch.is_tensor(features) or features.ndim != 3:
+        return None
+    return features.to(torch.float32)
+
+
+@torch.no_grad()
+def build_feature_cache(
+    dataset: Dataset,
+    *,
+    tokenizer_backbone: TokenizerBackbone,
+    cache_path: Path,
+    device: torch.device,
+    batch_size: int,
+    image_batch_normalizer,
+    metadata: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_loader = DataLoader(
+        dataset,
+        batch_size=max(1, int(batch_size)),
+        shuffle=False,
+        num_workers=0,
+        pin_memory=(device.type in {"cuda", "xpu"}),
+        drop_last=False,
+    )
+    was_training = tokenizer_backbone.training
+    tokenizer_backbone.eval()
+    tokenizer_backbone.encoder.eval()
+
+    cached_features: list[torch.Tensor] = []
+    for batch_idx, batch in enumerate(cache_loader):
+        x = image_batch_normalizer(batch["image"].to(device, non_blocking=True))
+        features = tokenizer_backbone.extract_features(x).cpu()
+        cached_features.append(features)
+        if batch_idx == 0 or (batch_idx + 1) == len(cache_loader):
+            print(f"cached tokenizer features: {min((batch_idx + 1) * batch_size, len(dataset))}/{len(dataset)}")
+
+    feature_tensor = torch.cat(cached_features, dim=0).to(torch.float32).contiguous()
+    torch.save(
+        {
+            "features": feature_tensor,
+            "meta": metadata or {},
+        },
+        cache_path,
+    )
+    if was_training:
+        tokenizer_backbone.train()
+    return feature_tensor
+
+
 def evaluate_validation(
     model: nn.Module,
     loader: DataLoader | None,
@@ -361,7 +468,10 @@ def evaluate_validation(
         for batch_idx, batch in enumerate(loader):
             if max_batches > 0 and batch_idx >= max_batches:
                 break
-            x = normalize_image_batch(batch["image"].to(device, non_blocking=True))
+            if "features" in batch:
+                x = batch["features"].to(device, non_blocking=True).to(torch.float32)
+            else:
+                x = normalize_image_batch(batch["image"].to(device, non_blocking=True))
             target_actions = batch["action"].to(device, non_blocking=True).to(torch.float32)
             if target_actions.ndim != 2 or target_actions.shape[-1] != action_dim:
                 raise RuntimeError(f"Expected actions shape (B,{action_dim}), got {tuple(target_actions.shape)}")
@@ -587,11 +697,78 @@ def train(args):
         frame_stride=args.frame_stride,
     )
     train_indices, val_indices = split_indices(len(full_dataset), args.val_frac, args.seed)
-    dataset = Subset(full_dataset, train_indices)
-    val_dataset = Subset(full_dataset, val_indices) if val_indices else None
 
+    tokenizer_path = args.tokenizer_ckpt_name
+    if tokenizer_path is None:
+        tokenizer_path = resolve_tokenizer_path(None)
+        if is_rank0():
+            print(f"Using tokenizer checkpoint: {tokenizer_path}")
+
+    # ---- model / features ----
+    action_dim = args.action_chunk_size * 2
+    args.policy_style = "direct_chunk_cnn"
+    args.action_space = "swm_relative"
+    args.image_normalization = "div255"
+    if is_rank0() and (args.temporal_layers != 0 or args.temporal_heads != 0 or args.temporal_context != 0):
+        print("Ignoring temporal transformer args. This BC run matches the other group's direct chunk policy contract.")
+
+    dataset_for_training: Dataset = full_dataset
+    if tokenizer_path:
+        args.tokenizer_ckpt_name = tokenizer_path
+        encoder = load_tokenizer_encoder(tokenizer_path)
+        backbone = TokenizerBackbone(
+            encoder,
+            patch=int(encoder.patch),
+            output_dim=args.tokenizer_feature_dim,
+        )
+        backbone_dim = backbone.feature_dim
+        if not args.disable_tokenizer_feature_cache:
+            cache_path = tokenizer_feature_cache_path(args, tokenizer_path)
+            cached_features = None
+            if is_rank0() and (args.rebuild_tokenizer_feature_cache or not cache_path.exists()):
+                print(f"Building tokenizer feature cache at {cache_path}")
+                cached_features = build_feature_cache(
+                    full_dataset,
+                    tokenizer_backbone=backbone.to(device),
+                    cache_path=cache_path,
+                    device=device,
+                    batch_size=args.tokenizer_feature_cache_batch_size or args.batch_size,
+                    image_batch_normalizer=normalize_image_batch,
+                    metadata={
+                        "dataset": str(args.dataset),
+                        "tokenizer_ckpt": str(tokenizer_path),
+                        "seq_len": int(args.seq_len),
+                        "frame_stride": int(args.frame_stride),
+                        "action_chunk_size": int(args.action_chunk_size),
+                        "raw_feature_dim": int(backbone.raw_feature_dim),
+                    },
+                )
+            if ddp:
+                dist.barrier()
+            if cached_features is None:
+                cached_features = load_feature_cache(cache_path)
+            if cached_features is None:
+                raise RuntimeError(f"Tokenizer feature cache at {cache_path} is missing or invalid.")
+            dataset_for_training = CachedFeatureDataset(full_dataset, cached_features)
+            if is_rank0():
+                print(
+                    f"Using cached tokenizer features: {cache_path} "
+                    f"| raw_dim={backbone.raw_feature_dim} -> proj_dim={backbone.feature_dim}"
+                )
+        elif is_rank0():
+            print(
+                f"Tokenizer cache disabled; training will encode online "
+                f"| raw_dim={backbone.raw_feature_dim} -> proj_dim={backbone.feature_dim}"
+            )
+    else:
+        if is_rank0():
+            print("No tokenizer checkpoint found; falling back to raw image CNN backbone.")
+        backbone = CNNBackbone(in_channels=args.C)
+        backbone_dim = backbone.feature_dim
+
+    dataset = Subset(dataset_for_training, train_indices)
+    val_dataset = Subset(dataset_for_training, val_indices) if val_indices else None
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
-
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -615,30 +792,6 @@ def train(args):
             persistent_workers=(args.num_workers > 0),
             worker_init_fn=worker_init_fn,
         )
-
-    # ---- model ----
-    action_dim = args.action_chunk_size * 2
-    args.policy_style = "direct_chunk_cnn"
-    args.action_space = "swm_relative"
-    args.image_normalization = "div255"
-    if is_rank0() and (args.temporal_layers != 0 or args.temporal_heads != 0 or args.temporal_context != 0):
-        print("Ignoring temporal transformer args. This BC run matches the other group's direct chunk policy contract.")
-    tokenizer_path = args.tokenizer_ckpt_name
-    if tokenizer_path is None:
-        tokenizer_path = resolve_tokenizer_path(None)
-        if is_rank0():
-            print(f"Using tokenizer checkpoint: {tokenizer_path}")
-
-    if tokenizer_path:
-        args.tokenizer_ckpt_name = tokenizer_path
-        encoder = load_tokenizer_encoder(tokenizer_path)
-        backbone = TokenizerBackbone(encoder, patch=int(encoder.patch))
-        backbone_dim = backbone.feature_dim
-    else:
-        if is_rank0():
-            print("No tokenizer checkpoint found; falling back to raw image CNN backbone.")
-        backbone = CNNBackbone(in_channels=args.C)
-        backbone_dim = backbone.feature_dim
 
     classifier = ActionChunkPolicyHead(
         in_dim=backbone_dim,
@@ -703,7 +856,10 @@ def train(args):
                 if step >= args.max_steps:
                     break
 
-                x = normalize_image_batch(batch["image"].to(device, non_blocking=True))  # (B,T,C,H,W)
+                if "features" in batch:
+                    x = batch["features"].to(device, non_blocking=True).to(torch.float32)
+                else:
+                    x = normalize_image_batch(batch["image"].to(device, non_blocking=True))  # (B,T,C,H,W)
 
                 with autocast(device_type=device_type, enabled=use_amp):
                     pred = model(x)
@@ -876,7 +1032,7 @@ if __name__ == "__main__":
     p.add_argument("--C", type=int, default=3)
 
     # model
-    p.add_argument("--hidden_dim", type=int, default=512)
+    p.add_argument("--hidden_dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--temporal_layers", type=int, default=0)
     p.add_argument("--temporal_heads", type=int, default=0)
@@ -886,6 +1042,15 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="optional tokenizer checkpoint; defaults to logs/tokenizer_ckpts/latest.pt if present",
+    )
+    p.add_argument("--tokenizer_feature_dim", type=int, default=256)
+    p.add_argument("--disable_tokenizer_feature_cache", action="store_true")
+    p.add_argument("--rebuild_tokenizer_feature_cache", action="store_true")
+    p.add_argument(
+        "--tokenizer_feature_cache_batch_size",
+        type=int,
+        default=0,
+        help="0 falls back to --batch_size when building cached tokenizer features",
     )
 
     # optim
