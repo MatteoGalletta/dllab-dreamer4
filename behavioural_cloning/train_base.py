@@ -220,7 +220,7 @@ class ActionChunkPolicyHead(nn.Module):
         if T != self.seq_len:
             raise ValueError(f"Expected seq_len={self.seq_len}, got {T}")
         logits = self.net(features_btD.reshape(B, T * D))
-        return logits
+        return torch.tanh(logits)
 
 
 class Policy(nn.Module):
@@ -259,8 +259,10 @@ def load_tokenizer_encoder(tokenizer_ckpt_name: str) -> nn.Module:
     if not ckpt_path.is_absolute() and not ckpt_path.exists():
         log_candidates = [
             LOCAL_MODEL_ROOT / "tokenizer_ckpts" / tokenizer_ckpt_name,
-            LOCAL_MODEL_ROOT / "tokenizer_ckpts" / "tokenizer.pt",
             LOCAL_MODEL_ROOT / "tokenizer_ckpts" / "latest.pt",
+            PROJECT_ROOT / "local_models" / "tokenizer" / "tokenizer.pt",
+            LOCAL_MODEL_ROOT / "tokenizer_ckpts" / "tokenizer.pt",
+            PROJECT_ROOT / "local_models" / "tokenizer" / "latest.pt",
         ]
         ckpt_path = next((path for path in log_candidates if path.exists()), Path(resolve_tokenizer_path(tokenizer_ckpt_name)))
 
@@ -616,16 +618,27 @@ def train(args):
 
     # ---- model ----
     action_dim = args.action_chunk_size * 2
-    if args.tokenizer_ckpt_name and is_rank0():
-        print("Ignoring --tokenizer_ckpt_name. This BC run uses raw image pixels only.")
-    args.tokenizer_ckpt_name = None
     args.policy_style = "direct_chunk_cnn"
     args.action_space = "swm_relative"
     args.image_normalization = "div255"
     if is_rank0() and (args.temporal_layers != 0 or args.temporal_heads != 0 or args.temporal_context != 0):
         print("Ignoring temporal transformer args. This BC run matches the other group's direct chunk policy contract.")
-    backbone = CNNBackbone(in_channels=args.C)
-    backbone_dim = backbone.feature_dim
+    tokenizer_path = args.tokenizer_ckpt_name
+    if tokenizer_path is None:
+        tokenizer_path = resolve_tokenizer_path(None)
+        if is_rank0():
+            print(f"Using tokenizer checkpoint: {tokenizer_path}")
+
+    if tokenizer_path:
+        args.tokenizer_ckpt_name = tokenizer_path
+        encoder = load_tokenizer_encoder(tokenizer_path)
+        backbone = TokenizerBackbone(encoder, patch=int(encoder.patch))
+        backbone_dim = backbone.feature_dim
+    else:
+        if is_rank0():
+            print("No tokenizer checkpoint found; falling back to raw image CNN backbone.")
+        backbone = CNNBackbone(in_channels=args.C)
+        backbone_dim = backbone.feature_dim
 
     classifier = ActionChunkPolicyHead(
         in_dim=backbone_dim,
@@ -872,7 +885,7 @@ if __name__ == "__main__":
         "--tokenizer_ckpt_name",
         type=str,
         default=None,
-        help="ignored for this setup; BC now trains on raw image pixels only",
+        help="optional tokenizer checkpoint; defaults to logs/tokenizer_ckpts/latest.pt if present",
     )
 
     # optim

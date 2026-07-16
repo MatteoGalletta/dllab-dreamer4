@@ -415,7 +415,7 @@ class TrainConfig:
     actor_hidden_dim: int = 512
     actor_dropout: float = 0.05
 
-    bc_prior_path: str = "logs/behavior_cloning_ckpts/latest.pt"
+    bc_prior_path: str = "local_models/behavior_cloning/latest.pt"
     prior_loss_coef: float = 0.05
     prior_loss_decay: float = 0.997
     tokenizer_path: str = "logs/tokenizer_ckpts/latest.pt"
@@ -424,7 +424,7 @@ class TrainConfig:
     seed: int = 42
     device: str = "auto"
     vector_env: str = "sync"
-    save_path: str = "logs/ppo_online_ckpts/latest.pth"
+    save_path: str = "local_models/ppo_online/latest.pth"
 
 
 def resolve_device(device_name: str) -> torch.device:

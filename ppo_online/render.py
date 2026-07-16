@@ -422,6 +422,7 @@ def render_agent_to_video():
         bc_payload = load_state_dict_safe(model_path, torch.device("cpu"))
         bc_args = extract_checkpoint_args(bc_payload)
         tokenizer_name = bc_args.get("tokenizer_ckpt_name")
+        policy_style = str(bc_args.get("policy_style", "sequence_classifier"))
         config.network_type = "bc_latent" if tokenizer_name else "bc_pixels"
         if tokenizer_name:
             config.tokenizer_path = resolve_tokenizer_path(str(tokenizer_name))
@@ -440,6 +441,7 @@ def render_agent_to_video():
         temporal_heads = int(bc_args.get("temporal_heads", 4))
         temporal_context = int(bc_args.get("temporal_context", 3))
     else:
+        policy_style = "sequence_classifier"
         config.tokenizer_path = resolve_tokenizer_path(config.tokenizer_path)
         temporal_layers = 2
         temporal_heads = 4
@@ -475,6 +477,7 @@ def render_agent_to_video():
             action_dim=action_dim,
             hidden_dim=config.actor_hidden_dim,
             dropout=config.actor_dropout,
+            policy_style=policy_style,
             temporal_layers=temporal_layers,
             temporal_heads=temporal_heads,
             temporal_context=temporal_context,
@@ -485,6 +488,7 @@ def render_agent_to_video():
             action_dim=action_dim,
             hidden_dim=config.actor_hidden_dim,
             dropout=config.actor_dropout,
+            policy_style=policy_style,
             temporal_layers=temporal_layers,
             temporal_heads=temporal_heads,
             max_seq_len=obs_shape[0] if len(obs_shape) >= 1 else 64,

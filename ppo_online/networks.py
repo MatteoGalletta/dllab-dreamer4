@@ -149,6 +149,30 @@ class BCActionClassifier(nn.Module):
         return actions.view(B, T, -1)
 
 
+class DirectChunkPolicyHead(nn.Module):
+    def __init__(self, *, in_dim: int, seq_len: int, hidden_dim: int, action_dim: int, dropout: float):
+        super().__init__()
+        self.seq_len = int(seq_len)
+        self.action_dim = int(action_dim)
+        self.net = nn.Sequential(
+            nn.Linear(int(in_dim) * self.seq_len, int(hidden_dim)),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), int(hidden_dim)),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), self.action_dim),
+        )
+
+    def forward(self, features_btD: torch.Tensor) -> torch.Tensor:
+        if features_btD.ndim != 3:
+            raise ValueError(f"Expected feature sequence with shape (B, T, D), got {tuple(features_btD.shape)}")
+        batch, steps, feature_dim = features_btD.shape
+        if steps != self.seq_len:
+            raise ValueError(f"Expected seq_len={self.seq_len}, got {steps}")
+        return torch.tanh(self.net(features_btD.reshape(batch, steps * feature_dim)))
+
+
 class PixelBackbone(nn.Module):
     def __init__(self, in_channels: int = 3, feature_dim: int = 256):
         super().__init__()
@@ -247,6 +271,7 @@ class BCPixelActorCritic(nn.Module):
         action_dim: int,
         hidden_dim: int = 512,
         dropout: float = 0.05,
+        policy_style: str = "sequence_classifier",
         temporal_layers: int = 2,
         temporal_heads: int = 4,
         temporal_context: int = 3,
@@ -255,17 +280,27 @@ class BCPixelActorCritic(nn.Module):
         self.image_shape = tuple(image_shape)
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
+        self.policy_style = str(policy_style)
         self.backbone = PixelBackbone(in_channels=3, feature_dim=256)
-        self.classifier = BCActionClassifier(
-            in_dim=self.backbone.feature_dim,
-            hidden_dim=hidden_dim,
-            action_dim=action_dim,
-            dropout=dropout,
-            temporal_layers=temporal_layers,
-            temporal_heads=temporal_heads,
-            max_seq_len=self.image_shape[0] if len(self.image_shape) >= 1 else 64,
-            temporal_context=temporal_context,
-        )
+        if self.policy_style == "direct_chunk_cnn":
+            self.classifier = DirectChunkPolicyHead(
+                in_dim=self.backbone.feature_dim,
+                seq_len=self.image_shape[0] if len(self.image_shape) >= 1 else 1,
+                hidden_dim=hidden_dim,
+                action_dim=action_dim,
+                dropout=dropout,
+            )
+        else:
+            self.classifier = BCActionClassifier(
+                in_dim=self.backbone.feature_dim,
+                hidden_dim=hidden_dim,
+                action_dim=action_dim,
+                dropout=dropout,
+                temporal_layers=temporal_layers,
+                temporal_heads=temporal_heads,
+                max_seq_len=self.image_shape[0] if len(self.image_shape) >= 1 else 64,
+                temporal_context=temporal_context,
+            )
         self.log_std = nn.Parameter(torch.full((1, action_dim), -1.0))
         self.critic = nn.Sequential(
             layer_init(nn.Linear(self.backbone.feature_dim, hidden_dim)),
@@ -294,8 +329,10 @@ class BCPixelActorCritic(nn.Module):
     def actor_mean(self, image_obs: torch.Tensor) -> torch.Tensor:
         sequence = self._ensure_sequence(image_obs)
         features = self.backbone(sequence)
-        action_sequence = self.classifier(features)
-        return action_sequence[:, -1, :]
+        action_output = self.classifier(features)
+        if action_output.ndim == 2:
+            return action_output
+        return action_output[:, -1, :]
 
     def action_dist(self, image_obs: torch.Tensor) -> Normal:
         mean = self.actor_mean(image_obs)
@@ -327,6 +364,7 @@ class BCStyleLatentActorCritic(nn.Module):
         action_dim: int,
         hidden_dim: int = 512,
         dropout: float = 0.05,
+        policy_style: str = "sequence_classifier",
         temporal_layers: int = 2,
         temporal_heads: int = 4,
         max_seq_len: int = 64,
@@ -336,16 +374,26 @@ class BCStyleLatentActorCritic(nn.Module):
         self.feature_dim = feature_dim
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
-        self.classifier = BCActionClassifier(
-            in_dim=feature_dim,
-            hidden_dim=hidden_dim,
-            action_dim=action_dim,
-            dropout=dropout,
-            temporal_layers=temporal_layers,
-            temporal_heads=temporal_heads,
-            max_seq_len=max_seq_len,
-            temporal_context=temporal_context,
-        )
+        self.policy_style = str(policy_style)
+        if self.policy_style == "direct_chunk_cnn":
+            self.classifier = DirectChunkPolicyHead(
+                in_dim=feature_dim,
+                seq_len=max_seq_len,
+                hidden_dim=hidden_dim,
+                action_dim=action_dim,
+                dropout=dropout,
+            )
+        else:
+            self.classifier = BCActionClassifier(
+                in_dim=feature_dim,
+                hidden_dim=hidden_dim,
+                action_dim=action_dim,
+                dropout=dropout,
+                temporal_layers=temporal_layers,
+                temporal_heads=temporal_heads,
+                max_seq_len=max_seq_len,
+                temporal_context=temporal_context,
+            )
         self.log_std = nn.Parameter(torch.full((1, action_dim), -1.0))
         self.critic = nn.Sequential(
             layer_init(nn.Linear(feature_dim, hidden_dim)),
@@ -368,8 +416,10 @@ class BCStyleLatentActorCritic(nn.Module):
 
     def actor_mean(self, state_vector: torch.Tensor) -> torch.Tensor:
         sequence = self._ensure_sequence(state_vector)
-        action_sequence = self.classifier(sequence)
-        return action_sequence[:, -1, :]
+        action_output = self.classifier(sequence)
+        if action_output.ndim == 2:
+            return action_output
+        return action_output[:, -1, :]
 
     def action_dist(self, state_vector: torch.Tensor) -> Normal:
         mean = self.actor_mean(state_vector)
