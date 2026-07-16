@@ -220,7 +220,7 @@ class ActionChunkPolicyHead(nn.Module):
         if T != self.seq_len:
             raise ValueError(f"Expected seq_len={self.seq_len}, got {T}")
         logits = self.net(features_btD.reshape(B, T * D))
-        return torch.tanh(logits)
+        return logits
 
 
 class Policy(nn.Module):
@@ -505,7 +505,7 @@ def evaluate_rollouts(
                     input_tensor = torch.as_tensor(stacked_frames[None], dtype=torch.uint8, device=device)
                     action_chunk_flat = base_model(input_tensor.permute(0, 1, 4, 2, 3).to(torch.float32) / 255.0)
                     action_chunk = action_chunk_flat.view(1, chunk_size, 2).squeeze(0).cpu().numpy()
-                    action_chunk = np.clip(action_chunk, -1.0, 1.0)
+                    #action_chunk = np.clip(action_chunk, -1.0, 1.0)
                     if temporal_ensemble:
                         pending_chunks.append({"chunk": action_chunk, "offset": 0})
                     else:
