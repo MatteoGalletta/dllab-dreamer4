@@ -264,8 +264,10 @@ class CachedFeatureDataset(Dataset):
     def __init__(self, base_dataset: Dataset, cached_features: torch.Tensor | Path | str):
         if isinstance(cached_features, (str, Path)):
             self.cached_features = np.load(str(cached_features), mmap_mode="r")
-        else:
+        elif isinstance(cached_features, torch.Tensor):
             self.cached_features = cached_features.contiguous()
+        else:
+            self.cached_features = cached_features
         if len(base_dataset) != int(self.cached_features.shape[0]):
             raise ValueError(
                 f"Cached feature length mismatch: dataset={len(base_dataset)} cache={int(self.cached_features.shape[0])}"
