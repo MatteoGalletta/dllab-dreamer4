@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import math
+import shutil
+import subprocess
 import tempfile
 from collections import deque
 from pathlib import Path
@@ -30,8 +32,8 @@ import stable_worldmodel as swm
 from behavioural_cloning.eval_bc_exact import (
     BCImagePolicy,
     clean_state_dict_keys,
-    resolve_model_config,
     save_video,
+    resolve_model_config,
 )
 from ppo_online.model_paths import resolve_bc_prior_path, resolve_tokenizer_path
 from ppo_online.render import extract_checkpoint_args, extract_checkpoint_state_dict, load_state_dict_safe
@@ -57,8 +59,20 @@ def _install_pusht_goal_pose_setter():
 
     def _set_goal_state_and_pose(self, goal_state):
         goal_state = _to_swm_state(goal_state)
+        current_state = None
+        if hasattr(self, "_get_obs"):
+            try:
+                current_state = np.asarray(self._get_obs(), dtype=np.float64).copy()
+            except Exception:
+                current_state = None
         self._set_goal_state(goal_state)
         self.goal_pose = goal_state[2:5].copy()
+        if hasattr(self, "_goal") and current_state is not None and hasattr(self, "_set_state"):
+            try:
+                self._set_state(goal_state)
+                self._goal = self.render()
+            finally:
+                self._set_state(current_state)
 
     PushT._set_goal_state_and_pose = _set_goal_state_and_pose
 
@@ -92,13 +106,22 @@ def combine_world_panel_videos(video_dir: str | Path, output_path: str | Path, f
         grid_h = rows * tile_h
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        writer = cv2.VideoWriter(
-            str(output_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            output_fps,
-            (grid_w, grid_h),
-        )
-        if not writer.isOpened():
+        temp_output_path = output_path.with_name(f"{output_path.stem}.raw{output_path.suffix}")
+        writer = None
+        opened_codec = None
+        for codec in ("mp4v", "avc1", "H264"):
+            candidate = cv2.VideoWriter(
+                str(temp_output_path),
+                cv2.VideoWriter_fourcc(*codec),
+                output_fps,
+                (grid_w, grid_h),
+            )
+            if candidate.isOpened():
+                writer = candidate
+                opened_codec = codec
+                break
+            candidate.release()
+        if writer is None:
             raise RuntimeError(f"Could not open video writer for {output_path}")
 
         last_frames = first_frames
@@ -128,8 +151,119 @@ def combine_world_panel_videos(video_dir: str | Path, output_path: str | Path, f
         if writer is not None:
             writer.release()
 
-    print(f"Saved combined swm.World video to: {output_path}")
+    finalized_codec = opened_codec
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is not None:
+        cmd = [
+            ffmpeg_path,
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(temp_output_path),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            finalized_codec = "libx264"
+            temp_output_path.unlink(missing_ok=True)
+        else:
+            temp_output_path.replace(output_path)
+    else:
+        temp_output_path.replace(output_path)
+
+    print(f"Saved combined swm.World video to: {output_path} using codec={finalized_codec}")
     return output_path
+
+
+def _overlay_goal_reference(frame: np.ndarray, goal_frame: np.ndarray) -> np.ndarray:
+    frame = np.asarray(frame, dtype=np.uint8)
+    goal_frame = np.asarray(goal_frame, dtype=np.uint8)
+    if frame.shape != goal_frame.shape:
+        return frame.copy()
+
+    # Isolate the bright green target from the goal frame and paint it on top
+    # of the live agent frame so goal orientation stays visible even when the
+    # current block nearly occludes the target underneath.
+    goal_rgb = goal_frame.astype(np.int16)
+    mask = (
+        (goal_rgb[..., 1] >= 150)
+        & (goal_rgb[..., 1] >= goal_rgb[..., 0] + 25)
+        & (goal_rgb[..., 1] >= goal_rgb[..., 2] + 25)
+    )
+    if not np.any(mask):
+        return frame.copy()
+
+    blended = frame.astype(np.float32).copy()
+    green_overlay = goal_frame.astype(np.float32)
+    blended[mask] = 0.35 * blended[mask] + 0.65 * green_overlay[mask]
+    return np.clip(blended, 0, 255).astype(np.uint8)
+
+
+def install_world_panel_video_patch():
+    from stable_worldmodel.plot.video_utils import save_video
+    import stable_worldmodel.world.world as swm_world_module
+    from PIL import Image, ImageDraw, ImageFont
+
+    def _patched_save_panel_videos(video_dir, panels, fps: int = 15) -> None:
+        video_dir = Path(video_dir)
+        video_dir.mkdir(parents=True, exist_ok=True)
+
+        labels = list(panels)
+        n_envs = len(panels[labels[0]])
+
+        sample = np.asarray(panels[labels[0]][0])
+        h, w = sample.shape[1:3] if sample.ndim == 4 else sample.shape[:2]
+        n = len(labels)
+        pad, gap, lh = max(12, w // 14), max(10, w // 16), max(22, w // 9)
+        cw = (2 * pad + n * w + (n - 1) * gap + 15) // 16 * 16
+        ch = (2 * pad + h + lh + 15) // 16 * 16
+        try:
+            font = ImageFont.truetype("DejaVuSans.ttf", max(12, w // 14))
+        except OSError:
+            font = ImageFont.load_default()
+        y_text = pad + h + max(8, lh // 4)
+
+        for i in range(n_envs):
+            env_panels = [np.asarray(panels[label][i]) for label in labels]
+            panel_by_label = {label: panel for label, panel in zip(labels, env_panels)}
+            goal_panel = panel_by_label.get("goal")
+            if goal_panel is not None and "agent" in panel_by_label:
+                goal_frame = goal_panel[0] if goal_panel.ndim == 4 else goal_panel
+                agent_panel = panel_by_label["agent"]
+                if agent_panel.ndim == 4:
+                    panel_by_label["agent"] = np.stack(
+                        [_overlay_goal_reference(frame, goal_frame) for frame in agent_panel],
+                        axis=0,
+                    )
+                else:
+                    panel_by_label["agent"] = _overlay_goal_reference(agent_panel, goal_frame)
+            env_panels = [panel_by_label[label] for label in labels]
+
+            T = max((len(p) for p in env_panels if p.ndim == 4), default=1)
+            composed = []
+            for t in range(T):
+                canvas = np.full((ch, cw, 3), 250, dtype=np.uint8)
+                for j, panel in enumerate(env_panels):
+                    frame = panel[min(t, len(panel) - 1)] if panel.ndim == 4 else panel
+                    x = pad + j * (w + gap)
+                    canvas[pad : pad + h, x : x + w] = frame
+                img = Image.fromarray(canvas)
+                draw = ImageDraw.Draw(img)
+                for j, label in enumerate(labels):
+                    bbox = draw.textbbox((0, 0), label, font=font)
+                    x = pad + j * (w + gap) + w // 2 - (bbox[2] - bbox[0]) // 2
+                    draw.text((x, y_text), label, fill=(130, 130, 130), font=font)
+                composed.append(np.array(img))
+            save_video(video_dir / f"env_{i}.mp4", composed, fps=fps)
+
+    swm_world_module.save_panel_videos = _patched_save_panel_videos
 
 
 class PushTH5WorldDataset:
@@ -354,6 +488,7 @@ def main():
             temporal_heads=model_cfg["temporal_heads"],
             temporal_context=model_cfg["temporal_context"],
             backbone_device=device,
+            action_output_tanh=model_cfg["action_output_tanh"],
         ).to(device)
         policy.load_state_dict(cleaned_state, strict=True)
         policy.eval()
@@ -377,6 +512,7 @@ def main():
         args.seed,
     )
     _install_pusht_goal_pose_setter()
+    install_world_panel_video_patch()
 
     print(
         f"Using swm.World.evaluate(dataset=...) for policy_source={args.policy_source}: "

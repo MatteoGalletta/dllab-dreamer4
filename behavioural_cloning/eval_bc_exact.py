@@ -6,6 +6,8 @@ import argparse
 import math
 from collections import deque
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 
 import cv2
@@ -370,15 +372,50 @@ def save_video(frames: list[np.ndarray], video_path: str, fps: int = 15):
     output = Path(video_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     height, width = frames[0].shape[:2]
-    writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (width, height))
-    if not writer.isOpened():
+    temp_output = output.with_name(f"{output.stem}.raw{output.suffix}")
+    writer = None
+    opened_codec = None
+    for codec in ("mp4v", "avc1", "H264"):
+        candidate = cv2.VideoWriter(str(temp_output), cv2.VideoWriter_fourcc(*codec), float(fps), (width, height))
+        if candidate.isOpened():
+            writer = candidate
+            opened_codec = codec
+            break
+        candidate.release()
+    if writer is None:
         raise RuntimeError(f"Could not open video writer for {output}")
     try:
         for frame in frames:
             writer.write(np.asarray(frame, dtype=np.uint8)[..., ::-1])
     finally:
         writer.release()
-    print(f"Saved evaluation video to {output}")
+    finalized_codec = opened_codec
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is not None:
+        cmd = [
+            ffmpeg_path,
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(temp_output),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            finalized_codec = "libx264"
+            temp_output.unlink(missing_ok=True)
+        else:
+            temp_output.replace(output)
+    else:
+        temp_output.replace(output)
+    print(f"Saved evaluation video to {output} using codec={finalized_codec}")
 
 
 def main():
