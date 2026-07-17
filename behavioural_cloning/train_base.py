@@ -710,6 +710,15 @@ def train(args):
         if is_rank0():
             print(f"Using tokenizer checkpoint: {tokenizer_path}")
 
+    if is_rank0():
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            entity=args.wandb_entity,
+            mode=get_wandb_mode(args),
+            config=vars(args),
+        )
+
     # ---- model / features ----
     action_dim = args.action_chunk_size * 2
     args.policy_style = "direct_chunk_cnn"
@@ -826,16 +835,6 @@ def train(args):
     opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
     use_amp = device_type in {"cuda", "xpu"}
     scaler = GradScaler(device=device_type, enabled=use_amp)
-
-    # ---- wandb ----
-    if is_rank0():
-        wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name,
-            entity=args.wandb_entity,
-            mode=get_wandb_mode(args),
-            config=vars(args),
-        )
 
     # ---- resume ----
     step = 0
