@@ -282,7 +282,7 @@ class CachedFeatureDataset(Dataset):
         features = self.cached_features[idx]
         return {
             **item,
-            "features": torch.as_tensor(np.asarray(features), dtype=torch.float32),
+            "features": torch.tensor(np.array(features, copy=True), dtype=torch.float32),
         }
 
 
@@ -868,15 +868,14 @@ def train(args):
                 else:
                     x = normalize_image_batch(batch["image"].to(device, non_blocking=True))  # (B,T,C,H,W)
 
-                with autocast(device_type=device_type, enabled=use_amp):
-                    pred = model(x)
-
                 target_actions = batch["action"].to(device, non_blocking=True).to(torch.float32)
                 if target_actions.ndim != 2 or target_actions.shape[-1] != action_dim:
                     raise RuntimeError(f"Expected actions shape (B,{action_dim}), got {tuple(target_actions.shape)}")
 
-                loss = F.mse_loss(pred, target_actions)
-                mae = torch.mean(torch.abs(pred - target_actions))
+                with autocast(device_type=device_type, enabled=use_amp):
+                    pred = model(x)
+                    loss = F.mse_loss(pred, target_actions)
+                    mae = torch.mean(torch.abs(pred - target_actions))
 
                 if not torch.isfinite(loss):
                     raise RuntimeError(f"Non-finite loss at step {step}: loss={loss}")
