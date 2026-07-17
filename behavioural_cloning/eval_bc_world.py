@@ -39,6 +39,10 @@ from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
 from ppo_online.train import resolve_device
 
 
+PUSHT_DATASET_DELTA_SCALE = 100.0
+SWM_PUSHT_RELATIVE_ACTION_SCALE = 100.0
+
+
 def _to_swm_state(state: np.ndarray) -> np.ndarray:
     state = np.asarray(state, dtype=np.float64)
     if state.shape[0] >= 7:
@@ -205,12 +209,14 @@ class BCWorldPolicy:
         frame_stride: int,
         action_chunk_size: int,
         device: torch.device,
+        action_rescale_ratio: float,
     ):
         self.policy = policy
         self.seq_len = int(seq_len)
         self.frame_stride = max(1, int(frame_stride))
         self.action_chunk_size = int(action_chunk_size)
         self.device = device
+        self.action_rescale_ratio = float(action_rescale_ratio)
         self.env = None
         self.frame_histories = None
         self.action_buffers = None
@@ -249,40 +255,37 @@ class BCWorldPolicy:
                 input_tensor = torch.as_tensor(stacked_frames[None], dtype=torch.uint8, device=self.device)
                 with torch.no_grad():
                     action_chunk = self.policy.predict_action_chunk(input_tensor).squeeze(0).cpu().numpy()
-                action_chunk = np.clip(action_chunk, -1.0, 1.0)
+                action_chunk = action_chunk * self.action_rescale_ratio
                 self.action_buffers[env_index].extend(action_chunk)
             actions.append(self.action_buffers[env_index].popleft())
         return np.asarray(actions, dtype=np.float32)
 
 
 class DatasetOracleWorldPolicy:
-    def __init__(self):
+    def __init__(self, action_sequences: list[np.ndarray], action_rescale_ratio: float):
         self.env = None
+        self.action_sequences = [np.asarray(sequence, dtype=np.float32) for sequence in action_sequences]
         self.action_buffers = None
+        self.action_rescale_ratio = float(action_rescale_ratio)
 
     def set_env(self, env):
         self.env = env
-        self.action_buffers = [deque() for _ in range(env.num_envs)]
+        self.action_buffers = []
+        for sequence in self.action_sequences[: env.num_envs]:
+            scaled_sequence = np.asarray(sequence, dtype=np.float32) * self.action_rescale_ratio
+            self.action_buffers.append(deque(np.asarray(action, dtype=np.float32) for action in scaled_sequence))
+        while len(self.action_buffers) < env.num_envs:
+            self.action_buffers.append(deque())
 
     def get_action(self, info_dict, **kwargs):
-        del kwargs
+        del info_dict, kwargs
         if self.env is None:
             raise RuntimeError("DatasetOracleWorldPolicy.set_env must be called before get_action")
-
-        needs_flush = info_dict.get("_needs_flush")
-        if needs_flush is not None:
-            needs_flush = np.asarray(needs_flush).reshape(-1)
-            for env_index, should_flush in enumerate(needs_flush):
-                if should_flush:
-                    self.action_buffers[env_index].clear()
-
-        dataset_actions = np.asarray(info_dict["action"], dtype=np.float32)
         actions = []
         for env_index in range(self.env.num_envs):
             if not self.action_buffers[env_index]:
-                self.action_buffers[env_index].extend(np.asarray(dataset_actions[env_index], dtype=np.float32))
-            if not self.action_buffers[env_index]:
-                raise RuntimeError("Dataset oracle received an empty action sequence from world info_dict.")
+                actions.append(np.zeros(2, dtype=np.float32))
+                continue
             actions.append(np.asarray(self.action_buffers[env_index].popleft(), dtype=np.float32))
         return np.asarray(actions, dtype=np.float32)
 
@@ -297,6 +300,18 @@ def parse_args():
     parser.add_argument("--eval-budget", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--video-path", type=str, default=None)
+    parser.add_argument(
+        "--dataset-action-scale",
+        type=float,
+        default=PUSHT_DATASET_DELTA_SCALE,
+        help="Pixels-per-unit implied by dataset relative actions.",
+    )
+    parser.add_argument(
+        "--world-action-scale",
+        type=float,
+        default=SWM_PUSHT_RELATIVE_ACTION_SCALE,
+        help="Pixels-per-unit used internally by the swm/PushT-v1 relative action space.",
+    )
     parser.add_argument(
         "--policy-source",
         choices=("bc", "dataset_oracle"),
@@ -333,6 +348,7 @@ def main():
             action_chunk_size=model_cfg["action_chunk_size"],
             seq_len=model_cfg["seq_len"],
             tokenizer_ckpt=tokenizer_path,
+            tokenizer_feature_dim=model_cfg["tokenizer_feature_dim"],
             policy_style=model_cfg["policy_style"],
             temporal_layers=model_cfg["temporal_layers"],
             temporal_heads=model_cfg["temporal_heads"],
@@ -371,6 +387,11 @@ def main():
     print(f"tokenizer={tokenizer_path}")
     print(f"sampled episode indices={episode_indices}")
     print(f"sampled start steps={start_steps}")
+    action_rescale_ratio = float(args.dataset_action_scale) / float(args.world_action_scale)
+    print(
+        f"relative action rescale ratio={action_rescale_ratio:.4f} "
+        f"(dataset_scale={float(args.dataset_action_scale):.3f} / world_scale={float(args.world_action_scale):.3f})"
+    )
 
     combine_world_video = args.video_path is not None and Path(args.video_path).suffix.lower() == ".mp4"
     with tempfile.TemporaryDirectory(prefix="pusht-world-video-") as tmp_video_dir:
@@ -391,9 +412,19 @@ def main():
                 frame_stride=model_cfg["frame_stride"],
                 action_chunk_size=model_cfg["action_chunk_size"],
                 device=device,
+                action_rescale_ratio=action_rescale_ratio,
             )
         else:
-            world_policy = DatasetOracleWorldPolicy()
+            oracle_chunks = world_dataset.load_chunk(
+                episode_indices,
+                start_steps,
+                [start_step + args.goal_offset_steps for start_step in start_steps],
+            )
+            oracle_action_sequences = [np.asarray(chunk["action"], dtype=np.float32) for chunk in oracle_chunks]
+            world_policy = DatasetOracleWorldPolicy(
+                action_sequences=oracle_action_sequences,
+                action_rescale_ratio=action_rescale_ratio,
+            )
         world.set_policy(world_policy)
         try:
             metrics = world.evaluate(

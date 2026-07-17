@@ -75,12 +75,14 @@ class BCActionClassifier(nn.Module):
         temporal_heads: int = 4,
         max_seq_len: int = 64,
         temporal_context: int = 3,
+        output_tanh: bool = True,
     ):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.action_dim = int(action_dim)
         self.max_seq_len = int(max_seq_len)
         self.temporal_context = max(1, int(temporal_context))
+        self.output_tanh = bool(output_tanh)
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
@@ -145,15 +147,16 @@ class BCActionClassifier(nn.Module):
             temporal_logits = self.temporal_out(self.temporal_norm(temporal_features))
         temporal_logits = temporal_logits.to(base_logits.dtype)
         logits = base_logits + temporal_logits
-        actions = torch.tanh(logits)
+        actions = torch.tanh(logits) if self.output_tanh else logits
         return actions.view(B, T, -1)
 
 
 class DirectChunkPolicyHead(nn.Module):
-    def __init__(self, *, in_dim: int, seq_len: int, hidden_dim: int, action_dim: int, dropout: float):
+    def __init__(self, *, in_dim: int, seq_len: int, hidden_dim: int, action_dim: int, dropout: float, output_tanh: bool = True):
         super().__init__()
         self.seq_len = int(seq_len)
         self.action_dim = int(action_dim)
+        self.output_tanh = bool(output_tanh)
         self.net = nn.Sequential(
             nn.Linear(int(in_dim) * self.seq_len, int(hidden_dim)),
             nn.ReLU(),
@@ -170,7 +173,8 @@ class DirectChunkPolicyHead(nn.Module):
         batch, steps, feature_dim = features_btD.shape
         if steps != self.seq_len:
             raise ValueError(f"Expected seq_len={self.seq_len}, got {steps}")
-        return torch.tanh(self.net(features_btD.reshape(batch, steps * feature_dim)))
+        logits = self.net(features_btD.reshape(batch, steps * feature_dim))
+        return torch.tanh(logits) if self.output_tanh else logits
 
 
 class PixelBackbone(nn.Module):

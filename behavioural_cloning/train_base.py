@@ -46,6 +46,9 @@ dreamer4_model = load_dreamer4_model_module()
 Dreamer4Encoder = dreamer4_model.Encoder
 temporal_patchify = dreamer4_model.temporal_patchify
 
+
+PUSHT_DATASET_DELTA_SCALE = 39.3
+
 if importlib.util.find_spec("wandb") is not None:
     wandb = importlib.import_module("wandb")
 else:
@@ -211,10 +214,12 @@ class ActionChunkPolicyHead(nn.Module):
         hidden_dim: int,
         action_dim: int,
         dropout: float,
+        output_tanh: bool,
     ):
         super().__init__()
         self.seq_len = int(seq_len)
         self.action_dim = int(action_dim)
+        self.output_tanh = bool(output_tanh)
         self.net = nn.Sequential(
             nn.Linear(int(in_dim) * self.seq_len, hidden_dim),
             nn.ReLU(),
@@ -232,7 +237,7 @@ class ActionChunkPolicyHead(nn.Module):
         if T != self.seq_len:
             raise ValueError(f"Expected seq_len={self.seq_len}, got {T}")
         logits = self.net(features_btD.reshape(B, T * D))
-        return torch.tanh(logits)
+        return torch.tanh(logits) if self.output_tanh else logits
 
 
 class Policy(nn.Module):
@@ -379,6 +384,15 @@ def split_indices(num_items: int, val_frac: float, seed: int) -> tuple[list[int]
     val_indices = perm[:val_size]
     train_indices = perm[val_size:]
     return train_indices, val_indices
+
+
+def maybe_truncate_indices(indices: list[int], limit: int, *, seed: int) -> list[int]:
+    if limit <= 0 or len(indices) <= limit:
+        return indices
+    rng = np.random.default_rng(int(seed))
+    chosen = rng.choice(len(indices), size=int(limit), replace=False)
+    chosen.sort()
+    return [indices[int(i)] for i in chosen]
 
 
 def tokenizer_feature_cache_path(args: argparse.Namespace, tokenizer_path: str) -> Path:
@@ -580,6 +594,8 @@ def evaluate_rollouts(
     temporal_ensemble_decay: float,
     video_fps: int,
 ) -> dict[str, object]:
+    from ppo_online.train import PushTDenseRewardWrapper
+
     base_model = get_base_model(model)
     was_training = base_model.training
     base_model.eval()
@@ -594,6 +610,7 @@ def evaluate_rollouts(
         align_sampled_goal_to_fixed_target=True,
         render_obs=False,
     )
+    env = PushTDenseRewardWrapper(env, env_id=DEFAULT_PUSHT_ENV_ID)
 
     returns: list[float] = []
     lengths: list[int] = []
@@ -705,6 +722,8 @@ def train(args):
         frame_stride=args.frame_stride,
     )
     train_indices, val_indices = split_indices(len(full_dataset), args.val_frac, args.seed)
+    train_indices = maybe_truncate_indices(train_indices, int(args.max_train_samples), seed=args.seed)
+    val_indices = maybe_truncate_indices(val_indices, int(args.max_val_samples), seed=args.seed + 1)
 
     tokenizer_path = args.tokenizer_ckpt_name
     if tokenizer_path is None:
@@ -713,6 +732,10 @@ def train(args):
             print(f"Using tokenizer checkpoint: {tokenizer_path}")
 
     if is_rank0():
+        print(
+            f"Dataset windows: total={len(full_dataset)} "
+            f"train={len(train_indices)} val={len(val_indices)}"
+        )
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
@@ -816,6 +839,7 @@ def train(args):
         hidden_dim=args.hidden_dim,
         action_dim=action_dim,
         dropout=args.dropout,
+        output_tanh=args.action_output_tanh,
     )
     model = Policy(backbone=backbone, classifier=classifier).to(device)
 
@@ -1040,6 +1064,12 @@ if __name__ == "__main__":
     # model
     p.add_argument("--hidden_dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument(
+        "--action_output_tanh",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether to squash BC action predictions with tanh. Disable for raw relative-action regression.",
+    )
     p.add_argument("--temporal_layers", type=int, default=0)
     p.add_argument("--temporal_heads", type=int, default=0)
     p.add_argument("--temporal_context", type=int, default=0)
@@ -1077,6 +1107,8 @@ if __name__ == "__main__":
     p.add_argument("--viz_max_items", type=int, default=4)
     p.add_argument("--viz_max_T", type=int, default=8)
     p.add_argument("--val_frac", type=float, default=0.1)
+    p.add_argument("--max_train_samples", type=int, default=0, help="0 uses all training windows; useful for fast debug retrains.")
+    p.add_argument("--max_val_samples", type=int, default=0, help="0 uses all validation windows; useful for fast debug retrains.")
     p.add_argument("--val_max_batches", type=int, default=0, help="0 evaluates the full validation loader")
     p.add_argument("--eval_every", type=int, default=2000)
     p.add_argument("--rollout_eval_every", type=int, default=0, help="0 disables rollout eval during training")

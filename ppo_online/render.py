@@ -6,6 +6,15 @@ import argparse
 import math
 import os
 from collections import deque
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import gymnasium as gym
 import numpy as np
@@ -140,11 +149,12 @@ class ChunkExecutionWrapper(gym.Wrapper):
     PPO's ACT-style temporal ensembling.
     """
 
-    def __init__(self, env: gym.Env, chunk_size: int, mode: str, max_step_pixels: float):
+    def __init__(self, env: gym.Env, chunk_size: int, mode: str, max_step_pixels: float, clip_actions: bool = True):
         super().__init__(env)
         self.chunk_size = chunk_size
         self.mode = mode
         self.max_step_pixels = max_step_pixels
+        self.clip_actions = bool(clip_actions)
         low = np.full((chunk_size * 2,), -1.0, dtype=np.float32)
         high = np.full((chunk_size * 2,), 1.0, dtype=np.float32)
         self.action_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
@@ -167,7 +177,9 @@ class ChunkExecutionWrapper(gym.Wrapper):
 
     def step(self, macro_action):
         macro_action = np.asarray(macro_action, dtype=np.float32)
-        primitives = np.clip(macro_action, -1.0, 1.0).reshape(self.chunk_size, 2)
+        if self.clip_actions:
+            macro_action = np.clip(macro_action, -1.0, 1.0)
+        primitives = macro_action.reshape(self.chunk_size, 2)
 
         if self.mode.startswith("first_"):
             primitives = primitives[:1]
@@ -195,12 +207,13 @@ class ChunkExecutionWrapper(gym.Wrapper):
 
 
 class TemporalEnsembleChunkExecutionWrapper(gym.Wrapper):
-    def __init__(self, env: gym.Env, chunk_size: int, mode: str, max_step_pixels: float, ensemble_decay: float):
+    def __init__(self, env: gym.Env, chunk_size: int, mode: str, max_step_pixels: float, ensemble_decay: float, clip_actions: bool = True):
         super().__init__(env)
         self.chunk_size = chunk_size
         self.mode = mode
         self.max_step_pixels = max_step_pixels
         self.ensemble_decay = ensemble_decay
+        self.clip_actions = bool(clip_actions)
         low = np.full((chunk_size * 2,), -1.0, dtype=np.float32)
         high = np.full((chunk_size * 2,), 1.0, dtype=np.float32)
         self.action_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
@@ -242,7 +255,9 @@ class TemporalEnsembleChunkExecutionWrapper(gym.Wrapper):
 
     def step(self, macro_action):
         macro_action = np.asarray(macro_action, dtype=np.float32)
-        primitives = np.clip(macro_action, -1.0, 1.0).reshape(self.chunk_size, 2)
+        if self.clip_actions:
+            macro_action = np.clip(macro_action, -1.0, 1.0)
+        primitives = macro_action.reshape(self.chunk_size, 2)
         self.pending_chunks.append({"chunk": primitives, "offset": 0})
 
         primitive = self._ensemble_primitive()
@@ -263,7 +278,19 @@ class TemporalEnsembleChunkExecutionWrapper(gym.Wrapper):
         return obs, float(reward), terminated, truncated, info
 
 
-def make_render_env(config: TrainConfig, video_folder: str, action_mode: str, record_video: bool = True):
+class BCPriorRenderAdapter(torch.nn.Module):
+    def __init__(self, policy: torch.nn.Module):
+        super().__init__()
+        self.policy = policy
+
+    def actor_mean(self, image_obs: torch.Tensor) -> torch.Tensor:
+        actions = self.policy(image_obs)
+        if actions.ndim == 3:
+            actions = actions[:, -1, :]
+        return actions
+
+
+def make_render_env(config: TrainConfig, video_folder: str, action_mode: str, record_video: bool = True, clip_actions: bool = True):
     tokenizer_info = None
     if config.network_type == "bc_latent":
         _, tokenizer_info = load_tokenizer_from_ckpt(config.tokenizer_path, torch.device("cpu"))
@@ -305,6 +332,7 @@ def make_render_env(config: TrainConfig, video_folder: str, action_mode: str, re
             mode=action_mode,
             max_step_pixels=config.max_step_pixels,
             ensemble_decay=config.ensemble_decay,
+            clip_actions=clip_actions,
         )
     else:
         env = ChunkExecutionWrapper(
@@ -312,6 +340,7 @@ def make_render_env(config: TrainConfig, video_folder: str, action_mode: str, re
             chunk_size=config.chunk_size,
             mode=action_mode,
             max_step_pixels=config.max_step_pixels,
+            clip_actions=clip_actions,
         )
     if config.network_type == "bc_pixels":
         env = RenderedImageObsWrapper(env, target_height=image_height, target_width=image_width)
@@ -419,11 +448,19 @@ def render_agent_to_video():
         model_path = resolve_ppo_checkpoint_path(model_path)
 
     if args.source == "bc_prior":
+        from behavioural_cloning.eval_bc_exact import BCImagePolicy, clean_state_dict_keys, resolve_model_config
+
         bc_payload = load_state_dict_safe(model_path, torch.device("cpu"))
         bc_args = extract_checkpoint_args(bc_payload)
+        bc_state_dict = extract_checkpoint_state_dict(bc_payload)
+        if bc_state_dict is None:
+            raise ValueError(f"Unsupported BC prior format in {model_path}")
+        cleaned_bc_state = clean_state_dict_keys(bc_state_dict)
+        bc_model_cfg = resolve_model_config(bc_args, cleaned_bc_state)
         tokenizer_name = bc_args.get("tokenizer_ckpt_name")
-        policy_style = str(bc_args.get("policy_style", "sequence_classifier"))
-        config.network_type = "bc_latent" if tokenizer_name else "bc_pixels"
+        policy_style = str(bc_model_cfg.get("policy_style", "sequence_classifier"))
+        clip_bc_prior_actions = bool(bc_model_cfg.get("action_output_tanh", True))
+        config.network_type = "bc_pixels"
         if tokenizer_name:
             config.tokenizer_path = resolve_tokenizer_path(str(tokenizer_name))
         config.image_height = int(bc_args.get("H", 224))
@@ -442,6 +479,7 @@ def render_agent_to_video():
         temporal_context = int(bc_args.get("temporal_context", 3))
     else:
         policy_style = "sequence_classifier"
+        clip_bc_prior_actions = True
         config.tokenizer_path = resolve_tokenizer_path(config.tokenizer_path)
         temporal_layers = 2
         temporal_heads = 4
@@ -465,13 +503,39 @@ def render_agent_to_video():
         f"frame_stride={getattr(config, 'frame_stride', 1)} chunk_size={config.chunk_size}"
     )
 
-    env = make_render_env(config, video_folder, action_mode=action_mode, record_video=record_video)
+    env = make_render_env(
+        config,
+        video_folder,
+        action_mode=action_mode,
+        record_video=record_video,
+        clip_actions=(clip_bc_prior_actions if args.source == "bc_prior" else True),
+    )
 
     obs_shape = tuple(env.observation_space.shape)
     state_dim = int(obs_shape[-1]) if config.network_type == "bc_latent" else int(np.prod(obs_shape))
     action_dim = int(env.action_space.shape[0])
 
-    if config.network_type == "bc_pixels":
+    if args.source == "bc_prior":
+        network = BCPriorRenderAdapter(
+            BCImagePolicy(
+                image_shape=obs_shape[1:] + (obs_shape[-1],) if False else (config.image_height, config.image_width, 3),
+                hidden_dim=bc_model_cfg["hidden_dim"],
+                dropout=bc_model_cfg["dropout"],
+                action_chunk_size=bc_model_cfg["action_chunk_size"],
+                seq_len=bc_model_cfg["seq_len"],
+                tokenizer_ckpt=config.tokenizer_path,
+                tokenizer_feature_dim=bc_model_cfg["tokenizer_feature_dim"],
+                policy_style=bc_model_cfg["policy_style"],
+                temporal_layers=bc_model_cfg["temporal_layers"],
+                temporal_heads=bc_model_cfg["temporal_heads"],
+                temporal_context=bc_model_cfg["temporal_context"],
+                backbone_device=device,
+                action_output_tanh=bc_model_cfg["action_output_tanh"],
+            )
+        ).to(device)
+        network.policy.load_state_dict(cleaned_bc_state, strict=True)
+        print(f"Loaded BC prior from {model_path}.")
+    elif config.network_type == "bc_pixels":
         network = BCPixelActorCritic(
             image_shape=obs_shape,
             action_dim=action_dim,
@@ -501,9 +565,7 @@ def render_agent_to_video():
             actor_output_tanh=config.actor_output_tanh,
         ).to(device)
 
-    if args.source == "bc_prior":
-        load_bc_prior_into_network(network, model_path, device, config.network_type)
-    else:
+    if args.source != "bc_prior":
         state_dict = load_state_dict_safe(model_path, device)
         network.load_state_dict(state_dict)
         print(f"Loaded PPO checkpoint from {model_path}.")
@@ -521,7 +583,9 @@ def render_agent_to_video():
         with torch.no_grad():
             action_mean = network.actor_mean(state_tensor)
 
-        env_action = np.clip(action_mean.squeeze(0).cpu().numpy(), -1.0, 1.0)
+        env_action = action_mean.squeeze(0).cpu().numpy()
+        if args.source != "bc_prior" or clip_bc_prior_actions:
+            env_action = np.clip(env_action, -1.0, 1.0)
         state, reward, terminated, truncated, info = env.step(env_action)
         final_info = info
         total_reward += float(reward)

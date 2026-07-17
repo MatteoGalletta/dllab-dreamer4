@@ -13,6 +13,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
+import importlib.util
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -23,10 +24,28 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from ppo_online.env_config import DEFAULT_PUSHT_ENV_ID, make_pusht_env
 from ppo_online.model_paths import resolve_bc_prior_path, resolve_tokenizer_path
-from ppo_online.networks import BCActionClassifier, TokenizerBackbone
+from ppo_online.networks import BCActionClassifier
 from ppo_online.render import extract_checkpoint_args, extract_checkpoint_state_dict, load_state_dict_safe
 from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
-from ppo_online.train import extract_state_array, resolve_device
+from ppo_online.train import PushTDenseRewardWrapper, extract_state_array, resolve_device
+
+DREAMER4_MODEL_PATH = PROJECT_ROOT / "dreamer4-src" / "dreamer4" / "model.py"
+
+
+def load_dreamer4_model_module():
+    spec = importlib.util.spec_from_file_location("dreamer4_model_eval_bc", DREAMER4_MODEL_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load Dreamer4 model module from {DREAMER4_MODEL_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+dreamer4_model = load_dreamer4_model_module()
+temporal_patchify = dreamer4_model.temporal_patchify
+
+
+PUSHT_DATASET_DELTA_SCALE = 39.3
 
 
 class CNNBackbone(nn.Module):
@@ -66,11 +85,39 @@ class CNNBackbone(nn.Module):
         return features.view(batch, steps, -1)
 
 
+class TokenizerBackbone(nn.Module):
+    def __init__(self, encoder: nn.Module, patch: int, *, output_dim: int | None):
+        super().__init__()
+        self.encoder = encoder
+        self.patch = int(patch)
+        self.raw_feature_dim = int(self.encoder.n_latents) * int(self.encoder.bottleneck_proj.out_features)
+        if output_dim is None or int(output_dim) == self.raw_feature_dim:
+            self.feature_dim = self.raw_feature_dim
+            self.projector = nn.Identity()
+        else:
+            self.feature_dim = int(output_dim)
+            self.projector = nn.Sequential(
+                nn.LayerNorm(self.raw_feature_dim),
+                nn.Linear(self.raw_feature_dim, self.feature_dim),
+                nn.ReLU(),
+            )
+
+    def extract_features(self, x_btchw: torch.Tensor) -> torch.Tensor:
+        patches = temporal_patchify(x_btchw, self.patch)
+        with torch.no_grad():
+            z, _ = self.encoder(patches)
+        return z.reshape(z.shape[0], z.shape[1], -1)
+
+    def forward(self, x_btchw: torch.Tensor) -> torch.Tensor:
+        return self.projector(self.extract_features(x_btchw))
+
+
 class DirectChunkPolicyHead(nn.Module):
-    def __init__(self, *, in_dim: int, seq_len: int, hidden_dim: int, action_dim: int, dropout: float):
+    def __init__(self, *, in_dim: int, seq_len: int, hidden_dim: int, action_dim: int, dropout: float, output_tanh: bool):
         super().__init__()
         self.seq_len = int(seq_len)
         self.action_dim = int(action_dim)
+        self.output_tanh = bool(output_tanh)
         self.net = nn.Sequential(
             nn.Linear(int(in_dim) * self.seq_len, int(hidden_dim)),
             nn.ReLU(),
@@ -87,7 +134,8 @@ class DirectChunkPolicyHead(nn.Module):
         batch, steps, feature_dim = features_btD.shape
         if steps != self.seq_len:
             raise ValueError(f"Expected seq_len={self.seq_len}, got {steps}")
-        return torch.tanh(self.net(features_btD.reshape(batch, steps * feature_dim)))
+        logits = self.net(features_btD.reshape(batch, steps * feature_dim))
+        return torch.tanh(logits) if self.output_tanh else logits
 
 
 class BCImagePolicy(nn.Module):
@@ -100,16 +148,27 @@ class BCImagePolicy(nn.Module):
         action_chunk_size: int,
         seq_len: int,
         tokenizer_ckpt: str | None,
+        tokenizer_feature_dim: int,
         policy_style: str,
         temporal_layers: int,
         temporal_heads: int,
         temporal_context: int,
         backbone_device: torch.device | str,
+        action_output_tanh: bool,
     ):
         super().__init__()
         action_dim = int(action_chunk_size) * 2
         if tokenizer_ckpt is not None:
-            self.backbone = TokenizerBackbone(tokenizer_ckpt=tokenizer_ckpt, device=backbone_device)
+            tokenizer, info = load_tokenizer_from_ckpt(tokenizer_ckpt, torch.device(backbone_device))
+            encoder = tokenizer.encoder
+            encoder.requires_grad_(False)
+            encoder.eval()
+            encoder.patch = int(info["patch"])
+            self.backbone = TokenizerBackbone(
+                encoder,
+                patch=int(encoder.patch),
+                output_dim=None if tokenizer_feature_dim is None else int(tokenizer_feature_dim),
+            )
         else:
             self.backbone = CNNBackbone(in_channels=int(image_shape[2]))
         self.policy_style = str(policy_style)
@@ -120,6 +179,7 @@ class BCImagePolicy(nn.Module):
                 hidden_dim=int(hidden_dim),
                 action_dim=action_dim,
                 dropout=float(dropout),
+                output_tanh=bool(action_output_tanh),
             )
         else:
             self.classifier = BCActionClassifier(
@@ -131,6 +191,7 @@ class BCImagePolicy(nn.Module):
                 temporal_heads=int(temporal_heads),
                 max_seq_len=int(seq_len),
                 temporal_context=int(temporal_context),
+                output_tanh=bool(action_output_tanh),
             )
         self.action_chunk_size = int(action_chunk_size)
 
@@ -146,6 +207,13 @@ class BCImagePolicy(nn.Module):
     def forward(self, image_obs: torch.Tensor) -> torch.Tensor:
         sequence = self._ensure_sequence(image_obs)
         if isinstance(self.backbone, CNNBackbone):
+            if sequence.dtype == torch.uint8:
+                sequence = sequence.to(torch.float32) / 255.0
+            else:
+                sequence = sequence.to(torch.float32)
+                if sequence.numel() > 0 and float(sequence.max().detach().cpu()) > 1.5:
+                    sequence = sequence / 255.0
+        elif isinstance(self.backbone, TokenizerBackbone):
             if sequence.dtype == torch.uint8:
                 sequence = sequence.to(torch.float32) / 255.0
             else:
@@ -215,6 +283,13 @@ def resolve_model_config(ckpt_args: dict, cleaned_state: dict[str, torch.Tensor]
     frame_stride = int(ckpt_args.get("frame_stride", 1))
     action_chunk_size = int(ckpt_args.get("action_chunk_size", 5))
     hidden_dim = int(ckpt_args.get("hidden_dim", 512))
+    has_tokenizer_projector = any(key.startswith("backbone.projector.") for key in cleaned_state)
+    tokenizer_feature_dim_arg = ckpt_args.get("tokenizer_feature_dim")
+    tokenizer_feature_dim = None if tokenizer_feature_dim_arg is None else int(tokenizer_feature_dim_arg)
+    if tokenizer_name is not None and not has_tokenizer_projector:
+        tokenizer_feature_dim = None
+    elif tokenizer_name is not None and tokenizer_feature_dim is None:
+        tokenizer_feature_dim = 256
     dropout = float(ckpt_args.get("dropout", 0.05))
     has_temporal = any(key.startswith("classifier.temporal_") for key in cleaned_state)
     policy_style = ckpt_args.get("policy_style")
@@ -223,17 +298,21 @@ def resolve_model_config(ckpt_args: dict, cleaned_state: dict[str, torch.Tensor]
     temporal_layers = int(ckpt_args.get("temporal_layers", 2 if has_temporal else 0))
     temporal_heads = int(ckpt_args.get("temporal_heads", 4))
     temporal_context = int(ckpt_args.get("temporal_context", 3))
+    action_output_tanh = bool(ckpt_args.get("action_output_tanh", True))
     return {
         "tokenizer_name": tokenizer_name,
         "seq_len": seq_len,
         "frame_stride": frame_stride,
         "action_chunk_size": action_chunk_size,
         "hidden_dim": hidden_dim,
+        "tokenizer_feature_dim": tokenizer_feature_dim,
+        "has_tokenizer_projector": has_tokenizer_projector,
         "dropout": dropout,
         "policy_style": policy_style,
         "temporal_layers": temporal_layers,
         "temporal_heads": temporal_heads,
         "temporal_context": temporal_context,
+        "action_output_tanh": action_output_tanh,
     }
 
 
@@ -328,11 +407,13 @@ def main():
         action_chunk_size=model_cfg["action_chunk_size"],
         seq_len=model_cfg["seq_len"],
         tokenizer_ckpt=tokenizer_path,
+        tokenizer_feature_dim=model_cfg["tokenizer_feature_dim"],
         policy_style=model_cfg["policy_style"],
         temporal_layers=model_cfg["temporal_layers"],
         temporal_heads=model_cfg["temporal_heads"],
         temporal_context=model_cfg["temporal_context"],
         backbone_device=device,
+        action_output_tanh=model_cfg["action_output_tanh"],
     ).to(device)
     model.load_state_dict(cleaned_state, strict=True)
     model.eval()
@@ -347,13 +428,15 @@ def main():
         align_sampled_goal_to_fixed_target=args.fixed_target_eval,
         render_obs=False,
     )
+    env = PushTDenseRewardWrapper(env, env_id=DEFAULT_PUSHT_ENV_ID)
 
     print(
         f"Loaded BC checkpoint from {checkpoint_path} | tokenizer={tokenizer_path} "
         f"| seq_len={model_cfg['seq_len']} frame_stride={model_cfg['frame_stride']} "
         f"chunk={model_cfg['action_chunk_size']} "
         f"| action_mode={args.action_mode} | temporal_ensemble={args.temporal_ensemble} "
-        f"| fixed_target_eval={args.fixed_target_eval} | device={device}"
+        f"| fixed_target_eval={args.fixed_target_eval} "
+        f"| delta_scale_hint={PUSHT_DATASET_DELTA_SCALE:.1f} | device={device}"
     )
 
     all_returns: list[float] = []
@@ -389,7 +472,6 @@ def main():
                 input_tensor = torch.as_tensor(stacked_frames[None], dtype=torch.uint8, device=device)
                 with torch.no_grad():
                     action_chunk = model.predict_action_chunk(input_tensor).squeeze(0).cpu().numpy()
-                action_chunk = np.clip(action_chunk, -1.0, 1.0)
                 if args.temporal_ensemble:
                     pending_chunks.append({"chunk": action_chunk, "offset": 0})
                 else:
