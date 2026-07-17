@@ -261,22 +261,26 @@ class Policy(nn.Module):
 
 
 class CachedFeatureDataset(Dataset):
-    def __init__(self, base_dataset: Dataset, cached_features: torch.Tensor):
-        if len(base_dataset) != int(cached_features.shape[0]):
+    def __init__(self, base_dataset: Dataset, cached_features: torch.Tensor | Path | str):
+        if isinstance(cached_features, (str, Path)):
+            self.cached_features = np.load(str(cached_features), mmap_mode="r")
+        else:
+            self.cached_features = cached_features.contiguous()
+        if len(base_dataset) != int(self.cached_features.shape[0]):
             raise ValueError(
-                f"Cached feature length mismatch: dataset={len(base_dataset)} cache={int(cached_features.shape[0])}"
+                f"Cached feature length mismatch: dataset={len(base_dataset)} cache={int(self.cached_features.shape[0])}"
             )
         self.base_dataset = base_dataset
-        self.cached_features = cached_features.contiguous()
 
     def __len__(self) -> int:
         return len(self.base_dataset)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         item = self.base_dataset[idx]
+        features = self.cached_features[idx]
         return {
             **item,
-            "features": self.cached_features[idx],
+            "features": torch.as_tensor(np.asarray(features), dtype=torch.float32),
         }
 
 
@@ -381,21 +385,21 @@ def tokenizer_feature_cache_path(args: argparse.Namespace, tokenizer_path: str) 
     cache_dir = PROJECT_ROOT / "logs" / "tokenizer_feature_cache"
     cache_name = (
         f"{dataset_stem}_{tokenizer_stem}_seq{int(args.seq_len)}"
-        f"_stride{int(args.frame_stride)}_chunk{int(args.action_chunk_size)}.pt"
+        f"_stride{int(args.frame_stride)}_chunk{int(args.action_chunk_size)}.npy"
     )
     return cache_dir / cache_name
 
 
-def load_feature_cache(path: Path) -> torch.Tensor | None:
+def load_feature_cache(path: Path) -> np.memmap | None:
     if not path.exists():
         return None
-    payload = torch.load(path, map_location="cpu")
-    if not isinstance(payload, dict) or "features" not in payload:
+    try:
+        features = np.load(str(path), mmap_mode="r")
+    except Exception:
         return None
-    features = payload["features"]
-    if not torch.is_tensor(features) or features.ndim != 3:
+    if features.ndim != 3:
         return None
-    return features.to(torch.float32)
+    return features
 
 
 @torch.no_grad()
@@ -408,7 +412,7 @@ def build_feature_cache(
     batch_size: int,
     image_batch_normalizer,
     metadata: dict[str, Any] | None = None,
-) -> torch.Tensor:
+) -> np.memmap:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_loader = DataLoader(
         dataset,
@@ -422,25 +426,27 @@ def build_feature_cache(
     tokenizer_backbone.eval()
     tokenizer_backbone.encoder.eval()
 
-    cached_features: list[torch.Tensor] = []
+    feature_array = np.lib.format.open_memmap(
+        str(cache_path),
+        mode="w+",
+        dtype=np.float16,
+        shape=(len(dataset), int(dataset.seq_len), int(tokenizer_backbone.raw_feature_dim)),
+    )
+    offset = 0
     for batch_idx, batch in enumerate(cache_loader):
         x = image_batch_normalizer(batch["image"].to(device, non_blocking=True))
-        features = tokenizer_backbone.extract_features(x).cpu()
-        cached_features.append(features)
+        features = tokenizer_backbone.extract_features(x).cpu().to(torch.float16).numpy()
+        batch_size_actual = int(features.shape[0])
+        feature_array[offset:offset + batch_size_actual] = features
+        offset += batch_size_actual
         if batch_idx == 0 or (batch_idx + 1) == len(cache_loader):
             print(f"cached tokenizer features: {min((batch_idx + 1) * batch_size, len(dataset))}/{len(dataset)}")
-
-    feature_tensor = torch.cat(cached_features, dim=0).to(torch.float32).contiguous()
-    torch.save(
-        {
-            "features": feature_tensor,
-            "meta": metadata or {},
-        },
-        cache_path,
-    )
+    feature_array.flush()
+    if metadata is not None:
+        torch.save(metadata, cache_path.with_suffix(".meta.pt"))
     if was_training:
         tokenizer_backbone.train()
-    return feature_tensor
+    return np.load(str(cache_path), mmap_mode="r")
 
 
 def evaluate_validation(
