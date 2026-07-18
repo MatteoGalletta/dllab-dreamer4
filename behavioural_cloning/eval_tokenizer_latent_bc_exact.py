@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import os
 import math
 import sys
 from collections import deque
@@ -22,9 +24,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from behavioural_cloning.train_tokenizer_latent_bc import TokenizerLatentBCPolicy
 from behavioural_cloning.train_base import TokenizerBackbone, load_tokenizer_encoder
-from ppo_online.env_config import DEFAULT_PUSHT_ENV_ID, make_pusht_env
+from ppo_online.env_config import DEFAULT_PUSHT_ENV_ID, PUSHT_FIXED_TARGET_POSE, make_pusht_env
 from ppo_online.model_paths import resolve_tokenizer_path
 from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
+
+if importlib.util.find_spec("wandb") is not None:
+    wandb = importlib.import_module("wandb")
+else:
+    wandb = None
 
 
 def resolve_device(device_name: str) -> torch.device:
@@ -192,22 +199,92 @@ def save_video(frames: list[np.ndarray], video_path: str, fps: int = 15):
     print(f"Saved evaluation video to {output} using codec=libx264")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate minimal tokenizer-latent BC checkpoint in exact PushT env.")
+def _success_from_info(info: dict, terminated: bool) -> bool:
+    for key in ("success", "is_success", "task_success", "block_success"):
+        if key in info:
+            return float(np.asarray(info[key]).squeeze()) > 0.5
+    return bool(terminated)
+
+
+def _get_wandb_mode(args: argparse.Namespace) -> str:
+    mode = getattr(args, "wandb_mode", "disabled") or "disabled"
+    if mode == "online":
+        has_api_key = bool(Path.home().joinpath(".netrc").exists()) or bool(os.environ.get("WANDB_API_KEY"))
+        if not has_api_key:
+            print("WANDB_API_KEY/.netrc not found, falling back from wandb online mode to offline mode.")
+            return "offline"
+    return mode
+
+
+def _init_wandb(args: argparse.Namespace, config: dict):
+    if not args.wandb:
+        return None
+    if wandb is None:
+        raise ImportError("wandb evaluation logging was requested, but wandb is not installed.")
+    return wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        group=args.wandb_group,
+        tags=args.wandb_tags,
+        mode=_get_wandb_mode(args),
+        config=config,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Evaluate minimal tokenizer-latent BC checkpoint on canonical fixed-target PushT."
+    )
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--episodes", type=int, default=5)
+    parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--max-steps", type=int, default=300)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--video-path", type=str, default="videos/tokenizer_latent_bc_exact.mp4")
+    parser.add_argument("--render", action="store_true")
+    parser.add_argument("--video-path", "--video_path", dest="video_path", type=str, default=None)
+    parser.add_argument("--video-fps", "--video_fps", dest="video_fps", type=int, default=30)
     parser.add_argument("--print-every", type=int, default=25)
-    parser.add_argument("--fixed-target-eval", action="store_true")
+    parser.add_argument(
+        "--fixed-target-pose",
+        "--fixed_target_pose",
+        dest="fixed_target_pose",
+        type=float,
+        nargs=3,
+        default=PUSHT_FIXED_TARGET_POSE.tolist(),
+        metavar=("X", "Y", "ANGLE"),
+    )
+    parser.add_argument("--fixed-target-full-state-success", "--fixed_target_full_state_success", dest="fixed_target_full_state_success", action="store_true")
+    parser.add_argument(
+        "--fixed-target-max-reset-attempts",
+        "--fixed_target_max_reset_attempts",
+        dest="fixed_target_max_reset_attempts",
+        type=int,
+        default=100,
+    )
+    parser.add_argument(
+        "--fixed-target-eval",
+        action="store_true",
+        help="Compatibility flag; canonical tokenizer-latent eval now always uses fixed-target PushT.",
+    )
     parser.add_argument("--temporal-ensemble", action="store_true")
     parser.add_argument("--temporal-ensemble-decay", type=float, default=0.01)
-    return parser.parse_args()
+    parser.add_argument("--seed", "--eval_seed", dest="eval_seed", type=int, default=42)
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", "--wandb_project", dest="wandb_project", default="pusht-tokenizer-latent-bc")
+    parser.add_argument("--wandb-entity", "--wandb_entity", dest="wandb_entity", default=None)
+    parser.add_argument("--wandb-run-name", "--wandb_run_name", dest="wandb_run_name", default=None)
+    parser.add_argument("--wandb-group", "--wandb_group", dest="wandb_group", default="pusht-tokenizer-latent-bc-eval")
+    parser.add_argument("--wandb-tags", "--wandb_tags", dest="wandb_tags", nargs="*", default=None)
+    parser.add_argument(
+        "--wandb-mode",
+        "--wandb_mode",
+        dest="wandb_mode",
+        choices=["online", "offline", "disabled"],
+        default="disabled",
+    )
+    return parser
 
 
-def main():
-    args = parse_args()
+def evaluate(args: argparse.Namespace) -> dict[str, float]:
     device = resolve_device("auto")
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     ckpt_args = ckpt["args"]
@@ -237,7 +314,10 @@ def main():
         image_width=int(tokenizer_info["W"]),
         relative=(str(ckpt_args.get("action_mode", "relative")) == "relative"),
         sync_goal_pose=True,
-        align_sampled_goal_to_fixed_target=args.fixed_target_eval,
+        align_sampled_goal_to_fixed_target=True,
+        fixed_target_pose=tuple(args.fixed_target_pose),
+        fixed_target_block_success=not bool(args.fixed_target_full_state_success),
+        fixed_target_max_reset_attempts=int(args.fixed_target_max_reset_attempts),
         render_obs=False,
     )
     env = PushTDenseRewardWrapper(env, env_id=DEFAULT_PUSHT_ENV_ID)
@@ -252,18 +332,32 @@ def main():
     returns = []
     lengths = []
     coverages = []
+    successes = []
     video_frames = []
+    wandb_run = _init_wandb(
+        args,
+        {
+            **vars(args),
+            "checkpoint_args": ckpt_args,
+            "tokenizer_path": str(tokenizer_path),
+            "device": str(device),
+        },
+    )
 
     print(
         f"Loaded tokenizer-latent BC from {args.checkpoint} | tokenizer={tokenizer_path} "
         f"| seq_len={seq_len} frame_stride={frame_stride} chunk={chunk_size} "
         f"| action_mode={action_mode} normalize_actions={normalize_actions} "
-        f"action_scale={action_scale} temporal_ensemble={args.temporal_ensemble} | device={device}"
+        f"action_scale={action_scale} temporal_ensemble={args.temporal_ensemble} "
+        f"| fixed_target_pose={tuple(float(x) for x in args.fixed_target_pose)} "
+        f"| fixed_target_block_success={not bool(args.fixed_target_full_state_success)} | device={device}"
     )
+    if args.render:
+        print("WARNING: live --render is not supported here; use --video-path for saved video output.")
 
     with torch.no_grad():
         for episode_idx in range(int(args.episodes)):
-            _, _ = env.reset(seed=int(args.seed) + episode_idx)
+            _, _ = env.reset(seed=int(args.eval_seed) + episode_idx)
             max_history_len = (seq_len - 1) * frame_stride + 1
             frame_history: deque[np.ndarray] = deque(maxlen=max_history_len)
             action_buffer: deque[np.ndarray] = deque()
@@ -311,21 +405,50 @@ def main():
                         f"total={total_reward:8.3f} coverage={coverage:.3f}"
                     )
 
+            success = _success_from_info(final_info, done)
             returns.append(total_reward)
             lengths.append(step_count)
             coverages.append(float(final_info.get("coverage", 0.0)))
+            successes.append(float(success))
             print(
                 f"episode={episode_idx + 1:02d} return={total_reward:.3f} "
-                f"steps={step_count} coverage={float(final_info.get('coverage', 0.0))}"
+                f"steps={step_count} success={int(success)} coverage={float(final_info.get('coverage', 0.0))}"
             )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "eval/episode_return": float(total_reward),
+                        "eval/episode_length": float(step_count),
+                        "eval/episode_success": float(success),
+                        "eval/episode_coverage": float(final_info.get("coverage", 0.0)),
+                    },
+                    step=episode_idx + 1,
+                )
 
     env.close()
     if args.video_path:
-        save_video(video_frames, args.video_path)
+        save_video(video_frames, args.video_path, fps=int(args.video_fps))
+    summary = {
+        "episodes": float(len(returns)),
+        "mean_return": float(np.mean(returns)) if returns else float("nan"),
+        "mean_length": float(np.mean(lengths)) if lengths else float("nan"),
+        "mean_coverage": float(np.mean(coverages)) if coverages else float("nan"),
+        "success_rate": float(np.mean(successes)) if successes else float("nan"),
+    }
     print(
-        f"Summary: episodes={len(returns)} mean_return={float(np.mean(returns)):.3f} "
-        f"mean_length={float(np.mean(lengths)):.1f} mean_coverage={float(np.mean(coverages)):.3f}"
+        f"Summary: episodes={int(summary['episodes'])} mean_return={summary['mean_return']:.3f} "
+        f"mean_length={summary['mean_length']:.1f} mean_coverage={summary['mean_coverage']:.3f} "
+        f"success_rate={summary['success_rate']:.3f}"
     )
+    if wandb_run is not None:
+        for key, value in summary.items():
+            wandb_run.summary[f"eval/{key}"] = value
+        wandb_run.finish()
+    return summary
+
+
+def main():
+    evaluate(build_parser().parse_args())
 
 
 if __name__ == "__main__":
