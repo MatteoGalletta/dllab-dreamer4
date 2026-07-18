@@ -199,6 +199,39 @@ def save_video(frames: list[np.ndarray], video_path: str, fps: int = 15):
     print(f"Saved evaluation video to {output} using codec=libx264")
 
 
+def _upscale(frame: np.ndarray, resolution: int) -> np.ndarray:
+    frame = np.asarray(frame, dtype=np.uint8)
+    if resolution <= 0 or frame.shape[:2] == (resolution, resolution):
+        return frame
+    try:
+        import cv2  # type: ignore
+    except ImportError:
+        return frame
+    return cv2.resize(frame, (resolution, resolution), interpolation=cv2.INTER_NEAREST)
+
+
+def write_episode_video(
+    frames: list[np.ndarray],
+    video_dir: str,
+    episode_index: int,
+    success: bool,
+    *,
+    fps: int = 10,
+    resolution: int = 512,
+) -> str | None:
+    if not frames:
+        return None
+    if fps <= 0:
+        raise ValueError("video fps must be positive")
+    output_dir = Path(video_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tag = "success" if success else "fail"
+    output_path = output_dir / f"episode_{episode_index:03d}_{tag}.mp4"
+    save_video([_upscale(frame, resolution) for frame in frames], str(output_path), fps=fps)
+    print(f"  saved {output_path}")
+    return str(output_path)
+
+
 def _success_from_info(info: dict, terminated: bool) -> bool:
     for key in ("success", "is_success", "task_success", "block_success"):
         if key in info:
@@ -242,6 +275,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--video-path", "--video_path", dest="video_path", type=str, default=None)
     parser.add_argument("--video-fps", "--video_fps", dest="video_fps", type=int, default=30)
+    parser.add_argument("--video-resolution", "--video_resolution", dest="video_resolution", type=int, default=512)
     parser.add_argument("--print-every", type=int, default=25)
     parser.add_argument(
         "--fixed-target-pose",
@@ -333,7 +367,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
     lengths = []
     coverages = []
     successes = []
-    video_frames = []
+    video_dir = None
+    if args.video_path:
+        raw_video_path = str(args.video_path)
+        video_dir = raw_video_path.rsplit(".", 1)[0] if "." in Path(raw_video_path).name else raw_video_path
     wandb_run = _init_wandb(
         args,
         {
@@ -365,12 +402,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
             total_reward = 0.0
             step_count = 0
             final_info: dict = {}
+            episode_frames: list[np.ndarray] | None = [] if video_dir else None
 
             while not done and step_count < int(args.max_steps):
                 frame = np.asarray(env.render(), dtype=np.uint8)
                 frame_history.append(frame)
-                if episode_idx == 0 and args.video_path:
-                    video_frames.append(frame.copy())
+                if episode_frames is not None:
+                    episode_frames.append(frame.copy())
 
                 if not action_buffer:
                     stacked_frames = pad_history(frame_history, seq_len, frame_stride)
@@ -414,6 +452,15 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
                 f"episode={episode_idx + 1:02d} return={total_reward:.3f} "
                 f"steps={step_count} success={int(success)} coverage={float(final_info.get('coverage', 0.0))}"
             )
+            if video_dir and episode_frames is not None:
+                write_episode_video(
+                    episode_frames,
+                    video_dir,
+                    episode_idx,
+                    bool(success),
+                    fps=int(args.video_fps),
+                    resolution=int(args.video_resolution),
+                )
             if wandb_run is not None:
                 wandb_run.log(
                     {
@@ -426,8 +473,6 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
                 )
 
     env.close()
-    if args.video_path:
-        save_video(video_frames, args.video_path, fps=int(args.video_fps))
     summary = {
         "episodes": float(len(returns)),
         "mean_return": float(np.mean(returns)) if returns else float("nan"),
