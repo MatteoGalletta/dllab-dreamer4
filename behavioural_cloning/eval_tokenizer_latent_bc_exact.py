@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from collections import deque
 from pathlib import Path
@@ -24,7 +25,110 @@ from behavioural_cloning.train_base import TokenizerBackbone, load_tokenizer_enc
 from ppo_online.env_config import DEFAULT_PUSHT_ENV_ID, make_pusht_env
 from ppo_online.model_paths import resolve_tokenizer_path
 from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
-from ppo_online.train import PushTDenseRewardWrapper, resolve_device
+
+
+def resolve_device(device_name: str) -> torch.device:
+    if device_name == "auto":
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return torch.device("xpu")
+        if not torch.cuda.is_available():
+            return torch.device("cpu")
+        try:
+            major, minor = torch.cuda.get_device_capability(0)
+            supported_arches = {
+                arch.replace("sm_", "")
+                for arch in torch.cuda.get_arch_list()
+                if arch.startswith("sm_")
+            }
+            requested_arch = f"{major}{minor}"
+            if supported_arches and requested_arch not in supported_arches:
+                print(
+                    "CUDA device detected but unsupported by this PyTorch build: "
+                    f"sm_{requested_arch} not in {sorted(supported_arches)}. Falling back to CPU."
+                )
+                return torch.device("cpu")
+            _ = torch.zeros(1, device="cuda")
+            return torch.device("cuda")
+        except Exception as error:
+            print(f"CUDA auto-detection failed ({error}). Falling back to CPU.")
+            return torch.device("cpu")
+    return torch.device(device_name)
+
+
+def extract_state_array(observation) -> np.ndarray:
+    if isinstance(observation, dict):
+        if "state" in observation:
+            return np.asarray(observation["state"], dtype=np.float32)
+        raise KeyError("Expected observation dict to contain a 'state' entry.")
+    return np.asarray(observation, dtype=np.float32)
+
+
+class PushTDenseRewardWrapper:
+    def __init__(self, env, env_id: str | None = None):
+        self.env = env
+        self.target_pos = np.array([256.0, 256.0], dtype=np.float32)
+        self.env_id = env_id or getattr(getattr(env, "spec", None), "id", "") or ""
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
+
+    def _resolve_goal_block_pose(self, info: dict, state: np.ndarray) -> np.ndarray | None:
+        goal_pose = info.get("goal_pose")
+        if goal_pose is not None:
+            goal_pose = np.asarray(goal_pose, dtype=np.float32).reshape(-1)
+            if goal_pose.shape[0] >= 3:
+                return goal_pose[:3]
+
+        goal_state = info.get("goal_state")
+        if goal_state is not None:
+            goal_state = np.asarray(goal_state, dtype=np.float32).reshape(-1)
+            if goal_state.shape[0] >= 5:
+                return np.array([goal_state[2], goal_state[3], goal_state[4]], dtype=np.float32)
+
+        if state.shape[0] >= 5:
+            return np.array([self.target_pos[0], self.target_pos[1], state[4]], dtype=np.float32)
+        return None
+
+    def _angle_distance(self, angle_a: float, angle_b: float) -> float:
+        diff = abs(angle_a - angle_b) % (2.0 * math.pi)
+        return min(diff, (2.0 * math.pi) - diff)
+
+    def step(self, action):
+        observation, original_reward, terminated, truncated, info = self.env.step(action)
+        state = extract_state_array(observation)
+        eef_pos = state[0:2].astype(np.float32)
+        block_pos = state[2:4].astype(np.float32)
+        block_angle = float(state[4]) if state.shape[0] >= 5 else 0.0
+        goal_block_pose = self._resolve_goal_block_pose(info, state)
+        goal_block_pos = goal_block_pose[:2] if goal_block_pose is not None else self.target_pos
+        goal_block_angle = float(goal_block_pose[2]) if goal_block_pose is not None else block_angle
+
+        dist_reach = float(np.linalg.norm(eef_pos - block_pos))
+        dist_push = float(np.linalg.norm(block_pos - goal_block_pos))
+        angle_error = self._angle_distance(block_angle, goal_block_angle)
+
+        r_push = math.exp(-dist_push / 100.0)
+        dist_reach_eff = max(0.0, dist_reach - 60.0)
+        r_reach = math.exp(-dist_reach_eff / 100.0)
+        r_angle = math.exp(-angle_error / (math.pi / 6.0))
+
+        info = dict(info)
+        info["original_reward"] = float(original_reward)
+        info["reach_reward"] = float(r_reach)
+        info["push_reward"] = float(r_push)
+        info["angle_reward"] = float(r_angle)
+        info["distance_to_block"] = dist_reach
+        info["distance_to_target"] = dist_push
+        info["angle_error"] = angle_error
+        info["coverage_proxy"] = float(r_push)
+        info["coverage"] = float(info.get("coverage", 0.0))
+
+        dense_reward = (1.0 * r_reach) + (3.0 * r_push) + (1.0 * r_angle)
+        info["dense_reward"] = float(dense_reward)
+        return observation, float(dense_reward), terminated, truncated, info
 
 
 def pad_history(frames: deque[np.ndarray], seq_len: int, frame_stride: int) -> np.ndarray:
