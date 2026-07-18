@@ -42,12 +42,21 @@ from behavioural_cloning.train_base import (
 
 
 class PushTNPZSequenceDataset(Dataset):
-    def __init__(self, npz_path: str, *, seq_len: int, action_chunk_size: int, frame_stride: int):
+    def __init__(
+        self,
+        npz_path: str,
+        *,
+        seq_len: int,
+        action_chunk_size: int,
+        frame_stride: int,
+        image_hw: tuple[int, int] | None = None,
+    ):
         self.npz_path = str(npz_path)
         self.seq_len = int(seq_len)
         self.action_chunk_size = int(action_chunk_size)
         self.frame_stride = int(frame_stride)
         self.raw_seq_len = (self.seq_len - 1) * self.frame_stride + self.action_chunk_size
+        self.image_hw = None if image_hw is None else (int(image_hw[0]), int(image_hw[1]))
 
         with np.load(self.npz_path, allow_pickle=True) as data:
             image_key = self._resolve_first_key(data, ("images", "pixels", "observations", "obs"))
@@ -125,6 +134,13 @@ class PushTNPZSequenceDataset(Dataset):
             images = images.astype(np.uint8)
 
         image_tensor = torch.from_numpy(images).permute(0, 3, 1, 2).float() / 255.0
+        if self.image_hw is not None and tuple(image_tensor.shape[-2:]) != self.image_hw:
+            image_tensor = F.interpolate(
+                image_tensor,
+                size=self.image_hw,
+                mode="bilinear",
+                align_corners=False,
+            )
         action_tensor = torch.from_numpy(actions).float()
         return {
             "image": image_tensor,
@@ -227,11 +243,16 @@ def _prepare_cached_dataset(
 ) -> tuple[Dataset, int, str]:
     dataset_path = str(args.dataset)
     if dataset_path.lower().endswith(".npz"):
+        from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
+
+        tokenizer_path = resolve_tokenizer_path(args.tokenizer_ckpt_name)
+        _, tokenizer_info = load_tokenizer_from_ckpt(tokenizer_path, torch.device("cpu"))
         full_dataset = PushTNPZSequenceDataset(
             dataset_path,
             seq_len=args.seq_len,
             action_chunk_size=args.action_chunk_size,
             frame_stride=args.frame_stride,
+            image_hw=(int(tokenizer_info["H"]), int(tokenizer_info["W"])),
         )
     else:
         full_dataset = PushTSequenceDataset(
