@@ -43,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-path", type=str, default="videos/tokenizer_latent_bc_exact.mp4")
     parser.add_argument("--print-every", type=int, default=25)
     parser.add_argument("--fixed-target-eval", action="store_true")
+    parser.add_argument("--temporal-ensemble", action="store_true")
+    parser.add_argument("--temporal-ensemble-decay", type=float, default=0.01)
     return parser.parse_args()
 
 
@@ -75,7 +77,7 @@ def main():
         render_mode="rgb_array",
         image_height=int(tokenizer_info["H"]),
         image_width=int(tokenizer_info["W"]),
-        relative=True,
+        relative=(str(ckpt_args.get("action_mode", "relative")) == "relative"),
         sync_goal_pose=True,
         align_sampled_goal_to_fixed_target=args.fixed_target_eval,
         render_obs=False,
@@ -87,6 +89,7 @@ def main():
     chunk_size = int(ckpt_args["action_chunk_size"])
     normalize_actions = bool(ckpt_args.get("normalize_actions", False))
     action_scale = float(ckpt_args.get("action_scale", 1.0))
+    action_mode = str(ckpt_args.get("action_mode", "relative"))
 
     returns = []
     lengths = []
@@ -96,7 +99,8 @@ def main():
     print(
         f"Loaded tokenizer-latent BC from {args.checkpoint} | tokenizer={tokenizer_path} "
         f"| seq_len={seq_len} frame_stride={frame_stride} chunk={chunk_size} "
-        f"| normalize_actions={normalize_actions} action_scale={action_scale} | device={device}"
+        f"| action_mode={action_mode} normalize_actions={normalize_actions} "
+        f"action_scale={action_scale} temporal_ensemble={args.temporal_ensemble} | device={device}"
     )
 
     with torch.no_grad():
@@ -128,7 +132,11 @@ def main():
                     pred = model(latent_stack).view(1, chunk_size, 2).squeeze(0).cpu().numpy()
                     if normalize_actions:
                         pred = pred * action_scale
-                    action_buffer.extend([np.asarray(action, dtype=np.float32) for action in pred])
+                    if args.temporal_ensemble:
+                        action_buffer.clear()
+                        action_buffer.extend([np.asarray(action, dtype=np.float32) for action in pred])
+                    else:
+                        action_buffer.extend([np.asarray(action, dtype=np.float32) for action in pred])
 
                 env_action = np.asarray(action_buffer.popleft(), dtype=np.float32)
                 _, reward, terminated, truncated, info = env.step(env_action)

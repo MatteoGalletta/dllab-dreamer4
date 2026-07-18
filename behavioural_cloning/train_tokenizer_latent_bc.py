@@ -196,6 +196,13 @@ def _action_scale_for_training(actions: torch.Tensor, *, normalize_actions: bool
     return actions / float(action_scale)
 
 
+def _resolve_action_mode(args: argparse.Namespace) -> str:
+    action_mode = str(args.action_mode)
+    if action_mode == "auto":
+        return "absolute" if str(args.dataset).lower().endswith(".npz") else "relative"
+    return action_mode
+
+
 def _evaluate_validation_scaled(
     model: nn.Module,
     loader: DataLoader | None,
@@ -300,6 +307,7 @@ def train(args: argparse.Namespace):
     device, device_type = get_runtime_device()
     seed_everything(int(args.seed))
     print(f"Using device: {device}")
+    args.action_mode = _resolve_action_mode(args)
     dataset, latent_dim, tokenizer_path = _prepare_cached_dataset(args, device=device)
     train_indices, val_indices = split_indices(len(dataset), args.val_frac, args.seed)
     train_indices = maybe_truncate_indices(train_indices, int(args.max_train_samples), seed=args.seed)
@@ -339,7 +347,8 @@ def train(args: argparse.Namespace):
         print(
             f"Tokenizer-latent BC: dataset={args.dataset} tokenizer={tokenizer_path} "
             f"| windows total={len(dataset)} train={len(train_dataset)} val={0 if val_dataset is None else len(val_dataset)} "
-            f"| latent_dim={latent_dim} frame_stack={args.seq_len} stride={args.frame_stride} chunk={args.action_chunk_size}"
+            f"| latent_dim={latent_dim} frame_stack={args.seq_len} stride={args.frame_stride} "
+            f"chunk={args.action_chunk_size} action_mode={args.action_mode}"
         )
         wandb.init(
             project=args.wandb_project,
@@ -461,6 +470,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebuild_latent_cache", action="store_true")
     parser.add_argument("--normalize_actions", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--action_scale", type=float, default=1.0)
+    parser.add_argument("--action_mode", type=str, default="auto", choices=["auto", "relative", "absolute"])
     parser.add_argument("--ckpt_dir", type=str, default="local_models/behavior_cloning/tokenizer_latent_bc")
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument("--wandb_project", type=str, default="pusht-tokenizer-latent-bc")
