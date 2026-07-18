@@ -6,6 +6,8 @@ import argparse
 import sys
 from collections import deque
 from pathlib import Path
+import shutil
+import subprocess
 
 import numpy as np
 import torch
@@ -17,7 +19,6 @@ if str(SCRIPT_DIR) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from behavioural_cloning.eval_bc_exact import save_video
 from behavioural_cloning.train_tokenizer_latent_bc import TokenizerLatentBCPolicy
 from behavioural_cloning.train_base import TokenizerBackbone, load_tokenizer_encoder
 from ppo_online.env_config import DEFAULT_PUSHT_ENV_ID, make_pusht_env
@@ -32,6 +33,59 @@ def pad_history(frames: deque[np.ndarray], seq_len: int, frame_stride: int) -> n
     newest = len(frames) - 1
     indices = [max(0, newest - i * int(frame_stride)) for i in range(seq_len - 1, -1, -1)]
     return np.stack([frames[idx] for idx in indices], axis=0)
+
+
+def save_video(frames: list[np.ndarray], video_path: str, fps: int = 15):
+    if not video_path or not frames:
+        return
+    output = Path(video_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError(
+            "Video saving for tokenizer latent eval requires ffmpeg in PATH. "
+            "Run with --video-path \"\" to disable video output."
+        )
+
+    temp_dir = output.parent / f".{output.stem}_frames"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from imageio.v2 import imwrite
+    except ImportError as exc:
+        raise RuntimeError(
+            "Video saving for tokenizer latent eval requires imageio when OpenCV is unavailable."
+        ) from exc
+
+    for index, frame in enumerate(frames):
+        frame_path = temp_dir / f"frame_{index:06d}.png"
+        imwrite(frame_path, np.asarray(frame, dtype=np.uint8))
+
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-loglevel",
+        "error",
+        "-framerate",
+        str(int(fps)),
+        "-i",
+        str(temp_dir / "frame_%06d.png"),
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(output),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    for frame_path in temp_dir.glob("*.png"):
+        frame_path.unlink(missing_ok=True)
+    temp_dir.rmdir()
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Could not encode video with ffmpeg for {output}: {result.stderr.strip() or result.stdout.strip()}"
+        )
+    print(f"Saved evaluation video to {output} using codec=libx264")
 
 
 def parse_args() -> argparse.Namespace:

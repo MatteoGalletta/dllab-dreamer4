@@ -10,7 +10,6 @@ import shutil
 import subprocess
 import sys
 
-import cv2
 import gymnasium as gym
 import numpy as np
 import torch
@@ -48,6 +47,14 @@ temporal_patchify = dreamer4_model.temporal_patchify
 
 
 PUSHT_DATASET_DELTA_SCALE = 39.3
+
+
+def _import_cv2():
+    try:
+        import cv2  # type: ignore
+    except ImportError:
+        return None
+    return cv2
 
 
 class CNNBackbone(nn.Module):
@@ -372,33 +379,71 @@ def save_video(frames: list[np.ndarray], video_path: str, fps: int = 15):
     output = Path(video_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     height, width = frames[0].shape[:2]
-    temp_output = output.with_name(f"{output.stem}.raw{output.suffix}")
-    writer = None
-    opened_codec = None
-    for codec in ("mp4v", "avc1", "H264"):
-        candidate = cv2.VideoWriter(str(temp_output), cv2.VideoWriter_fourcc(*codec), float(fps), (width, height))
-        if candidate.isOpened():
-            writer = candidate
-            opened_codec = codec
-            break
-        candidate.release()
-    if writer is None:
-        raise RuntimeError(f"Could not open video writer for {output}")
-    try:
-        for frame in frames:
-            writer.write(np.asarray(frame, dtype=np.uint8)[..., ::-1])
-    finally:
-        writer.release()
-    finalized_codec = opened_codec
     ffmpeg_path = shutil.which("ffmpeg")
+    cv2 = _import_cv2()
+    if cv2 is not None:
+        temp_output = output.with_name(f"{output.stem}.raw{output.suffix}")
+        writer = None
+        opened_codec = None
+        for codec in ("mp4v", "avc1", "H264"):
+            candidate = cv2.VideoWriter(str(temp_output), cv2.VideoWriter_fourcc(*codec), float(fps), (width, height))
+            if candidate.isOpened():
+                writer = candidate
+                opened_codec = codec
+                break
+            candidate.release()
+        if writer is None:
+            raise RuntimeError(f"Could not open video writer for {output}")
+        try:
+            for frame in frames:
+                writer.write(np.asarray(frame, dtype=np.uint8)[..., ::-1])
+        finally:
+            writer.release()
+        finalized_codec = opened_codec
+        if ffmpeg_path is not None:
+            cmd = [
+                ffmpeg_path,
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                str(temp_output),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(output),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                finalized_codec = "libx264"
+                temp_output.unlink(missing_ok=True)
+            else:
+                temp_output.replace(output)
+        else:
+            temp_output.replace(output)
+        print(f"Saved evaluation video to {output} using codec={finalized_codec}")
+        return
+
     if ffmpeg_path is not None:
+        temp_dir = output.parent / f".{output.stem}_frames"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        for index, frame in enumerate(frames):
+            frame_path = temp_dir / f"frame_{index:06d}.png"
+            from imageio.v2 import imwrite
+
+            imwrite(frame_path, np.asarray(frame, dtype=np.uint8))
         cmd = [
             ffmpeg_path,
             "-y",
             "-loglevel",
             "error",
+            "-framerate",
+            str(int(fps)),
             "-i",
-            str(temp_output),
+            str(temp_dir / "frame_%06d.png"),
             "-c:v",
             "libx264",
             "-pix_fmt",
@@ -409,13 +454,19 @@ def save_video(frames: list[np.ndarray], video_path: str, fps: int = 15):
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
-            finalized_codec = "libx264"
-            temp_output.unlink(missing_ok=True)
-        else:
-            temp_output.replace(output)
-    else:
-        temp_output.replace(output)
-    print(f"Saved evaluation video to {output} using codec={finalized_codec}")
+            for frame_path in temp_dir.glob("*.png"):
+                frame_path.unlink(missing_ok=True)
+            temp_dir.rmdir()
+            print(f"Saved evaluation video to {output} using codec=libx264")
+            return
+        raise RuntimeError(
+            f"Could not encode video with ffmpeg for {output}: {result.stderr.strip() or result.stdout.strip()}"
+        )
+
+    raise RuntimeError(
+        "Video saving requires either OpenCV with video support or ffmpeg in PATH. "
+        "Run eval without --video-path if neither is available."
+    )
 
 
 def main():
