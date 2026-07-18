@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import importlib
 import os
 import math
+import re
 import sys
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 import subprocess
@@ -265,15 +268,59 @@ def _init_wandb(args: argparse.Namespace, config: dict):
     )
 
 
+def _slug(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value)).strip("-._")
+    return slug or "eval"
+
+
+def create_run_directory(output_root: str, checkpoint: str, run_name: str | None = None) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    parts = [timestamp, "bc", _slug(Path(checkpoint).stem)]
+    if run_name:
+        parts.append(_slug(run_name))
+    output_root_path = Path(output_root)
+    output_root_path.mkdir(parents=True, exist_ok=True)
+    base_name = "_".join(parts)
+    for suffix in range(1000):
+        name = base_name if suffix == 0 else f"{base_name}_{suffix:02d}"
+        run_dir = output_root_path / name
+        try:
+            run_dir.mkdir()
+        except FileExistsError:
+            continue
+        return run_dir
+    raise RuntimeError(f"could not allocate an evaluation run directory under {output_root}")
+
+
+def write_metrics_json(summary: dict[str, float], run_dir: Path, episodes: list[dict], config: dict) -> Path:
+    metrics_path = run_dir / "metrics.json"
+    payload = {
+        "config": config,
+        "episodes": episodes,
+        "summary": summary,
+        "artifacts": {
+            "run_dir": str(run_dir),
+            "metrics_path": str(metrics_path),
+            "video_dir": str(run_dir / "videos") if config.get("record_video", False) else None,
+        },
+    }
+    with metrics_path.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2, sort_keys=True)
+        file.write("\n")
+    print(f"Saved evaluation metrics to: {metrics_path}")
+    return metrics_path
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Evaluate minimal tokenizer-latent BC checkpoint on canonical fixed-target PushT."
     )
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--episodes", type=int, default=10)
-    parser.add_argument("--max-steps", type=int, default=300)
+    parser.add_argument("--max-steps", "--max_steps", "--max-episode-steps", dest="max_steps", type=int, default=300)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--video-path", "--video_path", dest="video_path", type=str, default=None)
+    parser.add_argument("--video", action="store_true", help="Save per-episode videos under the evaluation run directory.")
     parser.add_argument("--video-fps", "--video_fps", dest="video_fps", type=int, default=30)
     parser.add_argument("--video-resolution", "--video_resolution", dest="video_resolution", type=int, default=512)
     parser.add_argument("--print-every", type=int, default=25)
@@ -294,14 +341,31 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=100,
     )
+    parser.add_argument("--agent-block-coef", "--agent_block_coef", dest="agent_block_coef", type=float, default=0.0)
+    parser.add_argument(
+        "--block-start-radius",
+        "--block_start_radius",
+        dest="block_start_radius",
+        type=float,
+        default=None,
+        help="Sample block starts within this goal radius; omit for unrestricted starts.",
+    )
     parser.add_argument(
         "--fixed-target-eval",
         action="store_true",
         help="Compatibility flag; canonical tokenizer-latent eval now always uses fixed-target PushT.",
     )
     parser.add_argument("--temporal-ensemble", action="store_true")
+    parser.add_argument(
+        "--execution-mode",
+        choices=["open-loop", "temporal-ensemble"],
+        default="open-loop",
+        help="Compatibility alias; maps to the tokenizer BC execution style.",
+    )
     parser.add_argument("--temporal-ensemble-decay", type=float, default=0.01)
     parser.add_argument("--seed", "--eval_seed", dest="eval_seed", type=int, default=42)
+    parser.add_argument("--output-root", "--output_root", dest="output_root", default="runs/evaluations")
+    parser.add_argument("--run-name", "--run_name", dest="run_name", default=None)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", "--wandb_project", dest="wandb_project", default="pusht-tokenizer-latent-bc")
     parser.add_argument("--wandb-entity", "--wandb_entity", dest="wandb_entity", default=None)
@@ -320,6 +384,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def evaluate(args: argparse.Namespace) -> dict[str, float]:
     device = resolve_device("auto")
+    if args.video and not args.video_path:
+        args.video_path = "videos"
+    if args.execution_mode == "temporal-ensemble":
+        args.temporal_ensemble = True
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     ckpt_args = ckpt["args"]
     tokenizer_path = resolve_tokenizer_path(ckpt_args["tokenizer_ckpt_name"])
@@ -352,7 +420,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
         fixed_target_pose=tuple(args.fixed_target_pose),
         fixed_target_block_success=not bool(args.fixed_target_full_state_success),
         fixed_target_max_reset_attempts=int(args.fixed_target_max_reset_attempts),
+        fixed_target_agent_block_coef=float(args.agent_block_coef),
+        block_start_near_goal=args.block_start_radius is not None,
+        block_start_radius=float(args.block_start_radius or 0.0),
         render_obs=False,
+        max_episode_steps=int(args.max_steps),
     )
     env = PushTDenseRewardWrapper(env, env_id=DEFAULT_PUSHT_ENV_ID)
 
@@ -367,10 +439,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
     lengths = []
     coverages = []
     successes = []
-    video_dir = None
-    if args.video_path:
-        raw_video_path = str(args.video_path)
-        video_dir = raw_video_path.rsplit(".", 1)[0] if "." in Path(raw_video_path).name else raw_video_path
+    run_dir = create_run_directory(args.output_root, args.checkpoint, run_name=args.run_name)
+    print(f"Evaluation run directory: {run_dir}")
+    video_dir = str(run_dir / "videos") if args.video_path else None
+    episode_payloads: list[dict] = []
     wandb_run = _init_wandb(
         args,
         {
@@ -378,6 +450,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
             "checkpoint_args": ckpt_args,
             "tokenizer_path": str(tokenizer_path),
             "device": str(device),
+            "record_video": bool(video_dir),
+            "run_dir": str(run_dir),
         },
     )
 
@@ -387,7 +461,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
         f"| action_mode={action_mode} normalize_actions={normalize_actions} "
         f"action_scale={action_scale} temporal_ensemble={args.temporal_ensemble} "
         f"| fixed_target_pose={tuple(float(x) for x in args.fixed_target_pose)} "
-        f"| fixed_target_block_success={not bool(args.fixed_target_full_state_success)} | device={device}"
+        f"| fixed_target_block_success={not bool(args.fixed_target_full_state_success)} "
+        f"| block_start_radius={args.block_start_radius} | device={device}"
     )
     if args.render:
         print("WARNING: live --render is not supported here; use --video-path for saved video output.")
@@ -453,7 +528,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
                 f"steps={step_count} success={int(success)} coverage={float(final_info.get('coverage', 0.0))}"
             )
             if video_dir and episode_frames is not None:
-                write_episode_video(
+                video_file = write_episode_video(
                     episode_frames,
                     video_dir,
                     episode_idx,
@@ -461,6 +536,20 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
                     fps=int(args.video_fps),
                     resolution=int(args.video_resolution),
                 )
+            else:
+                video_file = None
+            episode_payloads.append(
+                {
+                    "episode": int(episode_idx),
+                    "seed": int(args.eval_seed) + int(episode_idx),
+                    "episode_return": float(total_reward),
+                    "length": int(step_count),
+                    "success": float(success),
+                    "terminated": bool(done and step_count < int(args.max_steps)),
+                    "truncated": bool(step_count >= int(args.max_steps)),
+                    "video_path": video_file,
+                }
+            )
             if wandb_run is not None:
                 wandb_run.log(
                     {
@@ -476,10 +565,36 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
     summary = {
         "episodes": float(len(returns)),
         "mean_return": float(np.mean(returns)) if returns else float("nan"),
+        "std_return": float(np.std(returns)) if returns else float("nan"),
+        "min_return": float(np.min(returns)) if returns else float("nan"),
+        "max_return": float(np.max(returns)) if returns else float("nan"),
         "mean_length": float(np.mean(lengths)) if lengths else float("nan"),
         "mean_coverage": float(np.mean(coverages)) if coverages else float("nan"),
         "success_rate": float(np.mean(successes)) if successes else float("nan"),
+        "terminated_rate": float(np.mean([episode["terminated"] for episode in episode_payloads])) if episode_payloads else float("nan"),
+        "truncated_rate": float(np.mean([episode["truncated"] for episode in episode_payloads])) if episode_payloads else float("nan"),
     }
+    write_metrics_json(
+        summary,
+        run_dir,
+        episode_payloads,
+        {
+            "checkpoint": args.checkpoint,
+            "episodes": int(args.episodes),
+            "seed": int(args.eval_seed),
+            "max_episode_steps": int(args.max_steps),
+            "fixed_target_pose": [float(x) for x in args.fixed_target_pose],
+            "fixed_target_block_success": not bool(args.fixed_target_full_state_success),
+            "fixed_target_max_reset_attempts": int(args.fixed_target_max_reset_attempts),
+            "agent_block_coef": float(args.agent_block_coef),
+            "block_start_radius": None if args.block_start_radius is None else float(args.block_start_radius),
+            "record_video": bool(video_dir),
+            "video_dir": str(run_dir / "videos") if video_dir else None,
+            "video_fps": int(args.video_fps),
+            "video_resolution": int(args.video_resolution),
+            "execution_mode": "temporal-ensemble" if args.temporal_ensemble else "open-loop",
+        },
+    )
     print(
         f"Summary: episodes={int(summary['episodes'])} mean_return={summary['mean_return']:.3f} "
         f"mean_length={summary['mean_length']:.1f} mean_coverage={summary['mean_coverage']:.3f} "
