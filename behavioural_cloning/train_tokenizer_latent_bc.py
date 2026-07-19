@@ -50,6 +50,8 @@ class PushTNPZSequenceDataset(Dataset):
         action_chunk_size: int,
         frame_stride: int,
         image_hw: tuple[int, int] | None = None,
+        action_mode: str = "absolute",
+        swm_action_scale: float = 100.0,
     ):
         self.npz_path = str(npz_path)
         self.seq_len = int(seq_len)
@@ -57,18 +59,38 @@ class PushTNPZSequenceDataset(Dataset):
         self.frame_stride = int(frame_stride)
         self.raw_seq_len = (self.seq_len - 1) * self.frame_stride + self.action_chunk_size
         self.image_hw = None if image_hw is None else (int(image_hw[0]), int(image_hw[1]))
+        self.action_mode = str(action_mode)
+        self.swm_action_scale = float(swm_action_scale)
 
         with np.load(self.npz_path, allow_pickle=True) as data:
             image_key = self._resolve_first_key(data, ("images", "pixels", "observations", "obs"))
             action_key = self._resolve_first_key(data, ("actions", "action"))
             self.images = np.asarray(data[image_key])
             self.actions = np.asarray(data[action_key], dtype=np.float32)
+            state_key = self._resolve_first_key(data, ("states", "state"))
+            self.states = np.asarray(data[state_key], dtype=np.float32)
             self.episode_starts, self.episode_ends = self._resolve_episode_bounds(data, num_samples=len(self.actions))
 
         if len(self.images) != len(self.actions):
             raise ValueError(
                 f"Image/action length mismatch in {self.npz_path}: images={len(self.images)} actions={len(self.actions)}"
             )
+        if len(self.states) != len(self.actions):
+            raise ValueError(
+                f"State/action length mismatch in {self.npz_path}: states={len(self.states)} actions={len(self.actions)}"
+            )
+        if self.action_mode == "swm_relative":
+            if self.states.shape[-1] < 2:
+                raise ValueError(
+                    f"SWM-relative conversion requires states with agent x/y, got shape {tuple(self.states.shape)}"
+                )
+            if self.swm_action_scale <= 0:
+                raise ValueError("swm_action_scale must be positive")
+            self.actions = np.clip(
+                (self.actions - self.states[:, :2]) / self.swm_action_scale,
+                -1.0,
+                1.0,
+            ).astype(np.float32, copy=False)
 
         self.valid_start_indices: list[int] = []
         for episode_start, episode_end in zip(self.episode_starts, self.episode_ends):
@@ -260,6 +282,8 @@ def _prepare_cached_dataset(
             action_chunk_size=args.action_chunk_size,
             frame_stride=args.frame_stride,
             image_hw=(int(tokenizer_info["H"]), int(tokenizer_info["W"])),
+            action_mode=str(args.action_mode),
+            swm_action_scale=float(args.swm_action_scale),
         )
     else:
         full_dataset = PushTSequenceDataset(
@@ -470,7 +494,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebuild_latent_cache", action="store_true")
     parser.add_argument("--normalize_actions", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--action_scale", type=float, default=1.0)
-    parser.add_argument("--action_mode", type=str, default="auto", choices=["auto", "relative", "absolute"])
+    parser.add_argument("--swm_action_scale", type=float, default=100.0)
+    parser.add_argument(
+        "--action_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "relative", "absolute", "swm_relative"],
+    )
     parser.add_argument("--ckpt_dir", type=str, default="local_models/behavior_cloning/tokenizer_latent_bc")
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument("--wandb_project", type=str, default="pusht-tokenizer-latent-bc")

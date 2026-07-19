@@ -414,7 +414,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
         render_mode="rgb_array",
         image_height=int(tokenizer_info["H"]),
         image_width=int(tokenizer_info["W"]),
-        relative=(str(ckpt_args.get("action_mode", "relative")) == "relative"),
+        relative=(str(ckpt_args.get("action_mode", "relative")) in {"relative", "swm_relative"}),
         sync_goal_pose=True,
         align_sampled_goal_to_fixed_target=True,
         fixed_target_pose=tuple(args.fixed_target_pose),
