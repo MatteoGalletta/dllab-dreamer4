@@ -80,7 +80,7 @@ def extract_checkpoint_state_dict(payload):
             first_value = next(iter(payload.values()))
             if torch.is_tensor(first_value):
                 return payload
-        for key in ("state_dict", "model_state_dict", "network", "model", "actor"):
+        for key in ("state_dict", "model_state_dict", "network", "model", "actor", "agent"):
             nested = payload.get(key)
             if isinstance(nested, dict):
                 state_dict = extract_checkpoint_state_dict(nested)
@@ -565,7 +565,10 @@ def render_agent_to_video():
         ).to(device)
 
     if args.source != "bc_prior":
-        state_dict = load_state_dict_safe(model_path, device)
+        payload = load_state_dict_safe(model_path, device)
+        state_dict = extract_checkpoint_state_dict(payload)
+        if state_dict is None:
+            raise ValueError(f"Unsupported PPO checkpoint format in {model_path}")
         network.load_state_dict(state_dict)
         print(f"Loaded PPO checkpoint from {model_path}.")
     network.eval()

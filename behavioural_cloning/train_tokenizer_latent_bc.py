@@ -6,6 +6,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
+import random
 
 import numpy as np
 import torch
@@ -232,6 +233,7 @@ def _evaluate_validation_scaled(
     device: torch.device,
     normalize_actions: bool,
     action_scale: float,
+    max_batches: int = 0,
 ) -> dict[str, float]:
     if loader is None:
         return {}
@@ -242,7 +244,9 @@ def _evaluate_validation_scaled(
     mae_sum = 0.0
     num_batches = 0
     with torch.no_grad():
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader):
+            if max_batches > 0 and batch_idx >= max_batches:
+                break
             features = batch["features"].to(device, non_blocking=True).to(torch.float32)
             target_actions = batch["action"].to(device, non_blocking=True).to(torch.float32)
             target_actions = _action_scale_for_training(
@@ -263,6 +267,50 @@ def _evaluate_validation_scaled(
         "validation/mae": mae_sum / num_batches,
         "validation/num_batches": float(num_batches),
     }
+
+
+def _seed_dataloader_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def _stats_sidecar_path(checkpoint_path: Path) -> Path:
+    if checkpoint_path.suffix:
+        return checkpoint_path.with_name(f"{checkpoint_path.stem}_stats.pth")
+    return Path(f"{checkpoint_path}_stats.pth")
+
+
+def _build_bc_stats(
+    args: argparse.Namespace,
+    *,
+    dataset: Dataset,
+    latent_dim: int,
+    tokenizer_path: str,
+    train_size: int,
+    val_size: int,
+) -> dict[str, object]:
+    stats = {
+        "frame_stack": int(args.seq_len),
+        "frame_stride": int(args.frame_stride),
+        "action_chunk_size": int(args.action_chunk_size),
+        "latent_dim": int(latent_dim),
+        "hidden_dim": int(args.hidden_dim),
+        "action_dim": 2,
+        "action_mode": str(args.action_mode),
+        "normalize_actions": bool(args.normalize_actions),
+        "action_scale": float(args.action_scale),
+        "swm_action_scale": float(args.swm_action_scale),
+        "dataset": str(args.dataset),
+        "dataset_windows": int(len(dataset)),
+        "train_windows": int(train_size),
+        "val_windows": int(val_size),
+        "tokenizer_ckpt_name": str(tokenizer_path),
+    }
+    underlying = getattr(dataset, "dataset", None)
+    if underlying is not None:
+        stats["source_dataset_type"] = type(underlying).__name__
+    return stats
 
 
 def _prepare_cached_dataset(
@@ -339,6 +387,8 @@ def train(args: argparse.Namespace):
 
     train_dataset = Subset(dataset, train_indices)
     val_dataset = Subset(dataset, val_indices) if val_indices else None
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(int(args.seed))
     loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -346,6 +396,8 @@ def train(args: argparse.Namespace):
         num_workers=args.num_workers,
         pin_memory=(device.type in {"cuda", "xpu"}),
         drop_last=True,
+        worker_init_fn=_seed_dataloader_worker,
+        generator=loader_generator,
     )
     val_loader = None
     if val_dataset is not None:
@@ -356,6 +408,7 @@ def train(args: argparse.Namespace):
             num_workers=args.num_workers,
             pin_memory=(device.type in {"cuda", "xpu"}),
             drop_last=False,
+            worker_init_fn=_seed_dataloader_worker,
         )
 
     model = TokenizerLatentBCPolicy(
@@ -374,12 +427,23 @@ def train(args: argparse.Namespace):
             f"| latent_dim={latent_dim} frame_stack={args.seq_len} stride={args.frame_stride} "
             f"chunk={args.action_chunk_size} action_mode={args.action_mode}"
         )
+        bc_stats = _build_bc_stats(
+            args,
+            dataset=dataset,
+            latent_dim=latent_dim,
+            tokenizer_path=tokenizer_path,
+            train_size=len(train_dataset),
+            val_size=0 if val_dataset is None else len(val_dataset),
+        )
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(bc_stats, _stats_sidecar_path(ckpt_dir / "best.pt"))
+        torch.save(bc_stats, _stats_sidecar_path(ckpt_dir / "latest.pt"))
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
             entity=args.wandb_entity,
             mode=get_wandb_mode(args),
-            config=vars(args),
+            config={**vars(args), **bc_stats},
         )
 
     ckpt_dir = Path(args.ckpt_dir)
@@ -427,6 +491,7 @@ def train(args: argparse.Namespace):
                 device=device,
                 normalize_actions=bool(args.normalize_actions),
                 action_scale=float(args.action_scale),
+                max_batches=int(args.val_max_batches),
             )
             metrics.update(val_metrics)
             val_loss = float(val_metrics.get("validation/loss", avg_loss))
@@ -441,6 +506,8 @@ def train(args: argparse.Namespace):
                     scaler=None,
                     args=args,
                 )
+                if is_rank0():
+                    torch.save(bc_stats, _stats_sidecar_path(ckpt_dir / "best.pt"))
 
         if is_rank0():
             wandb.log(metrics, step=epoch + 1)
@@ -470,6 +537,8 @@ def train(args: argparse.Namespace):
         scaler=None,
         args=args,
     )
+    if is_rank0():
+        torch.save(bc_stats, _stats_sidecar_path(ckpt_dir / "latest.pt"))
 
 
 def parse_args() -> argparse.Namespace:

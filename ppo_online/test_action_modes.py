@@ -80,7 +80,11 @@ def run_single_mode(config: TrainConfig, args, mode: str, model_path: str, devic
     if args.source == "bc_prior":
         load_bc_prior_into_network(network, model_path, device, config.network_type)
     else:
-        network.load_state_dict(load_state_dict_safe(model_path, device))
+        payload = load_state_dict_safe(model_path, device)
+        state_dict = extract_checkpoint_state_dict(payload)
+        if state_dict is None:
+            raise ValueError(f"Unsupported PPO checkpoint format in {model_path}")
+        network.load_state_dict(state_dict)
 
     network.eval()
     state, _ = env.reset()

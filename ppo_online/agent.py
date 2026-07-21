@@ -76,6 +76,17 @@ def _load_bc_prior_payload(prior_path: Path, device: torch.device) -> Any:
         return torch.load(prior_path, map_location=device)
 
 
+def _infer_prior_format(state_dict: dict[str, torch.Tensor]) -> str:
+    keys = list(state_dict.keys())
+    if any(key.startswith("classifier.") for key in keys) or any(key.startswith("backbone.") for key in keys):
+        return "backbone_classifier"
+    if any(key.startswith("net.") for key in keys):
+        return "latent_mlp"
+    if any(key.startswith("actor.") for key in keys):
+        return "actor_critic"
+    return "unknown"
+
+
 def _infer_bc_latent_architecture(
     bc_prior_path: str | None,
     *,
@@ -145,6 +156,8 @@ class PPOAgent:
         bc_prior_path: str | None = None,
         prior_loss_coef: float = 0.0,
         prior_loss_decay: float = 1.0,
+        bc_kl_penalty: bool = False,
+        bc_kl_penalty_coef: float = 0.0,
         prior_log_std_init: float | None = None,
         device: torch.device | str = "cpu",
         network_type: str = "mlp",
@@ -204,6 +217,8 @@ class PPOAgent:
         self.target_kl = target_kl
         self.base_prior_loss_coef = prior_loss_coef
         self.prior_loss_decay = prior_loss_decay
+        self.bc_kl_penalty = bool(bc_kl_penalty)
+        self.bc_kl_penalty_coef = float(bc_kl_penalty_coef)
 
         self._prior_network: nn.Module | None = None
         self.network_type = network_type
@@ -263,6 +278,10 @@ class PPOAgent:
     def current_prior_loss_coef(self, update_idx: int) -> float:
         return self.base_prior_loss_coef * (self.prior_loss_decay ** max(update_idx, 0))
 
+    @torch.no_grad()
+    def set_log_std(self, value: float) -> None:
+        self.network.log_std.data.fill_(float(value))
+
     def load_bc_prior(
         self,
         bc_prior_path: str,
@@ -286,6 +305,7 @@ class PPOAgent:
 
         checkpoint_args = _extract_checkpoint_args(payload)
         state_dict = _normalize_prior_keys(state_dict)
+        prior_format = _infer_prior_format(state_dict)
         if self.network_type == "bc_pixels":
             load_target = {
                 key: value
@@ -294,17 +314,39 @@ class PPOAgent:
             }
             if not load_target:
                 return PriorLoadInfo(False, "BC prior does not contain backbone/classifier weights for bc_pixels PPO.")
-            incompatible = self.network.load_state_dict(load_target, strict=False)
+            try:
+                incompatible = self.network.load_state_dict(load_target, strict=False)
+            except RuntimeError as error:
+                return PriorLoadInfo(
+                    False,
+                    f"BC prior at {prior_path} is incompatible with bc_pixels PPO ({prior_format}): {error}",
+                )
         elif self.network_type == "bc_latent":
             policy_state = state_dict
             if any(key.startswith("classifier.") for key in state_dict):
                 policy_state = _strip_prefix(state_dict, "classifier.")
-            incompatible = self.network.bc_policy.load_state_dict(policy_state, strict=False)
+            try:
+                incompatible = self.network.bc_policy.load_state_dict(policy_state, strict=False)
+            except RuntimeError as error:
+                return PriorLoadInfo(
+                    False,
+                    "BC prior at "
+                    f"{prior_path} is incompatible with tokenizer latent PPO "
+                    f"({prior_format}). This usually means the checkpoint comes from the older "
+                    "CNN/backbone BC pipeline rather than the newer latent-MLP policy. "
+                    f"Original error: {error}"
+                )
         else:
             actor_only = {k: v for k, v in state_dict.items() if k.startswith("actor.") or k == "log_std"}
             if not actor_only:
                 actor_only = state_dict
-            incompatible = self.network.load_state_dict(actor_only, strict=False)
+            try:
+                incompatible = self.network.load_state_dict(actor_only, strict=False)
+            except RuntimeError as error:
+                return PriorLoadInfo(
+                    False,
+                    f"BC prior at {prior_path} is incompatible with PPO actor loading ({prior_format}): {error}",
+                )
 
         if self.network_type == "bc_pixels":
             prior_network = BCPixelActorCritic(
@@ -366,6 +408,7 @@ class PPOAgent:
         batch_size: int,
         ppo_epochs: int,
         update_idx: int = 0,
+        clip_vloss: bool = True,
     ) -> dict[str, float]:
         states = self._to_tensor(self._get_buffer_attr(buffer, ("states", "observations", "obs")))
         actions = self._to_tensor(self._get_buffer_attr(buffer, ("actions", "acts")))
@@ -374,6 +417,7 @@ class PPOAgent:
         b_states = self._flatten_states(states)
         b_actions = self._flatten_actions(actions)
         b_old_logprobs = self._flatten_logprobs(old_logprobs)
+        old_values = self._to_tensor(self._get_buffer_attr(buffer, ("values", "vals"))).reshape(-1)
 
         b_advantages = self._to_tensor(advantages).reshape(-1)
         b_returns = self._to_tensor(returns).reshape(-1)
@@ -390,6 +434,7 @@ class PPOAgent:
         approx_kl_value = 0.0
         clipfrac_value = 0.0
         prior_loss_value = 0.0
+        bc_kl_loss_value = 0.0
         num_minibatches = 0
 
         for _ in range(ppo_epochs):
@@ -412,7 +457,17 @@ class PPOAgent:
                 pg_loss_clipped = -mb_advantages * torch.clamp(ratio, 1.0 - self.clip_coef, 1.0 + self.clip_coef)
                 pg_loss = torch.max(pg_loss_unclipped, pg_loss_clipped).mean()
 
-                v_loss = 0.5 * ((new_values - b_returns[mb_inds]).pow(2)).mean()
+                if clip_vloss:
+                    value_target = b_returns[mb_inds]
+                    old_value_batch = old_values[mb_inds]
+                    v_loss_unclipped = (new_values - value_target).pow(2)
+                    v_clipped = old_value_batch + torch.clamp(
+                        new_values - old_value_batch, -self.clip_coef, self.clip_coef
+                    )
+                    v_loss_clipped = (v_clipped - value_target).pow(2)
+                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                else:
+                    v_loss = 0.5 * ((new_values - b_returns[mb_inds]).pow(2)).mean()
                 entropy_loss = entropy.mean()
 
                 prior_loss = torch.zeros((), device=self.device)
@@ -422,7 +477,20 @@ class PPOAgent:
                     policy_mean = self.network.actor_mean(b_states[mb_inds])
                     prior_loss = torch.mean((policy_mean - prior_mean).pow(2))
 
-                loss = pg_loss + self.vf_coef * v_loss - self.ent_coef * entropy_loss + prior_loss_coef * prior_loss
+                bc_kl_loss = torch.zeros((), device=self.device)
+                if self._prior_network is not None and self.bc_kl_penalty and self.bc_kl_penalty_coef > 0.0:
+                    with torch.no_grad():
+                        bc_action_mean = self._prior_network.actor_mean(b_states[mb_inds])
+                    current_action_mean = self.network.actor_mean(b_states[mb_inds])
+                    bc_kl_loss = torch.mean((current_action_mean - bc_action_mean).pow(2))
+
+                loss = (
+                    pg_loss
+                    + self.vf_coef * v_loss
+                    - self.ent_coef * entropy_loss
+                    + prior_loss_coef * prior_loss
+                    + self.bc_kl_penalty_coef * bc_kl_loss
+                )
 
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -439,6 +507,7 @@ class PPOAgent:
                 approx_kl_value += float(approx_kl.detach().cpu())
                 clipfrac_value += float(clipfrac.detach().cpu())
                 prior_loss_value += float(prior_loss.detach().cpu())
+                bc_kl_loss_value += float(bc_kl_loss.detach().cpu())
                 num_minibatches += 1
 
             if self.target_kl is not None:
@@ -454,5 +523,7 @@ class PPOAgent:
             "approx_kl": approx_kl_value / denom,
             "clipfrac": clipfrac_value / denom,
             "prior_loss": prior_loss_value / denom,
+            "bc_kl_loss": bc_kl_loss_value / denom,
             "prior_loss_coef": prior_loss_coef,
+            "bc_kl_penalty_coef": self.bc_kl_penalty_coef,
         }

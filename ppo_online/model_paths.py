@@ -65,9 +65,11 @@ def resolve_tokenizer_path(path: str | None = None) -> str:
 
 
 def resolve_ppo_checkpoint_path(path: str | None = None) -> str:
-    resolved = _resolve_explicit_or_directory_candidate(path, PPO_MODEL_DIR)
-    if resolved is not None:
-        return resolved
+    if path:
+        explicit = Path(path)
+        if explicit.is_absolute():
+            return str(explicit)
+        return str(PROJECT_ROOT / explicit)
 
     candidates = [
         PPO_MODEL_DIR / "latest.pth",
