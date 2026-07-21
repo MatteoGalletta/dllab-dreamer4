@@ -410,7 +410,7 @@ class TrainConfig:
     ensemble_decay: float = 0.35
     actor_output_tanh: bool = True
     init_log_std: float = -1.0
-    obs_stack_size: int = 8
+    obs_stack_size: int = 3
     network_type: str = "bc_latent"
     actor_hidden_dim: int = 512
     actor_dropout: float = 0.05

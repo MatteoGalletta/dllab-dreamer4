@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
+from behavioural_cloning.train_tokenizer_latent_bc import TokenizerLatentBCPolicy
 from .tokenizer_utils import load_tokenizer_from_ckpt
 
 
@@ -441,3 +442,84 @@ class BCStyleLatentActorCritic(nn.Module):
 
     def get_value(self, state_vector: torch.Tensor) -> torch.Tensor:
         return self.critic(self._last_features(state_vector))
+
+
+class TokenizerLatentBCPPOActorCritic(nn.Module):
+    """
+    Latent PPO actor-critic that stays close to the other group's setup:
+    the actor mean is exactly the tokenizer latent BC policy, while PPO learns
+    a state-independent Gaussian log-std and a separate critic over the full
+    stacked latent history.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int,
+        frame_stack: int,
+        action_dim: int,
+        action_chunk_size: int,
+        hidden_dim: int = 512,
+        init_log_std: float = -1.0,
+    ):
+        super().__init__()
+        self.feature_dim = int(feature_dim)
+        self.frame_stack = int(frame_stack)
+        self.action_dim = int(action_dim)
+        self.action_chunk_size = int(action_chunk_size)
+        if self.action_chunk_size < 1:
+            raise ValueError("action_chunk_size must be at least 1")
+        if self.action_dim % self.action_chunk_size != 0:
+            raise ValueError(
+                f"Flat action_dim={self.action_dim} must be divisible by action_chunk_size={self.action_chunk_size}"
+            )
+        self.primitive_action_dim = int(self.action_dim // self.action_chunk_size)
+
+        self.bc_policy = TokenizerLatentBCPolicy(
+            latent_dim=self.feature_dim,
+            frame_stack=self.frame_stack,
+            action_dim=self.primitive_action_dim,
+            hidden_dim=int(hidden_dim),
+            action_chunk_size=self.action_chunk_size,
+        )
+        self.log_std = nn.Parameter(torch.full((1, self.action_dim), float(init_log_std)))
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(self.feature_dim * self.frame_stack, int(hidden_dim))),
+            nn.ReLU(),
+            layer_init(nn.Linear(int(hidden_dim), int(hidden_dim))),
+            nn.ReLU(),
+            layer_init(nn.Linear(int(hidden_dim), 1), std=1.0),
+        )
+
+    def _ensure_sequence(self, state_vector: torch.Tensor) -> torch.Tensor:
+        if state_vector.ndim == 2:
+            state_vector = state_vector.unsqueeze(1)
+        if state_vector.ndim != 3:
+            raise ValueError(f"Expected state shape (B, D) or (B, T, D), got {tuple(state_vector.shape)}")
+        if state_vector.shape[1] != self.frame_stack:
+            raise ValueError(f"Expected frame_stack={self.frame_stack}, got {state_vector.shape[1]}")
+        if state_vector.shape[2] != self.feature_dim:
+            raise ValueError(f"Expected feature_dim={self.feature_dim}, got {state_vector.shape[2]}")
+        return state_vector
+
+    def actor_mean(self, state_vector: torch.Tensor) -> torch.Tensor:
+        sequence = self._ensure_sequence(state_vector)
+        return self.bc_policy(sequence)
+
+    def action_dist(self, state_vector: torch.Tensor) -> Normal:
+        mean = self.actor_mean(state_vector)
+        std = self.log_std.exp().expand_as(mean)
+        return Normal(mean, std)
+
+    def get_action_and_value(self, state_vector: torch.Tensor, action: torch.Tensor | None = None):
+        distribution = self.action_dist(state_vector)
+        if action is None:
+            action = distribution.sample()
+        value = self.get_value(state_vector)
+        log_prob = distribution.log_prob(action).sum(dim=-1)
+        entropy = distribution.entropy().sum(dim=-1)
+        return action, log_prob, entropy, value
+
+    def get_value(self, state_vector: torch.Tensor) -> torch.Tensor:
+        sequence = self._ensure_sequence(state_vector)
+        flat = sequence.reshape(sequence.shape[0], -1)
+        return self.critic(flat)

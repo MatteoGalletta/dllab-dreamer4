@@ -23,7 +23,7 @@ from gymnasium.wrappers import FrameStackObservation
 
 from ppo_online.env_config import make_pusht_env, resolve_pusht_env_id
 from ppo_online.model_paths import resolve_bc_prior_path, resolve_ppo_checkpoint_path, resolve_tokenizer_path
-from ppo_online.networks import BCPixelActorCritic, BCStyleLatentActorCritic, VectorActorCritic
+from ppo_online.networks import BCPixelActorCritic, TokenizerLatentBCPPOActorCritic, VectorActorCritic
 from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
 from ppo_online.train import (
     ActionChunkingTemporalEnsembleWrapper,
@@ -116,14 +116,16 @@ def load_bc_prior_into_network(network: torch.nn.Module, path: str, device: torc
         cleaned[clean_key] = value
 
     if network_type == "bc_latent":
-        classifier_state = {
-            key[len("classifier.") :]: value
-            for key, value in cleaned.items()
-            if key.startswith("classifier.")
-        }
-        if not classifier_state:
-            raise ValueError(f"No classifier weights found in BC prior {path}")
-        incompatible = network.classifier.load_state_dict(classifier_state, strict=False)
+        policy_state = cleaned
+        if any(key.startswith("classifier.") for key in cleaned):
+            policy_state = {
+                key[len("classifier.") :]: value
+                for key, value in cleaned.items()
+                if key.startswith("classifier.")
+            }
+        if not policy_state:
+            raise ValueError(f"No latent BC policy weights found in BC prior {path}")
+        incompatible = network.bc_policy.load_state_dict(policy_state, strict=False)
     elif network_type == "bc_pixels":
         actor_state = {
             key: value
@@ -547,16 +549,13 @@ def render_agent_to_video():
             temporal_context=temporal_context,
         ).to(device)
     elif config.network_type == "bc_latent":
-        network = BCStyleLatentActorCritic(
+        network = TokenizerLatentBCPPOActorCritic(
             feature_dim=state_dim,
+            frame_stack=obs_shape[0] if len(obs_shape) >= 1 else 1,
             action_dim=action_dim,
+            action_chunk_size=config.chunk_size,
             hidden_dim=config.actor_hidden_dim,
-            dropout=config.actor_dropout,
-            policy_style=policy_style,
-            temporal_layers=temporal_layers,
-            temporal_heads=temporal_heads,
-            max_seq_len=obs_shape[0] if len(obs_shape) >= 1 else 64,
-            temporal_context=temporal_context,
+            init_log_std=config.init_log_std,
         ).to(device)
     else:
         network = VectorActorCritic(

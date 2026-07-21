@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from ppo_online.model_paths import resolve_bc_prior_path, resolve_ppo_checkpoint_path, resolve_tokenizer_path
-from ppo_online.networks import BCPixelActorCritic, BCStyleLatentActorCritic, VectorActorCritic
+from ppo_online.networks import BCPixelActorCritic, TokenizerLatentBCPPOActorCritic, VectorActorCritic
 from ppo_online.render import load_bc_prior_into_network, load_state_dict_safe, make_render_env
 from ppo_online.train import TrainConfig, resolve_device
 
@@ -40,11 +40,13 @@ def build_network(config: TrainConfig, obs_shape: tuple[int, ...], action_dim: i
             dropout=config.actor_dropout,
         ).to(device)
     if config.network_type == "bc_latent":
-        return BCStyleLatentActorCritic(
+        return TokenizerLatentBCPPOActorCritic(
             feature_dim=state_dim,
+            frame_stack=obs_shape[0] if len(obs_shape) >= 1 else 1,
             action_dim=action_dim,
+            action_chunk_size=config.chunk_size,
             hidden_dim=config.actor_hidden_dim,
-            dropout=config.actor_dropout,
+            init_log_std=config.init_log_std,
         ).to(device)
     return VectorActorCritic(
         state_dim=state_dim,

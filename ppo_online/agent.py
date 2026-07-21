@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .networks import BCPixelActorCritic, BCStyleLatentActorCritic, VectorActorCritic
+from .networks import BCPixelActorCritic, BCStyleLatentActorCritic, TokenizerLatentBCPPOActorCritic, VectorActorCritic
 
 
 @dataclass
@@ -57,6 +57,79 @@ def _strip_prefix(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str,
     return {key[len(prefix):]: value for key, value in state_dict.items() if key.startswith(prefix)}
 
 
+def _extract_checkpoint_args(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    args = payload.get("args", {}) or {}
+    if isinstance(args, dict):
+        return args
+    try:
+        return vars(args)
+    except TypeError:
+        return {}
+
+
+def _load_bc_prior_payload(prior_path: Path, device: torch.device) -> Any:
+    try:
+        return torch.load(prior_path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(prior_path, map_location=device)
+
+
+def _infer_bc_latent_architecture(
+    bc_prior_path: str | None,
+    *,
+    obs_shape: tuple[int, ...] | None,
+    state_dim: int,
+    action_dim: int,
+    actor_hidden_dim: int,
+) -> dict[str, int]:
+    frame_stack = obs_shape[0] if obs_shape is not None and len(obs_shape) >= 1 else 1
+    action_chunk_size = max(1, action_dim // 2)
+    hidden_dim = int(actor_hidden_dim)
+    source = "ppo_defaults"
+
+    if bc_prior_path is not None:
+        prior_path = Path(bc_prior_path)
+        if prior_path.exists():
+            try:
+                payload = _load_bc_prior_payload(prior_path, torch.device("cpu"))
+                checkpoint_args = _extract_checkpoint_args(payload)
+            except Exception:
+                checkpoint_args = {}
+            if checkpoint_args.get("seq_len") is not None:
+                frame_stack = int(checkpoint_args["seq_len"])
+                source = "bc_prior_args"
+            if checkpoint_args.get("action_chunk_size") is not None:
+                action_chunk_size = int(checkpoint_args["action_chunk_size"])
+                source = "bc_prior_args"
+            if checkpoint_args.get("hidden_dim") is not None:
+                hidden_dim = int(checkpoint_args["hidden_dim"])
+                source = "bc_prior_args"
+
+    if action_chunk_size < 1:
+        raise ValueError("action_chunk_size must be at least 1")
+    if action_dim != action_chunk_size * 2:
+        raise ValueError(
+            f"PushT bc_latent PPO expects flattened action_dim=2*chunk_size, got action_dim={action_dim} "
+            f"and action_chunk_size={action_chunk_size}"
+        )
+    if obs_shape is not None and len(obs_shape) >= 1 and frame_stack != int(obs_shape[0]):
+        raise ValueError(
+            f"BC prior expects frame_stack={frame_stack}, but PPO env emits obs_stack={obs_shape[0]}. "
+            "Match PPO obs_stack_size/chunk config to the BC prior before training."
+        )
+
+    return {
+        "feature_dim": int(state_dim),
+        "frame_stack": int(frame_stack),
+        "action_dim": int(action_dim),
+        "action_chunk_size": int(action_chunk_size),
+        "hidden_dim": int(hidden_dim),
+        "source": source,
+    }
+
+
 class PPOAgent:
     def __init__(
         self,
@@ -85,6 +158,7 @@ class PPOAgent:
         self.obs_shape = obs_shape
         self.tokenizer_path = tokenizer_path
         self.backbone_device = torch.device(backbone_device)
+        self.bc_latent_architecture: dict[str, Any] | None = None
         if network_type == "bc_pixels":
             if obs_shape is None:
                 raise ValueError("obs_shape is required for bc_pixels PPO.")
@@ -95,12 +169,20 @@ class PPOAgent:
                 dropout=actor_dropout,
             ).to(self.device_override)
         elif network_type == "bc_latent":
-            self.network = BCStyleLatentActorCritic(
-                feature_dim=state_dim,
+            self.bc_latent_architecture = _infer_bc_latent_architecture(
+                bc_prior_path,
+                obs_shape=obs_shape,
+                state_dim=state_dim,
                 action_dim=action_dim,
-                hidden_dim=actor_hidden_dim,
-                dropout=actor_dropout,
-                max_seq_len=obs_shape[0] if obs_shape is not None and len(obs_shape) >= 1 else 64,
+                actor_hidden_dim=actor_hidden_dim,
+            )
+            self.network = TokenizerLatentBCPPOActorCritic(
+                feature_dim=self.bc_latent_architecture["feature_dim"],
+                frame_stack=self.bc_latent_architecture["frame_stack"],
+                action_dim=self.bc_latent_architecture["action_dim"],
+                action_chunk_size=self.bc_latent_architecture["action_chunk_size"],
+                hidden_dim=self.bc_latent_architecture["hidden_dim"],
+                init_log_std=prior_log_std_init if prior_log_std_init is not None else -1.0,
             ).to(self.device_override)
         else:
             self.network = VectorActorCritic(
@@ -194,9 +276,7 @@ class PPOAgent:
             return PriorLoadInfo(False, f"BC prior not found at {prior_path}.")
 
         try:
-            payload = torch.load(prior_path, map_location=self.device, weights_only=True)
-        except TypeError:
-            payload = torch.load(prior_path, map_location=self.device)
+            payload = _load_bc_prior_payload(prior_path, self.device)
         except Exception as error:
             return PriorLoadInfo(False, f"Failed to load BC prior: {error}")
 
@@ -204,7 +284,7 @@ class PPOAgent:
         if state_dict is None:
             return PriorLoadInfo(False, "BC prior format is unsupported.")
 
-        checkpoint_args = payload.get("args", {}) if isinstance(payload, dict) else {}
+        checkpoint_args = _extract_checkpoint_args(payload)
         state_dict = _normalize_prior_keys(state_dict)
         if self.network_type == "bc_pixels":
             load_target = {
@@ -216,10 +296,10 @@ class PPOAgent:
                 return PriorLoadInfo(False, "BC prior does not contain backbone/classifier weights for bc_pixels PPO.")
             incompatible = self.network.load_state_dict(load_target, strict=False)
         elif self.network_type == "bc_latent":
-            classifier_state = _strip_prefix(state_dict, "classifier.")
-            if not classifier_state:
-                return PriorLoadInfo(False, "BC prior does not contain classifier weights compatible with bc_latent PPO.")
-            incompatible = self.network.classifier.load_state_dict(classifier_state, strict=False)
+            policy_state = state_dict
+            if any(key.startswith("classifier.") for key in state_dict):
+                policy_state = _strip_prefix(state_dict, "classifier.")
+            incompatible = self.network.bc_policy.load_state_dict(policy_state, strict=False)
         else:
             actor_only = {k: v for k, v in state_dict.items() if k.startswith("actor.") or k == "log_std"}
             if not actor_only:
@@ -234,12 +314,13 @@ class PPOAgent:
                 dropout=0.0,
             ).to(self.device)
         elif self.network_type == "bc_latent":
-            prior_network = BCStyleLatentActorCritic(
-                feature_dim=state_dim,
-                action_dim=action_dim,
-                hidden_dim=getattr(self.network, "hidden_dim", 512),
-                dropout=0.0,
-                max_seq_len=self.obs_shape[0] if self.obs_shape is not None and len(self.obs_shape) >= 1 else 64,
+            prior_network = TokenizerLatentBCPPOActorCritic(
+                feature_dim=int(self.network.feature_dim),
+                frame_stack=int(self.network.frame_stack),
+                action_dim=int(self.network.action_dim),
+                action_chunk_size=int(self.network.action_chunk_size),
+                hidden_dim=int(self.network.bc_policy.net[0].out_features),
+                init_log_std=prior_log_std_init if prior_log_std_init is not None else -1.0,
             ).to(self.device)
         else:
             prior_network = VectorActorCritic(
@@ -267,6 +348,14 @@ class PPOAgent:
             parts.append(f"Missing keys: {missing[:6]}")
         if unexpected:
             parts.append(f"Unexpected keys: {unexpected[:6]}")
+        if self.network_type == "bc_latent" and self.bc_latent_architecture is not None:
+            parts.append(
+                "bc_latent_architecture="
+                f"(frame_stack={self.bc_latent_architecture['frame_stack']}, "
+                f"chunk={self.bc_latent_architecture['action_chunk_size']}, "
+                f"hidden={self.bc_latent_architecture['hidden_dim']}, "
+                f"source={self.bc_latent_architecture['source']})"
+            )
         return PriorLoadInfo(True, " ".join(parts))
 
     def update(
