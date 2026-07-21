@@ -7,6 +7,7 @@ import math
 import os
 from collections import deque
 from pathlib import Path
+import pickle
 import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -72,6 +73,10 @@ def load_state_dict_safe(path: str, device: torch.device):
         return torch.load(path, map_location=device, weights_only=True)
     except TypeError:
         return torch.load(path, map_location=device)
+    except pickle.UnpicklingError:
+        # Local PPO checkpoints may contain numpy scalars or config payloads
+        # that are rejected by PyTorch's strict weights_only loader.
+        return torch.load(path, map_location=device, weights_only=False)
 
 
 def extract_checkpoint_state_dict(payload):
