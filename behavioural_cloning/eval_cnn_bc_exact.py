@@ -398,6 +398,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
     normalize_actions = bool(ckpt_args.get("normalize_actions", False))
     action_scale = float(ckpt_args.get("action_scale", 1.0))
     action_mode = str(ckpt_args.get("action_mode", "relative"))
+    swm_action_scale = float(ckpt_args.get("swm_action_scale", 100.0))
 
     image_hw = ckpt_args.get("image_hw")
     img_h, img_w = (int(image_hw[0]), int(image_hw[1])) if image_hw else (96, 96)
@@ -494,6 +495,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
                         / 255.0
                     )
                     pred = model(input_tensor).view(1, chunk_size, 2).squeeze(0).cpu().numpy()
+                    if action_mode == "swm_relative" and swm_action_scale != 100.0:
+                        pred = pred * (swm_action_scale / 100.0)
                     if normalize_actions:
                         pred = pred * action_scale
                     if args.temporal_ensemble:

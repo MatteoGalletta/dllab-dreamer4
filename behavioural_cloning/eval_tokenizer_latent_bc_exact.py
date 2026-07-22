@@ -495,6 +495,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
                     )
                     latent_stack = latent_backbone.extract_features(input_tensor)
                     pred = model(latent_stack).view(1, chunk_size, 2).squeeze(0).cpu().numpy()
+                    action_mode = str(ckpt_args.get("action_mode", "relative"))
+                    swm_action_scale = float(ckpt_args.get("swm_action_scale", 100.0))
+                    if action_mode == "swm_relative" and swm_action_scale != 100.0:
+                        pred = pred * (swm_action_scale / 100.0)
                     if normalize_actions:
                         pred = pred * action_scale
                     if args.temporal_ensemble:
