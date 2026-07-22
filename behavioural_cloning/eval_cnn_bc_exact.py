@@ -270,6 +270,29 @@ def _slug(value: str) -> str:
     return slug or "eval"
 
 
+def _infer_eval_image_hw(ckpt_args: dict) -> tuple[int, int]:
+    image_hw = ckpt_args.get("image_hw")
+    if image_hw is not None:
+        try:
+            if len(image_hw) == 2 and image_hw[0] is not None and image_hw[1] is not None:
+                return int(image_hw[0]), int(image_hw[1])
+        except TypeError:
+            pass
+
+    dataset_path = ckpt_args.get("dataset")
+    if dataset_path:
+        dataset_path = Path(str(dataset_path))
+        if dataset_path.suffix.lower() == ".npz" and dataset_path.exists():
+            with np.load(str(dataset_path), allow_pickle=True) as data:
+                for key in ("images", "pixels", "observations", "obs"):
+                    if key in data:
+                        sample_shape = tuple(np.asarray(data[key]).shape)
+                        if len(sample_shape) >= 4:
+                            return int(sample_shape[-3]), int(sample_shape[-2])
+                        break
+    return (96, 96)
+
+
 def create_run_directory(output_root: str, checkpoint: str, run_name: str | None = None) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     parts = [timestamp, "cnn_bc", _slug(Path(checkpoint).stem)]
@@ -400,8 +423,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
     action_mode = str(ckpt_args.get("action_mode", "relative"))
     swm_action_scale = float(ckpt_args.get("swm_action_scale", 100.0))
 
-    image_hw = ckpt_args.get("image_hw")
-    img_h, img_w = (int(image_hw[0]), int(image_hw[1])) if image_hw else (96, 96)
+    img_h, img_w = _infer_eval_image_hw(ckpt_args)
 
     action_dim = chunk_size * 2
     backbone = CNNBackbone(in_channels=3, feature_dim=cnn_feature_dim)
@@ -460,7 +482,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
         f"| seq_len={seq_len} frame_stride={frame_stride} chunk={chunk_size} "
         f"| image_hw=({img_h}, {img_w}) cnn_feature_dim={cnn_feature_dim} "
         f"| action_mode={action_mode} normalize_actions={normalize_actions} "
-        f"action_scale={action_scale} temporal_ensemble={args.temporal_ensemble} "
+        f"action_scale={action_scale} swm_action_scale={swm_action_scale} "
+        f"temporal_ensemble={args.temporal_ensemble} "
         f"| fixed_target_pose={tuple(float(x) for x in args.fixed_target_pose)} "
         f"| fixed_target_block_success={not bool(args.fixed_target_full_state_success)} "
         f"| block_start_radius={args.block_start_radius} | device={device}"

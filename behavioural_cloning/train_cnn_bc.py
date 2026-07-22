@@ -81,11 +81,23 @@ class PushTNPZSequenceDataset(Dataset):
                 )
             if self.swm_action_scale <= 0:
                 raise ValueError("swm_action_scale must be positive")
-            self.actions = np.clip(
-                (self.actions - self.states[:, :2]) / self.swm_action_scale,
-                -1.0,
-                1.0,
-            ).astype(np.float32, copy=False)
+            raw_relative = (self.actions - self.states[:, :2]) / self.swm_action_scale
+            abs_raw_relative = np.abs(raw_relative)
+            clipped = abs_raw_relative > 1.0
+            self.swm_clip_stats = {
+                "swm_clip_frac_any": float(clipped.any(axis=1).mean()),
+                "swm_clip_frac_x": float(clipped[:, 0].mean()),
+                "swm_clip_frac_y": float(clipped[:, 1].mean()),
+                "swm_abs_p50_x": float(np.quantile(abs_raw_relative[:, 0], 0.5)),
+                "swm_abs_p50_y": float(np.quantile(abs_raw_relative[:, 1], 0.5)),
+                "swm_abs_p90_x": float(np.quantile(abs_raw_relative[:, 0], 0.9)),
+                "swm_abs_p90_y": float(np.quantile(abs_raw_relative[:, 1], 0.9)),
+                "swm_abs_p99_x": float(np.quantile(abs_raw_relative[:, 0], 0.99)),
+                "swm_abs_p99_y": float(np.quantile(abs_raw_relative[:, 1], 0.99)),
+            }
+            self.actions = np.clip(raw_relative, -1.0, 1.0).astype(np.float32, copy=False)
+        else:
+            self.swm_clip_stats = None
 
         self.valid_start_indices: list[int] = []
         for episode_start, episode_end in zip(self.episode_starts, self.episode_ends):
@@ -351,7 +363,22 @@ def _build_bc_stats(
     underlying = getattr(dataset, "dataset", None)
     if underlying is not None:
         stats["source_dataset_type"] = type(underlying).__name__
+    swm_clip_stats = getattr(dataset, "swm_clip_stats", None)
+    if swm_clip_stats:
+        stats.update(swm_clip_stats)
     return stats
+
+
+def _infer_dataset_image_hw(dataset: Dataset) -> tuple[int, int] | None:
+    image_hw = getattr(dataset, "image_hw", None)
+    if image_hw is not None:
+        return int(image_hw[0]), int(image_hw[1])
+    images = getattr(dataset, "images", None)
+    if images is not None:
+        shape = tuple(np.asarray(images).shape)
+        if len(shape) >= 4:
+            return int(shape[-3]), int(shape[-2])
+    return None
 
 
 def _prepare_dataset(args: argparse.Namespace) -> Dataset:
@@ -383,6 +410,9 @@ def train(args: argparse.Namespace):
     print(f"Using device: {device}")
     args.action_mode = _resolve_action_mode(args)
     dataset = _prepare_dataset(args)
+    resolved_image_hw = _infer_dataset_image_hw(dataset)
+    if resolved_image_hw is not None and getattr(args, "image_hw", None) is None:
+        args.image_hw = tuple(int(x) for x in resolved_image_hw)
     train_indices, val_indices = split_indices(len(dataset), args.val_frac, args.seed)
     train_indices = maybe_truncate_indices(train_indices, int(args.max_train_samples), seed=args.seed)
     val_indices = maybe_truncate_indices(val_indices, int(args.max_val_samples), seed=args.seed + 1)
@@ -432,7 +462,8 @@ def train(args: argparse.Namespace):
             f"CNN BC: dataset={args.dataset} "
             f"| windows total={len(dataset)} train={len(train_dataset)} val={0 if val_dataset is None else len(val_dataset)} "
             f"| cnn_feature_dim={args.cnn_feature_dim} frame_stack={args.seq_len} stride={args.frame_stride} "
-            f"chunk={args.action_chunk_size} action_mode={args.action_mode}"
+            f"chunk={args.action_chunk_size} action_mode={args.action_mode} "
+            f"| image_hw={args.image_hw}"
         )
         bc_stats = _build_bc_stats(
             args,
@@ -441,6 +472,20 @@ def train(args: argparse.Namespace):
             train_size=len(train_dataset),
             val_size=0 if val_dataset is None else len(val_dataset),
         )
+        clip_frac_any = float(bc_stats.get("swm_clip_frac_any", 0.0))
+        if args.action_mode == "swm_relative":
+            print(
+                f"SWM-relative target stats: scale={float(args.swm_action_scale):.3f} "
+                f"| clipped_any={clip_frac_any:.3%} "
+                f"| p90_abs=({bc_stats.get('swm_abs_p90_x', float('nan')):.3f}, {bc_stats.get('swm_abs_p90_y', float('nan')):.3f}) "
+                f"| p99_abs=({bc_stats.get('swm_abs_p99_x', float('nan')):.3f}, {bc_stats.get('swm_abs_p99_y', float('nan')):.3f})"
+            )
+            if clip_frac_any > 0.05:
+                print(
+                    "WARNING: More than 5% of SWM-relative targets clip at +/-1. "
+                    "This can make validation loss look artificially good while harming rollout quality. "
+                    "Consider increasing --swm_action_scale."
+                )
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         torch.save(bc_stats, _stats_sidecar_path(ckpt_dir / "best.pt"))
         torch.save(bc_stats, _stats_sidecar_path(ckpt_dir / "latest.pt"))
