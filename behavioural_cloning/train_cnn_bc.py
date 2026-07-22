@@ -26,6 +26,7 @@ from behavioural_cloning.train_base import (
     get_runtime_device,
     get_wandb_mode,
     is_rank0,
+    load_ckpt,
     maybe_truncate_indices,
     normalize_image_batch,
     save_ckpt,
@@ -453,8 +454,20 @@ def train(args: argparse.Namespace):
 
     best_val = float("inf")
     step = 0
+    start_epoch = 0
+    if args.resume is not None:
+        resume_path = Path(args.resume)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        step, resumed_epoch = load_ckpt(resume_path, model=model, opt=opt, scaler=None)
+        start_epoch = resumed_epoch + 1
+        if is_rank0():
+            print(
+                f"Resumed training from {resume_path} (step={step}, finished_epoch={resumed_epoch + 1}, starting_epoch={start_epoch + 1})"
+            )
+
     t0 = time.time()
-    for epoch in range(int(args.epochs)):
+    for epoch in range(start_epoch, int(args.epochs)):
         model.train()
         epoch_loss = 0.0
         epoch_mae = 0.0
@@ -576,6 +589,7 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "relative", "absolute", "swm_relative"],
     )
     parser.add_argument("--ckpt_dir", type=str, default="local_models/behavior_cloning/cnn_bc")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from.")
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument("--wandb_project", type=str, default="pusht-cnn-bc")
     parser.add_argument("--wandb_run_name", type=str, default="cnn-bc")
