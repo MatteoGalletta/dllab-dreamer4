@@ -22,22 +22,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from behavioural_cloning.train_base import (
-    CachedFeatureDataset,
     PushTSequenceDataset,
-    TokenizerBackbone,
-    build_feature_cache,
     get_runtime_device,
     get_wandb_mode,
     is_rank0,
-    load_feature_cache,
-    load_tokenizer_encoder,
     maybe_truncate_indices,
     normalize_image_batch,
-    resolve_tokenizer_path,
     save_ckpt,
     seed_everything,
     split_indices,
-    tokenizer_feature_cache_path,
     wandb,
 )
 
@@ -171,46 +164,93 @@ class PushTNPZSequenceDataset(Dataset):
         }
 
 
-class TokenizerLatentBCPolicy(nn.Module):
+class CNNBackbone(nn.Module):
     def __init__(
         self,
         *,
-        latent_dim: int,
-        frame_stack: int,
-        action_dim: int,
-        hidden_dim: int,
-        action_chunk_size: int,
+        in_channels: int = 3,
+        feature_dim: int = 256,
     ):
         super().__init__()
-        if int(action_chunk_size) < 1:
-            raise ValueError("action_chunk_size must be at least 1")
-        self.latent_dim = int(latent_dim)
-        self.frame_stack = int(frame_stack)
-        self.action_dim = int(action_dim)
-        self.action_chunk_size = int(action_chunk_size)
-        input_dim = self.latent_dim * self.frame_stack
-        output_dim = self.action_dim * self.action_chunk_size
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, int(hidden_dim)),
-            nn.ReLU(),
-            nn.Linear(int(hidden_dim), int(hidden_dim)),
-            nn.ReLU(),
-            nn.Linear(int(hidden_dim), output_dim),
+        self.in_channels = int(in_channels)
+        self.feature_dim = int(feature_dim)
+
+        def conv_block(in_ch: int, out_ch: int, *, stride: int = 2) -> nn.Sequential:
+            kernel = 5 if stride == 2 else 3
+            padding = 2 if kernel == 5 else 1
+            groups = min(8, out_ch)
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=kernel, stride=stride, padding=padding, bias=False),
+                nn.GroupNorm(groups, out_ch),
+                nn.ReLU(),
+            )
+
+        self.backbone = nn.Sequential(
+            conv_block(self.in_channels, 32, stride=2),
+            conv_block(32, 64, stride=2),
+            conv_block(64, 128, stride=2),
+            conv_block(128, 256, stride=2),
+            conv_block(256, 256, stride=2),
+            nn.AdaptiveAvgPool2d((1, 1)),
         )
 
-    def forward(self, stacked_latents: torch.Tensor) -> torch.Tensor:
-        if stacked_latents.ndim != 3:
-            raise ValueError(
-                f"Expected stacked latents with shape (B, T, D), got {tuple(stacked_latents.shape)}"
-            )
-        batch_size, frames, latent_dim = stacked_latents.shape
-        if frames != self.frame_stack:
-            raise ValueError(f"Expected frame_stack={self.frame_stack}, got {frames}")
-        if latent_dim != self.latent_dim:
-            raise ValueError(f"Expected latent_dim={self.latent_dim}, got {latent_dim}")
-        flattened = stacked_latents.reshape(batch_size, -1)
-        flat_actions = self.net(flattened)
-        return flat_actions.view(batch_size, self.action_chunk_size * self.action_dim)
+        self.proj = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256, self.feature_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, x_btchw: torch.Tensor) -> torch.Tensor:
+        batch, steps, channels, height, width = x_btchw.shape
+        x = x_btchw.reshape(batch * steps, channels, height, width)
+        features = self.proj(self.backbone(x))
+        return features.view(batch, steps, -1)
+
+
+class DirectChunkPolicyHead(nn.Module):
+    def __init__(
+        self,
+        *,
+        in_dim: int,
+        seq_len: int,
+        hidden_dim: int,
+        action_dim: int,
+        dropout: float = 0.0,
+        output_tanh: bool = False,
+    ):
+        super().__init__()
+        self.seq_len = int(seq_len)
+        self.action_dim = int(action_dim)
+        self.output_tanh = bool(output_tanh)
+        self.net = nn.Sequential(
+            nn.Linear(int(in_dim) * self.seq_len, int(hidden_dim)),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), int(hidden_dim)),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), self.action_dim),
+        )
+
+    def forward(self, features_btD: torch.Tensor) -> torch.Tensor:
+        if features_btD.ndim != 3:
+            raise ValueError(f"Expected feature sequence with shape (B, T, D), got {tuple(features_btD.shape)}")
+        batch, steps, feature_dim = features_btD.shape
+        if steps != self.seq_len:
+            raise ValueError(f"Expected seq_len={self.seq_len}, got {steps}")
+        logits = self.net(features_btD.reshape(batch, steps * feature_dim))
+        return torch.tanh(logits) if self.output_tanh else logits
+
+
+class CNNBCPolicy(nn.Module):
+    def __init__(self, backbone: CNNBackbone, classifier: DirectChunkPolicyHead):
+        super().__init__()
+        self.backbone = backbone
+        self.classifier = classifier
+
+    def forward(self, x_btchw: torch.Tensor) -> torch.Tensor:
+        features = self.backbone(x_btchw)
+        return self.classifier(features)
 
 
 def _action_scale_for_training(actions: torch.Tensor, *, normalize_actions: bool, action_scale: float) -> torch.Tensor:
@@ -247,14 +287,14 @@ def _evaluate_validation_scaled(
         for batch_idx, batch in enumerate(loader):
             if max_batches > 0 and batch_idx >= max_batches:
                 break
-            features = batch["features"].to(device, non_blocking=True).to(torch.float32)
+            images = normalize_image_batch(batch["image"]).to(device, non_blocking=True)
             target_actions = batch["action"].to(device, non_blocking=True).to(torch.float32)
             target_actions = _action_scale_for_training(
                 target_actions,
                 normalize_actions=normalize_actions,
                 action_scale=action_scale,
             )
-            pred = model(features)
+            pred = model(images)
             loss_sum += float(F.mse_loss(pred, target_actions).item())
             mae_sum += float(torch.mean(torch.abs(pred - target_actions)).item())
             num_batches += 1
@@ -285,8 +325,7 @@ def _build_bc_stats(
     args: argparse.Namespace,
     *,
     dataset: Dataset,
-    latent_dim: int,
-    tokenizer_path: str,
+    cnn_feature_dim: int,
     train_size: int,
     val_size: int,
 ) -> dict[str, object]:
@@ -294,7 +333,7 @@ def _build_bc_stats(
         "frame_stack": int(args.seq_len),
         "frame_stride": int(args.frame_stride),
         "action_chunk_size": int(args.action_chunk_size),
-        "latent_dim": int(latent_dim),
+        "cnn_feature_dim": int(cnn_feature_dim),
         "hidden_dim": int(args.hidden_dim),
         "action_dim": 2,
         "action_mode": str(args.action_mode),
@@ -305,7 +344,8 @@ def _build_bc_stats(
         "dataset_windows": int(len(dataset)),
         "train_windows": int(train_size),
         "val_windows": int(val_size),
-        "tokenizer_ckpt_name": str(tokenizer_path),
+        "tokenizer_ckpt_name": None,
+        "policy_style": "direct_chunk_cnn",
     }
     underlying = getattr(dataset, "dataset", None)
     if underlying is not None:
@@ -313,23 +353,16 @@ def _build_bc_stats(
     return stats
 
 
-def _prepare_cached_dataset(
-    args: argparse.Namespace,
-    *,
-    device: torch.device,
-) -> tuple[Dataset, int, str]:
+def _prepare_dataset(args: argparse.Namespace) -> Dataset:
     dataset_path = str(args.dataset)
     if dataset_path.lower().endswith(".npz"):
-        from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
-
-        tokenizer_path = resolve_tokenizer_path(args.tokenizer_ckpt_name)
-        _, tokenizer_info = load_tokenizer_from_ckpt(tokenizer_path, torch.device("cpu"))
+        image_hw = (args.image_hw[0], args.image_hw[1]) if args.image_hw else None
         full_dataset = PushTNPZSequenceDataset(
             dataset_path,
             seq_len=args.seq_len,
             action_chunk_size=args.action_chunk_size,
             frame_stride=args.frame_stride,
-            image_hw=(int(tokenizer_info["H"]), int(tokenizer_info["W"])),
+            image_hw=image_hw,
             action_mode=str(args.action_mode),
             swm_action_scale=float(args.swm_action_scale),
         )
@@ -340,39 +373,7 @@ def _prepare_cached_dataset(
             action_chunk_size=args.action_chunk_size,
             frame_stride=args.frame_stride,
         )
-    tokenizer_path = resolve_tokenizer_path(args.tokenizer_ckpt_name)
-    encoder = load_tokenizer_encoder(tokenizer_path)
-    backbone = TokenizerBackbone(
-        encoder,
-        patch=int(encoder.patch),
-        output_dim=int(encoder.n_latents) * int(encoder.bottleneck_proj.out_features),
-    )
-    cache_path = tokenizer_feature_cache_path(args, tokenizer_path)
-    cached_features = None
-    if args.rebuild_latent_cache or not cache_path.exists():
-        cached_features = build_feature_cache(
-            full_dataset,
-            tokenizer_backbone=backbone.to(device),
-            cache_path=cache_path,
-            device=device,
-            batch_size=args.latent_cache_batch_size or args.batch_size,
-            image_batch_normalizer=normalize_image_batch,
-            metadata={
-                "dataset": str(args.dataset),
-                "tokenizer_ckpt": str(tokenizer_path),
-                "seq_len": int(args.seq_len),
-                "frame_stride": int(args.frame_stride),
-                "action_chunk_size": int(args.action_chunk_size),
-                "raw_feature_dim": int(backbone.raw_feature_dim),
-                "cache_type": "tokenizer_raw_latents",
-            },
-        )
-    if cached_features is None:
-        cached_features = load_feature_cache(cache_path)
-    if cached_features is None:
-        raise RuntimeError(f"Tokenizer latent cache missing or invalid: {cache_path}")
-    dataset = CachedFeatureDataset(full_dataset, cached_features)
-    return dataset, int(backbone.raw_feature_dim), str(tokenizer_path)
+    return full_dataset
 
 
 def train(args: argparse.Namespace):
@@ -380,7 +381,7 @@ def train(args: argparse.Namespace):
     seed_everything(int(args.seed))
     print(f"Using device: {device}")
     args.action_mode = _resolve_action_mode(args)
-    dataset, latent_dim, tokenizer_path = _prepare_cached_dataset(args, device=device)
+    dataset = _prepare_dataset(args)
     train_indices, val_indices = split_indices(len(dataset), args.val_frac, args.seed)
     train_indices = maybe_truncate_indices(train_indices, int(args.max_train_samples), seed=args.seed)
     val_indices = maybe_truncate_indices(val_indices, int(args.max_val_samples), seed=args.seed + 1)
@@ -411,28 +412,31 @@ def train(args: argparse.Namespace):
             worker_init_fn=_seed_dataloader_worker,
         )
 
-    model = TokenizerLatentBCPolicy(
-        latent_dim=latent_dim,
-        frame_stack=args.seq_len,
-        action_dim=2,
+    action_dim = int(args.action_chunk_size) * 2
+    backbone = CNNBackbone(in_channels=3, feature_dim=args.cnn_feature_dim)
+    classifier = DirectChunkPolicyHead(
+        in_dim=args.cnn_feature_dim,
+        seq_len=args.seq_len,
         hidden_dim=args.hidden_dim,
-        action_chunk_size=args.action_chunk_size,
-    ).to(device)
+        action_dim=action_dim,
+        dropout=args.dropout,
+        output_tanh=args.action_output_tanh,
+    )
+    model = CNNBCPolicy(backbone=backbone, classifier=classifier).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     ckpt_dir = Path(args.ckpt_dir)
     if is_rank0():
         print(
-            f"Tokenizer-latent BC: dataset={args.dataset} tokenizer={tokenizer_path} "
+            f"CNN BC: dataset={args.dataset} "
             f"| windows total={len(dataset)} train={len(train_dataset)} val={0 if val_dataset is None else len(val_dataset)} "
-            f"| latent_dim={latent_dim} frame_stack={args.seq_len} stride={args.frame_stride} "
+            f"| cnn_feature_dim={args.cnn_feature_dim} frame_stack={args.seq_len} stride={args.frame_stride} "
             f"chunk={args.action_chunk_size} action_mode={args.action_mode}"
         )
         bc_stats = _build_bc_stats(
             args,
             dataset=dataset,
-            latent_dim=latent_dim,
-            tokenizer_path=tokenizer_path,
+            cnn_feature_dim=args.cnn_feature_dim,
             train_size=len(train_dataset),
             val_size=0 if val_dataset is None else len(val_dataset),
         )
@@ -456,7 +460,7 @@ def train(args: argparse.Namespace):
         epoch_mae = 0.0
         num_batches = 0
         for batch in loader:
-            features = batch["features"].to(device, non_blocking=True).to(torch.float32)
+            images = normalize_image_batch(batch["image"]).to(device, non_blocking=True)
             target_actions = batch["action"].to(device, non_blocking=True).to(torch.float32)
             target_actions = _action_scale_for_training(
                 target_actions,
@@ -464,7 +468,7 @@ def train(args: argparse.Namespace):
                 action_scale=float(args.action_scale),
             )
 
-            pred = model(features)
+            pred = model(images)
             loss = F.mse_loss(pred, target_actions)
             mae = torch.mean(torch.abs(pred - target_actions))
             opt.zero_grad(set_to_none=True)
@@ -542,13 +546,15 @@ def train(args: argparse.Namespace):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Minimal tokenizer-latent BC in the style of the other group.")
-    parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument("--tokenizer_ckpt_name", type=str, default=None)
+    parser = argparse.ArgumentParser(description="CNN Behavioural Cloning training directly from image pixels.")
+    parser.add_argument("--dataset", type=str, required=True, help="Path to HDF5 (.h5) or NPZ dataset.")
     parser.add_argument("--seq_len", type=int, default=3)
     parser.add_argument("--frame_stride", type=int, default=5)
     parser.add_argument("--action_chunk_size", type=int, default=1)
+    parser.add_argument("--cnn_feature_dim", type=int, default=256)
     parser.add_argument("--hidden_dim", type=int, default=256)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--action_output_tanh", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--eval_batch_size", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=100)
@@ -559,8 +565,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_max_batches", type=int, default=50)
     parser.add_argument("--max_train_samples", type=int, default=0)
     parser.add_argument("--max_val_samples", type=int, default=0)
-    parser.add_argument("--latent_cache_batch_size", type=int, default=0)
-    parser.add_argument("--rebuild_latent_cache", action="store_true")
+    parser.add_argument("--image_hw", type=int, nargs=2, default=None, help="Optional image resize (H W) for NPZ dataset.")
     parser.add_argument("--normalize_actions", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--action_scale", type=float, default=1.0)
     parser.add_argument("--swm_action_scale", type=float, default=100.0)
@@ -570,10 +575,10 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         choices=["auto", "relative", "absolute", "swm_relative"],
     )
-    parser.add_argument("--ckpt_dir", type=str, default="local_models/behavior_cloning/tokenizer_latent_bc")
+    parser.add_argument("--ckpt_dir", type=str, default="local_models/behavior_cloning/cnn_bc")
     parser.add_argument("--save_every", type=int, default=10)
-    parser.add_argument("--wandb_project", type=str, default="pusht-tokenizer-latent-bc")
-    parser.add_argument("--wandb_run_name", type=str, default="tokenizer-latent-bc")
+    parser.add_argument("--wandb_project", type=str, default="pusht-cnn-bc")
+    parser.add_argument("--wandb_run_name", type=str, default="cnn-bc")
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_mode", type=str, default="disabled", choices=["disabled", "offline", "online"])
     return parser.parse_args()
