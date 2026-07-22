@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from typing import Any
 
 import gymnasium as gym
 import numpy as np
@@ -248,9 +249,9 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--action-mode",
-        choices=("relative", "delta", "absolute"),
-        default="relative",
-        help="How to map predicted primitive actions into env actions.",
+        choices=("relative", "delta", "absolute", "swm_relative"),
+        default=None,
+        help="How to map predicted primitive actions into env actions. Defaults to the checkpoint action_mode.",
     )
     parser.add_argument(
         "--max-step-pixels",
@@ -308,6 +309,16 @@ def resolve_model_config(ckpt_args: dict, cleaned_state: dict[str, torch.Tensor]
     temporal_heads = int(ckpt_args.get("temporal_heads", 4))
     temporal_context = int(ckpt_args.get("temporal_context", 3))
     action_output_tanh = bool(ckpt_args.get("action_output_tanh", True))
+    action_mode = str(ckpt_args.get("action_mode", "relative"))
+    swm_action_scale = float(ckpt_args.get("swm_action_scale", 100.0))
+    image_hw_raw = ckpt_args.get("image_hw")
+    image_hw = None
+    if image_hw_raw is not None:
+        try:
+            if len(image_hw_raw) == 2 and image_hw_raw[0] is not None and image_hw_raw[1] is not None:
+                image_hw = (int(image_hw_raw[0]), int(image_hw_raw[1]))
+        except TypeError:
+            image_hw = None
     return {
         "tokenizer_name": tokenizer_name,
         "seq_len": seq_len,
@@ -322,7 +333,32 @@ def resolve_model_config(ckpt_args: dict, cleaned_state: dict[str, torch.Tensor]
         "temporal_heads": temporal_heads,
         "temporal_context": temporal_context,
         "action_output_tanh": action_output_tanh,
+        "action_mode": action_mode,
+        "swm_action_scale": swm_action_scale,
+        "image_hw": image_hw,
+        "dataset": ckpt_args.get("dataset"),
     }
+
+
+def infer_cnn_image_hw(model_cfg: dict[str, Any]) -> tuple[int, int]:
+    if model_cfg["tokenizer_name"] is not None:
+        raise ValueError("Tokenizer-backed checkpoints should resolve image size from the tokenizer.")
+    image_hw = model_cfg.get("image_hw")
+    if image_hw is not None:
+        return int(image_hw[0]), int(image_hw[1])
+
+    dataset_path = model_cfg.get("dataset")
+    if dataset_path:
+        dataset_path = Path(str(dataset_path))
+        if dataset_path.suffix.lower() == ".npz" and dataset_path.exists():
+            with np.load(str(dataset_path), allow_pickle=True) as data:
+                for key in ("images", "pixels", "observations", "obs"):
+                    if key in data:
+                        sample_shape = tuple(np.asarray(data[key]).shape)
+                        if len(sample_shape) >= 4:
+                            return int(sample_shape[-3]), int(sample_shape[-2])
+                        break
+    return (224, 224)
 
 
 def pad_history(frames: deque[np.ndarray], seq_len: int, frame_stride: int) -> np.ndarray:
@@ -340,14 +376,17 @@ def map_primitive_to_env_action(
     mode: str,
     current_eef: np.ndarray,
     max_step_pixels: float,
+    action_output_tanh: bool,
 ) -> np.ndarray:
     primitive = np.asarray(primitive, dtype=np.float32)
-    if mode == "relative":
+    if mode in {"relative", "swm_relative"}:
         return primitive
     if mode == "delta":
         return np.clip(current_eef + primitive * float(max_step_pixels), 0.0, 512.0)
     if mode == "absolute":
-        return np.clip((primitive + 1.0) * 256.0, 0.0, 512.0)
+        if action_output_tanh:
+            return np.clip((primitive + 1.0) * 256.0, 0.0, 512.0)
+        return np.clip(primitive, 0.0, 512.0)
     raise ValueError(f"Unsupported action mode: {mode}")
 
 
@@ -480,6 +519,7 @@ def main():
     cleaned_state = clean_state_dict_keys(state_dict)
     ckpt_args = extract_checkpoint_args(payload)
     model_cfg = resolve_model_config(ckpt_args, cleaned_state)
+    effective_action_mode = str(args.action_mode or model_cfg["action_mode"])
 
     tokenizer_path = None
     image_hw = (224, 224)
@@ -487,6 +527,8 @@ def main():
         tokenizer_path = resolve_tokenizer_path(args.tokenizer_path or str(model_cfg["tokenizer_name"]))
         _, tokenizer_info = load_tokenizer_from_ckpt(tokenizer_path, torch.device("cpu"))
         image_hw = (int(tokenizer_info["H"]), int(tokenizer_info["W"]))
+    else:
+        image_hw = infer_cnn_image_hw(model_cfg)
 
     model = BCImagePolicy(
         image_shape=(image_hw[0], image_hw[1], 3),
@@ -511,7 +553,7 @@ def main():
         render_mode="rgb_array",
         image_height=image_hw[0],
         image_width=image_hw[1],
-        relative=(args.action_mode == "relative"),
+        relative=(effective_action_mode in {"relative", "swm_relative"}),
         sync_goal_pose=True,
         align_sampled_goal_to_fixed_target=args.fixed_target_eval,
         render_obs=False,
@@ -522,7 +564,9 @@ def main():
         f"Loaded BC checkpoint from {checkpoint_path} | tokenizer={tokenizer_path} "
         f"| seq_len={model_cfg['seq_len']} frame_stride={model_cfg['frame_stride']} "
         f"chunk={model_cfg['action_chunk_size']} "
-        f"| action_mode={args.action_mode} | temporal_ensemble={args.temporal_ensemble} "
+        f"| image_hw={image_hw[0]}x{image_hw[1]} "
+        f"| action_mode={effective_action_mode} | swm_action_scale={model_cfg['swm_action_scale']:.3f} "
+        f"| temporal_ensemble={args.temporal_ensemble} "
         f"| fixed_target_eval={args.fixed_target_eval} "
         f"| delta_scale_hint={PUSHT_DATASET_DELTA_SCALE:.1f} | device={device}"
     )
@@ -575,9 +619,10 @@ def main():
                 primitive = np.asarray(action_buffer.popleft(), dtype=np.float32)
             env_action = map_primitive_to_env_action(
                 primitive,
-                mode=args.action_mode,
+                mode=effective_action_mode,
                 current_eef=current_eef,
                 max_step_pixels=args.max_step_pixels,
+                action_output_tanh=bool(model_cfg["action_output_tanh"]),
             )
             obs, reward, terminated, truncated, info = env.step(env_action)
             state = extract_state_array(obs)

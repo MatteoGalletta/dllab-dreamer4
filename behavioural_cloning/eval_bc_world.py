@@ -32,6 +32,7 @@ import stable_worldmodel as swm
 from behavioural_cloning.eval_bc_exact import (
     BCImagePolicy,
     clean_state_dict_keys,
+    infer_cnn_image_hw,
     save_video,
     resolve_model_config,
 )
@@ -474,6 +475,8 @@ def main():
             tokenizer_path = resolve_tokenizer_path(args.tokenizer_path or str(model_cfg["tokenizer_name"]))
             _, tokenizer_info = load_tokenizer_from_ckpt(tokenizer_path, torch.device("cpu"))
             image_hw = (int(tokenizer_info["H"]), int(tokenizer_info["W"]))
+        else:
+            image_hw = infer_cnn_image_hw(model_cfg)
 
         policy = BCImagePolicy(
             image_shape=(image_hw[0], image_hw[1], 3),
@@ -523,10 +526,17 @@ def main():
     print(f"tokenizer={tokenizer_path}")
     print(f"sampled episode indices={episode_indices}")
     print(f"sampled start steps={start_steps}")
-    action_rescale_ratio = float(args.dataset_action_scale) / float(args.world_action_scale)
+    dataset_action_scale = float(
+        args.dataset_action_scale
+        if args.dataset_action_scale != PUSHT_DATASET_DELTA_SCALE or args.policy_source != "bc"
+        else model_cfg.get("swm_action_scale", PUSHT_DATASET_DELTA_SCALE)
+        if model_cfg.get("action_mode") == "swm_relative"
+        else PUSHT_DATASET_DELTA_SCALE
+    )
+    action_rescale_ratio = dataset_action_scale / float(args.world_action_scale)
     print(
         f"relative action rescale ratio={action_rescale_ratio:.4f} "
-        f"(dataset_scale={float(args.dataset_action_scale):.3f} / world_scale={float(args.world_action_scale):.3f})"
+        f"(dataset_scale={dataset_action_scale:.3f} / world_scale={float(args.world_action_scale):.3f})"
     )
 
     combine_world_video = args.video_path is not None and Path(args.video_path).suffix.lower() == ".mp4"
