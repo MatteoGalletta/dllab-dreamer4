@@ -226,9 +226,9 @@ class DirectChunkPolicyHead(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(int(in_dim) * self.seq_len, int(hidden_dim)),
             nn.ReLU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(int(hidden_dim), int(hidden_dim)),
-            nn.ReLU(),
+            # nn.Dropout(float(dropout)),
+            # nn.Linear(int(hidden_dim), int(hidden_dim)),
+            # nn.ReLU(),
             nn.Dropout(float(dropout)),
             nn.Linear(int(hidden_dim), self.action_dim),
         )

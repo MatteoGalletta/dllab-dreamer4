@@ -4,6 +4,12 @@ pusht_expert_train.h5
 logs/*
 wandb/*
 local_models/*
+/data
+/runs
+/videos
+/evaluation
+/evaluation_rollouts
+/debug
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python
