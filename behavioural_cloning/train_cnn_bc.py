@@ -266,6 +266,55 @@ class CNNBCPolicy(nn.Module):
         return self.classifier(features)
 
 
+def _apply_train_augmentation(images: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    if not bool(getattr(args, "augment", False)):
+        return images
+
+    augmented = images
+    batch, steps, channels, height, width = augmented.shape
+    flat = augmented.reshape(batch * steps, channels, height, width)
+
+    max_shift = int(getattr(args, "augment_translate_px", 0))
+    if max_shift > 0:
+        padded = F.pad(flat, (max_shift, max_shift, max_shift, max_shift), mode="replicate")
+        shifts_y = torch.randint(
+            -max_shift,
+            max_shift + 1,
+            (flat.shape[0],),
+            device=flat.device,
+        )
+        shifts_x = torch.randint(
+            -max_shift,
+            max_shift + 1,
+            (flat.shape[0],),
+            device=flat.device,
+        )
+        shifted = torch.empty_like(flat)
+        for idx in range(flat.shape[0]):
+            top = int(shifts_y[idx].item()) + max_shift
+            left = int(shifts_x[idx].item()) + max_shift
+            shifted[idx] = padded[idx, :, top : top + height, left : left + width]
+        flat = shifted
+
+    brightness = float(getattr(args, "augment_brightness", 0.0))
+    if brightness > 0:
+        delta = torch.empty((flat.shape[0], 1, 1, 1), device=flat.device).uniform_(-brightness, brightness)
+        flat = flat + delta
+
+    contrast = float(getattr(args, "augment_contrast", 0.0))
+    if contrast > 0:
+        scale = torch.empty((flat.shape[0], 1, 1, 1), device=flat.device).uniform_(1.0 - contrast, 1.0 + contrast)
+        mean = flat.mean(dim=(-2, -1), keepdim=True)
+        flat = (flat - mean) * scale + mean
+
+    noise_std = float(getattr(args, "augment_noise_std", 0.0))
+    if noise_std > 0:
+        flat = flat + torch.randn_like(flat) * noise_std
+
+    flat = torch.clamp(flat, 0.0, 1.0)
+    return flat.reshape(batch, steps, channels, height, width)
+
+
 def _action_scale_for_training(actions: torch.Tensor, *, normalize_actions: bool, action_scale: float) -> torch.Tensor:
     if not normalize_actions:
         return actions
@@ -353,6 +402,11 @@ def _build_bc_stats(
         "normalize_actions": bool(args.normalize_actions),
         "action_scale": float(args.action_scale),
         "swm_action_scale": float(args.swm_action_scale),
+        "augment": bool(args.augment),
+        "augment_translate_px": int(args.augment_translate_px),
+        "augment_brightness": float(args.augment_brightness),
+        "augment_contrast": float(args.augment_contrast),
+        "augment_noise_std": float(args.augment_noise_std),
         "dataset": str(args.dataset),
         "dataset_windows": int(len(dataset)),
         "train_windows": int(train_size),
@@ -465,6 +519,13 @@ def train(args: argparse.Namespace):
             f"chunk={args.action_chunk_size} action_mode={args.action_mode} "
             f"| image_hw={args.image_hw}"
         )
+        if bool(args.augment):
+            print(
+                f"Train augmentation: translate_px={int(args.augment_translate_px)} "
+                f"| brightness={float(args.augment_brightness):.3f} "
+                f"| contrast={float(args.augment_contrast):.3f} "
+                f"| noise_std={float(args.augment_noise_std):.3f}"
+            )
         bc_stats = _build_bc_stats(
             args,
             dataset=dataset,
@@ -519,6 +580,7 @@ def train(args: argparse.Namespace):
         num_batches = 0
         for batch in loader:
             images = normalize_image_batch(batch["image"]).to(device, non_blocking=True)
+            images = _apply_train_augmentation(images, args)
             target_actions = batch["action"].to(device, non_blocking=True).to(torch.float32)
             target_actions = _action_scale_for_training(
                 target_actions,
@@ -627,6 +689,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--normalize_actions", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--action_scale", type=float, default=1.0)
     parser.add_argument("--swm_action_scale", type=float, default=100.0)
+    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--augment_translate_px", type=int, default=4)
+    parser.add_argument("--augment_brightness", type=float, default=0.08)
+    parser.add_argument("--augment_contrast", type=float, default=0.08)
+    parser.add_argument("--augment_noise_std", type=float, default=0.01)
     parser.add_argument(
         "--action_mode",
         type=str,
