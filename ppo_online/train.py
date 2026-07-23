@@ -26,6 +26,52 @@ from .model_paths import resolve_bc_prior_path, resolve_ppo_checkpoint_path, res
 from .tokenizer_utils import TokenizerZEncoder, load_tokenizer_from_ckpt
 
 
+def pool_latents(z_unpacked: torch.Tensor) -> torch.Tensor:
+    """Collapses spatial patches by taking their spatial token mean."""
+    return z_unpacked.mean(dim=-2)
+
+
+class LatentContextSampler:
+    def __init__(self, npz_path: str, action_chunk_size: int, device: torch.device):
+        self.device = device
+        self.action_chunk_size = action_chunk_size
+
+        data = np.load(npz_path, allow_pickle=True)
+        self.images = data["images"]
+        self.actions_raw = data["actions"]
+
+        ends = data["episode_ends"]
+        starts = np.zeros_like(ends)
+        starts[1:] = ends[:-1]
+
+        self.episodes = []
+        for s, e in zip(starts, ends):
+            raw_len = e - s
+            seq_len = raw_len // action_chunk_size
+            used = seq_len * action_chunk_size
+
+            if seq_len >= 24:
+                ep_imgs = self.images[s:s + used][::action_chunk_size]
+                ep_acts = self.actions_raw[s:s + used].reshape(seq_len, -1)
+                self.episodes.append((ep_imgs, ep_acts))
+
+    def sample_context(self, batch_size: int, ctx_len: int = 24):
+        batch_imgs, batch_acts = [], []
+        indices = np.random.choice(len(self.episodes), size=batch_size, replace=True)
+
+        for idx in indices:
+            ep_imgs, ep_acts = self.episodes[idx]
+            t_start = np.random.randint(0, len(ep_imgs) - ctx_len)
+
+            batch_imgs.append(ep_imgs[t_start: t_start + ctx_len])
+            batch_acts.append(ep_acts[t_start: t_start + ctx_len])
+
+        imgs_tensor = torch.from_numpy(np.stack(batch_imgs)).permute(0, 1, 4, 2, 3).float() / 255.0
+        acts_tensor = torch.from_numpy(np.stack(batch_acts)).float()
+
+        return imgs_tensor.to(self.device), acts_tensor.to(self.device)
+
+
 class StridedObservationStackWrapper(gym.ObservationWrapper):
     def __init__(self, env: gym.Env, stack_size: int, frame_stride: int):
         super().__init__(env)
