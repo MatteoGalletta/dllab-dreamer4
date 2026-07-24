@@ -192,13 +192,17 @@ class OpenLoopChunkExecutionWrapper(gym.Wrapper):
         chunk_size: int,
         gamma: float,
         action_mode: str,
+        action_output_tanh: bool = False,
     ):
         super().__init__(env)
         self.chunk_size = int(chunk_size)
         self.gamma = float(gamma)
         self.action_mode = str(action_mode)
+        self.action_output_tanh = bool(action_output_tanh)
 
-        if self.action_mode in {"relative", "swm_relative"}:
+        if self.action_mode in {"relative", "swm_relative"} or (
+            self.action_mode == "absolute" and self.action_output_tanh
+        ):
             low = np.full((self.chunk_size * 2,), -1.0, dtype=np.float32)
             high = np.full((self.chunk_size * 2,), 1.0, dtype=np.float32)
         else:
@@ -210,6 +214,8 @@ class OpenLoopChunkExecutionWrapper(gym.Wrapper):
         primitive = np.asarray(primitive, dtype=np.float32)
         if self.action_mode in {"relative", "swm_relative"}:
             return np.clip(primitive, -1.0, 1.0)
+        if self.action_mode == "absolute" and self.action_output_tanh:
+            return np.clip((primitive + 1.0) * 256.0, 0.0, 512.0)
         return np.clip(primitive, 0.0, 512.0)
 
     def step(self, macro_action):
@@ -773,6 +779,7 @@ def make_env(rank: int, seed: int, config: TrainConfig, render_mode: str | None 
             chunk_size=config.chunk_size,
             gamma=config.gamma,
             action_mode=config.action_mode,
+            action_output_tanh=bool(getattr(config, "action_output_tanh", False)),
         )
         if config.network_type == "bc_pixels":
             env = RenderedImageObsWrapper(
