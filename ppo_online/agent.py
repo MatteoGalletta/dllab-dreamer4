@@ -153,6 +153,7 @@ def _infer_bc_pixel_architecture(
     hidden_dim = int(actor_hidden_dim)
     policy_style = "sequence_classifier"
     backbone_style = "avgpool"
+    action_output_tanh = True
     source = "ppo_defaults"
 
     if bc_prior_path is not None:
@@ -172,6 +173,12 @@ def _infer_bc_pixel_architecture(
                 source = "bc_prior_args"
             if checkpoint_args.get("hidden_dim") is not None:
                 hidden_dim = int(checkpoint_args["hidden_dim"])
+                source = "bc_prior_args"
+            if checkpoint_args.get("action_output_tanh") is not None:
+                action_output_tanh = bool(checkpoint_args["action_output_tanh"])
+                source = "bc_prior_args"
+            elif checkpoint_args.get("action_mode") is not None:
+                action_output_tanh = str(checkpoint_args["action_mode"]) != "absolute"
                 source = "bc_prior_args"
 
             proj_weight = state_dict.get("backbone.proj.1.weight")
@@ -209,6 +216,7 @@ def _infer_bc_pixel_architecture(
         "action_dim": int(action_dim),
         "policy_style": str(policy_style),
         "backbone_style": str(backbone_style),
+        "action_output_tanh": bool(action_output_tanh),
         "source": source,
     }
 
@@ -262,6 +270,7 @@ class PPOAgent:
                 policy_style=self.bc_pixel_architecture["policy_style"],
                 backbone_style=self.bc_pixel_architecture["backbone_style"],
                 feature_dim=self.bc_pixel_architecture["feature_dim"],
+                action_output_tanh=self.bc_pixel_architecture["action_output_tanh"],
             ).to(self.device_override)
         elif network_type == "bc_latent":
             self.bc_latent_architecture = _infer_bc_latent_architecture(
@@ -439,6 +448,7 @@ class PPOAgent:
                 policy_style=getattr(self.network, "policy_style", "sequence_classifier"),
                 backbone_style=getattr(self.network, "backbone_style", "avgpool"),
                 feature_dim=getattr(self.network, "feature_dim", 256),
+                action_output_tanh=getattr(self.network, "action_output_tanh", True),
             ).to(self.device)
         elif self.network_type == "bc_latent":
             prior_network = TokenizerLatentBCPPOActorCritic(
@@ -491,6 +501,7 @@ class PPOAgent:
                 f"hidden={self.bc_pixel_architecture['hidden_dim']}, "
                 f"policy={self.bc_pixel_architecture['policy_style']}, "
                 f"backbone={self.bc_pixel_architecture['backbone_style']}, "
+                f"tanh={self.bc_pixel_architecture['action_output_tanh']}, "
                 f"source={self.bc_pixel_architecture['source']})"
             )
         return PriorLoadInfo(True, " ".join(parts))

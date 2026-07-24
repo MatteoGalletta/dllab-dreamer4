@@ -311,6 +311,7 @@ class BCPixelActorCritic(nn.Module):
         policy_style: str = "sequence_classifier",
         backbone_style: str = "avgpool",
         feature_dim: int = 256,
+        action_output_tanh: bool = True,
         temporal_layers: int = 2,
         temporal_heads: int = 4,
         temporal_context: int = 3,
@@ -322,6 +323,7 @@ class BCPixelActorCritic(nn.Module):
         self.policy_style = str(policy_style)
         self.backbone_style = str(backbone_style)
         self.feature_dim = int(feature_dim)
+        self.action_output_tanh = bool(action_output_tanh)
         self.backbone = PixelBackbone(
             in_channels=3,
             feature_dim=self.feature_dim,
@@ -334,6 +336,7 @@ class BCPixelActorCritic(nn.Module):
                 hidden_dim=hidden_dim,
                 action_dim=action_dim,
                 dropout=dropout,
+                output_tanh=self.action_output_tanh,
             )
         else:
             self.classifier = BCActionClassifier(
@@ -341,6 +344,7 @@ class BCPixelActorCritic(nn.Module):
                 hidden_dim=hidden_dim,
                 action_dim=action_dim,
                 dropout=dropout,
+                output_tanh=self.action_output_tanh,
                 temporal_layers=temporal_layers,
                 temporal_heads=temporal_heads,
                 max_seq_len=self.image_shape[0] if len(self.image_shape) >= 1 else 64,
