@@ -815,6 +815,21 @@ def _extract_checkpoint_args(payload: Any) -> dict[str, Any]:
         return {}
 
 
+def extract_checkpoint_state_dict(payload: Any) -> dict[str, torch.Tensor] | None:
+    if isinstance(payload, dict):
+        if payload and all(isinstance(key, str) for key in payload.keys()):
+            first_value = next(iter(payload.values()))
+            if torch.is_tensor(first_value):
+                return payload
+        for key in ("state_dict", "model_state_dict", "network", "model", "actor", "agent"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                state_dict = extract_checkpoint_state_dict(nested)
+                if state_dict is not None:
+                    return state_dict
+    return None
+
+
 def _load_bc_contract_overrides(bc_prior_path: str) -> dict[str, Any]:
     try:
         payload = torch.load(bc_prior_path, map_location="cpu", weights_only=True)
