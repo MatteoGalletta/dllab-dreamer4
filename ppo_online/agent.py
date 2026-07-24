@@ -141,6 +141,78 @@ def _infer_bc_latent_architecture(
     }
 
 
+def _infer_bc_pixel_architecture(
+    bc_prior_path: str | None,
+    *,
+    obs_shape: tuple[int, ...] | None,
+    action_dim: int,
+    actor_hidden_dim: int,
+) -> dict[str, Any]:
+    frame_stack = obs_shape[0] if obs_shape is not None and len(obs_shape) >= 1 else 1
+    feature_dim = 256
+    hidden_dim = int(actor_hidden_dim)
+    policy_style = "sequence_classifier"
+    backbone_style = "avgpool"
+    source = "ppo_defaults"
+
+    if bc_prior_path is not None:
+        prior_path = Path(bc_prior_path)
+        if prior_path.exists():
+            try:
+                payload = _load_bc_prior_payload(prior_path, torch.device("cpu"))
+                checkpoint_args = _extract_checkpoint_args(payload)
+                state_dict = _extract_state_dict(payload) or {}
+                state_dict = _normalize_prior_keys(state_dict)
+            except Exception:
+                checkpoint_args = {}
+                state_dict = {}
+
+            if checkpoint_args.get("seq_len") is not None:
+                frame_stack = int(checkpoint_args["seq_len"])
+                source = "bc_prior_args"
+            if checkpoint_args.get("hidden_dim") is not None:
+                hidden_dim = int(checkpoint_args["hidden_dim"])
+                source = "bc_prior_args"
+
+            proj_weight = state_dict.get("backbone.proj.1.weight")
+            if torch.is_tensor(proj_weight) and proj_weight.ndim == 2:
+                feature_dim = int(proj_weight.shape[0])
+                proj_in_dim = int(proj_weight.shape[1])
+                if proj_in_dim == 512:
+                    backbone_style = "spatial_softmax"
+                    source = "bc_prior_state_dict"
+                elif proj_in_dim == 256:
+                    backbone_style = "avgpool"
+                    source = "bc_prior_state_dict"
+
+            classifier_first = state_dict.get("classifier.net.0.weight")
+            if torch.is_tensor(classifier_first) and classifier_first.ndim == 2:
+                hidden_dim = int(classifier_first.shape[0])
+                classifier_in_dim = int(classifier_first.shape[1])
+                if feature_dim > 0 and classifier_in_dim == feature_dim * frame_stack:
+                    policy_style = "direct_chunk_cnn"
+                    source = "bc_prior_state_dict"
+                elif feature_dim > 0 and classifier_in_dim == feature_dim:
+                    policy_style = "sequence_classifier"
+                    source = "bc_prior_state_dict"
+
+    if obs_shape is not None and len(obs_shape) >= 1 and frame_stack != int(obs_shape[0]):
+        raise ValueError(
+            f"BC prior expects frame_stack={frame_stack}, but PPO env emits obs_stack={obs_shape[0]}. "
+            "Match PPO obs_stack_size/chunk config to the BC prior before training."
+        )
+
+    return {
+        "frame_stack": int(frame_stack),
+        "feature_dim": int(feature_dim),
+        "hidden_dim": int(hidden_dim),
+        "action_dim": int(action_dim),
+        "policy_style": str(policy_style),
+        "backbone_style": str(backbone_style),
+        "source": source,
+    }
+
+
 class PPOAgent:
     def __init__(
         self,
@@ -172,14 +244,24 @@ class PPOAgent:
         self.tokenizer_path = tokenizer_path
         self.backbone_device = torch.device(backbone_device)
         self.bc_latent_architecture: dict[str, Any] | None = None
+        self.bc_pixel_architecture: dict[str, Any] | None = None
         if network_type == "bc_pixels":
             if obs_shape is None:
                 raise ValueError("obs_shape is required for bc_pixels PPO.")
+            self.bc_pixel_architecture = _infer_bc_pixel_architecture(
+                bc_prior_path,
+                obs_shape=obs_shape,
+                action_dim=action_dim,
+                actor_hidden_dim=actor_hidden_dim,
+            )
             self.network = BCPixelActorCritic(
                 image_shape=obs_shape,
                 action_dim=action_dim,
-                hidden_dim=actor_hidden_dim,
+                hidden_dim=self.bc_pixel_architecture["hidden_dim"],
                 dropout=actor_dropout,
+                policy_style=self.bc_pixel_architecture["policy_style"],
+                backbone_style=self.bc_pixel_architecture["backbone_style"],
+                feature_dim=self.bc_pixel_architecture["feature_dim"],
             ).to(self.device_override)
         elif network_type == "bc_latent":
             self.bc_latent_architecture = _infer_bc_latent_architecture(
@@ -354,6 +436,9 @@ class PPOAgent:
                 action_dim=action_dim,
                 hidden_dim=getattr(self.network, "hidden_dim", 512),
                 dropout=0.0,
+                policy_style=getattr(self.network, "policy_style", "sequence_classifier"),
+                backbone_style=getattr(self.network, "backbone_style", "avgpool"),
+                feature_dim=getattr(self.network, "feature_dim", 256),
             ).to(self.device)
         elif self.network_type == "bc_latent":
             prior_network = TokenizerLatentBCPPOActorCritic(
@@ -397,6 +482,16 @@ class PPOAgent:
                 f"chunk={self.bc_latent_architecture['action_chunk_size']}, "
                 f"hidden={self.bc_latent_architecture['hidden_dim']}, "
                 f"source={self.bc_latent_architecture['source']})"
+            )
+        if self.network_type == "bc_pixels" and self.bc_pixel_architecture is not None:
+            parts.append(
+                "bc_pixel_architecture="
+                f"(frame_stack={self.bc_pixel_architecture['frame_stack']}, "
+                f"feature_dim={self.bc_pixel_architecture['feature_dim']}, "
+                f"hidden={self.bc_pixel_architecture['hidden_dim']}, "
+                f"policy={self.bc_pixel_architecture['policy_style']}, "
+                f"backbone={self.bc_pixel_architecture['backbone_style']}, "
+                f"source={self.bc_pixel_architecture['source']})"
             )
         return PriorLoadInfo(True, " ".join(parts))
 

@@ -178,11 +178,31 @@ class DirectChunkPolicyHead(nn.Module):
         return torch.tanh(logits) if self.output_tanh else logits
 
 
+class SpatialSoftmax(nn.Module):
+    def __init__(self, temperature: float = 1.0):
+        super().__init__()
+        self.temperature = float(temperature)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bsz, channels, height, width = x.shape
+        x_flat = x.view(bsz, channels, height * width) / self.temperature
+        weights = F.softmax(x_flat, dim=-1).view(bsz, channels, height, width)
+
+        y_coord = torch.linspace(-1.0, 1.0, height, device=x.device, dtype=x.dtype)
+        x_coord = torch.linspace(-1.0, 1.0, width, device=x.device, dtype=x.dtype)
+        y_grid, x_grid = torch.meshgrid(y_coord, x_coord, indexing="ij")
+
+        expected_y = torch.sum(weights * y_grid, dim=(2, 3))
+        expected_x = torch.sum(weights * x_grid, dim=(2, 3))
+        return torch.cat([expected_x, expected_y], dim=-1)
+
+
 class PixelBackbone(nn.Module):
-    def __init__(self, in_channels: int = 3, feature_dim: int = 256):
+    def __init__(self, in_channels: int = 3, feature_dim: int = 256, backbone_style: str = "avgpool"):
         super().__init__()
         self.in_channels = int(in_channels)
         self.feature_dim = int(feature_dim)
+        self.backbone_style = str(backbone_style)
 
         def conv_block(in_ch: int, out_ch: int, stride: int = 2) -> nn.Sequential:
             kernel = 5 if stride == 2 else 3
@@ -194,17 +214,29 @@ class PixelBackbone(nn.Module):
                 nn.ReLU(),
             )
 
-        self.backbone = nn.Sequential(
-            conv_block(self.in_channels, 32, stride=2),
-            conv_block(32, 64, stride=2),
-            conv_block(64, 128, stride=2),
-            conv_block(128, 256, stride=2),
-            conv_block(256, 256, stride=2),
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
+        if self.backbone_style == "spatial_softmax":
+            self.backbone = nn.Sequential(
+                conv_block(self.in_channels, 32, stride=2),
+                conv_block(32, 64, stride=2),
+                conv_block(64, 128, stride=2),
+                conv_block(128, 256, stride=2),
+                conv_block(256, 256, stride=2),
+                SpatialSoftmax(),
+            )
+            proj_in_dim = 256 * 2
+        else:
+            self.backbone = nn.Sequential(
+                conv_block(self.in_channels, 32, stride=2),
+                conv_block(32, 64, stride=2),
+                conv_block(64, 128, stride=2),
+                conv_block(128, 256, stride=2),
+                conv_block(256, 256, stride=2),
+                nn.AdaptiveAvgPool2d((1, 1)),
+            )
+            proj_in_dim = 256
         self.proj = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(256, self.feature_dim),
+            nn.Linear(proj_in_dim, self.feature_dim),
             nn.ReLU(),
         )
 
@@ -277,6 +309,8 @@ class BCPixelActorCritic(nn.Module):
         hidden_dim: int = 512,
         dropout: float = 0.05,
         policy_style: str = "sequence_classifier",
+        backbone_style: str = "avgpool",
+        feature_dim: int = 256,
         temporal_layers: int = 2,
         temporal_heads: int = 4,
         temporal_context: int = 3,
@@ -286,7 +320,13 @@ class BCPixelActorCritic(nn.Module):
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
         self.policy_style = str(policy_style)
-        self.backbone = PixelBackbone(in_channels=3, feature_dim=256)
+        self.backbone_style = str(backbone_style)
+        self.feature_dim = int(feature_dim)
+        self.backbone = PixelBackbone(
+            in_channels=3,
+            feature_dim=self.feature_dim,
+            backbone_style=self.backbone_style,
+        )
         if self.policy_style == "direct_chunk_cnn":
             self.classifier = DirectChunkPolicyHead(
                 in_dim=self.backbone.feature_dim,
