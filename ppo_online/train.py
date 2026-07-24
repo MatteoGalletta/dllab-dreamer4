@@ -674,6 +674,8 @@ class TrainConfig:
     obs_stack_size: int = 3
     frame_stride: int = 5
     network_type: str = "bc_latent"
+    image_height: int = 224
+    image_width: int = 224
     actor_hidden_dim: int = 256
     actor_dropout: float = 0.05
 
@@ -732,12 +734,20 @@ def resolve_device(device_name: str) -> torch.device:
 def make_env(rank: int, seed: int, config: TrainConfig, render_mode: str | None = None):
     def _thunk():
         tokenizer_info = None
-        if config.network_type in {"bc_pixels", "bc_latent"}:
+        if config.network_type == "bc_latent":
             _, tokenizer_info = load_tokenizer_from_ckpt(config.tokenizer_path, torch.device("cpu"))
 
         resolved_env_id = resolve_pusht_env_id(config.env_id)
-        image_height = int(tokenizer_info["H"]) if tokenizer_info is not None else None
-        image_width = int(tokenizer_info["W"]) if tokenizer_info is not None else None
+        image_height = (
+            int(tokenizer_info["H"])
+            if tokenizer_info is not None
+            else int(getattr(config, "image_height", 224))
+        )
+        image_width = (
+            int(tokenizer_info["W"])
+            if tokenizer_info is not None
+            else int(getattr(config, "image_width", 224))
+        )
         env = make_pusht_env(
             env_id=resolved_env_id,
             render_mode=render_mode or "rgb_array",
@@ -763,7 +773,11 @@ def make_env(rank: int, seed: int, config: TrainConfig, render_mode: str | None 
             action_mode=config.action_mode,
         )
         if config.network_type == "bc_pixels":
-            env = RenderedImageObsWrapper(env, tokenizer_ckpt=config.tokenizer_path)
+            env = RenderedImageObsWrapper(
+                env,
+                target_height=image_height,
+                target_width=image_width,
+            )
             env = StridedObservationStackWrapper(
                 env,
                 stack_size=config.obs_stack_size,
@@ -811,6 +825,7 @@ def _load_bc_contract_overrides(bc_prior_path: str) -> dict[str, Any]:
         return {}
 
     ckpt_args = _extract_checkpoint_args(payload)
+    state_dict = extract_checkpoint_state_dict(payload)
     overrides: dict[str, Any] = {}
     if ckpt_args.get("seq_len") is not None:
         overrides["obs_stack_size"] = int(ckpt_args["seq_len"])
@@ -824,6 +839,15 @@ def _load_bc_contract_overrides(bc_prior_path: str) -> dict[str, Any]:
         overrides["tokenizer_path"] = str(ckpt_args["tokenizer_ckpt_name"])
     if ckpt_args.get("action_mode") is not None:
         overrides["action_mode"] = str(ckpt_args["action_mode"])
+    image_hw = ckpt_args.get("image_hw")
+    if isinstance(image_hw, (list, tuple)) and len(image_hw) == 2:
+        if image_hw[0] is not None and image_hw[1] is not None:
+            overrides["image_height"] = int(image_hw[0])
+            overrides["image_width"] = int(image_hw[1])
+    if state_dict is not None:
+        state_keys = list(state_dict.keys())
+        if any(key.startswith("backbone.") or key.startswith("classifier.") for key in state_keys):
+            overrides["network_type"] = "bc_pixels"
     return overrides
 
 
@@ -859,6 +883,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train PPO on PushT with optional BC/tokenizer overrides.")
     parser.add_argument("--bc-prior-path", "--bc_checkpoint", dest="bc_prior_path", type=str, default=None)
     parser.add_argument("--bc-stats", type=str, default=None)
+    parser.add_argument("--network-type", choices=("bc_latent", "bc_pixels", "mlp"), default=None)
     parser.add_argument("--tokenizer-path", type=str, default=None)
     parser.add_argument("--save-path", type=str, default=None)
     parser.add_argument("--wandb-mode", type=str, default=None)
@@ -870,6 +895,8 @@ def parse_args():
     parser.add_argument("--frame-stack", type=int, default=None)
     parser.add_argument("--frame-stride", type=int, default=None)
     parser.add_argument("--action-chunk-size", type=int, default=None)
+    parser.add_argument("--image-height", type=int, default=None)
+    parser.add_argument("--image-width", type=int, default=None)
     parser.add_argument("--log-interval", type=int, default=None)
     parser.add_argument("--save-interval", type=int, default=None)
     parser.add_argument("--eval-interval", type=int, default=None)
@@ -1055,6 +1082,8 @@ def train_pusht():
     stats_overrides = _load_bc_stats_overrides(config.bc_stats_path)
     for key, value in stats_overrides.items():
         setattr(config, key, value)
+    if args.network_type is not None:
+        config.network_type = str(args.network_type)
     if args.tokenizer_path is not None:
         config.tokenizer_path = args.tokenizer_path
     if args.save_path is not None:
@@ -1075,6 +1104,10 @@ def train_pusht():
         config.frame_stride = int(args.frame_stride)
     if args.action_chunk_size is not None:
         config.chunk_size = int(args.action_chunk_size)
+    if args.image_height is not None:
+        config.image_height = int(args.image_height)
+    if args.image_width is not None:
+        config.image_width = int(args.image_width)
     if args.log_interval is not None:
         config.log_interval = int(args.log_interval)
     if args.save_interval is not None:
@@ -1135,7 +1168,8 @@ def train_pusht():
         config.block_start_near_goal = True
     if args.no_block_start_near_goal:
         config.block_start_near_goal = False
-    config.tokenizer_path = resolve_tokenizer_path(config.tokenizer_path)
+    if config.network_type == "bc_latent" or args.tokenizer_path is not None:
+        config.tokenizer_path = resolve_tokenizer_path(config.tokenizer_path)
     config.save_path = resolve_ppo_checkpoint_path(config.save_path)
     policy_device = resolve_device(config.device)
     tokenizer_device = resolve_device(config.tokenizer_device)
@@ -1160,13 +1194,21 @@ def train_pusht():
         f"Model paths: bc_prior={config.bc_prior_path} "
         f"tokenizer={config.tokenizer_path} save={config.save_path}"
     )
-    if config.network_type in {"bc_pixels", "bc_latent"}:
+    tokenizer_info = None
+    if config.network_type == "bc_latent":
         _, tokenizer_info = load_tokenizer_from_ckpt(config.tokenizer_path, torch.device("cpu"))
-    print(
-        "Tokenizer/image setup: "
-        f"H={tokenizer_info['H']} W={tokenizer_info['W']} "
-        f"latent_dim={tokenizer_info['latent_dim']}"
-    )
+    if tokenizer_info is not None:
+        print(
+            "Tokenizer/image setup: "
+            f"H={tokenizer_info['H']} W={tokenizer_info['W']} "
+            f"latent_dim={tokenizer_info['latent_dim']}"
+        )
+    else:
+        print(
+            "Image setup: "
+            f"H={int(config.image_height)} W={int(config.image_width)} "
+            f"network_type={config.network_type}"
+        )
     print(
         "Resolved PPO contract: "
         f"obs_stack={config.obs_stack_size} frame_stride={config.frame_stride} "
