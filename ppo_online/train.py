@@ -193,12 +193,23 @@ class OpenLoopChunkExecutionWrapper(gym.Wrapper):
         gamma: float,
         action_mode: str,
         action_output_tanh: bool = False,
+        return_rendered_history: bool = False,
+        target_height: int | None = None,
+        target_width: int | None = None,
+        stack_size: int = 1,
+        frame_stride: int = 1,
     ):
         super().__init__(env)
         self.chunk_size = int(chunk_size)
         self.gamma = float(gamma)
         self.action_mode = str(action_mode)
         self.action_output_tanh = bool(action_output_tanh)
+        self.return_rendered_history = bool(return_rendered_history)
+        self.target_height = None if target_height is None else int(target_height)
+        self.target_width = None if target_width is None else int(target_width)
+        self.stack_size = max(1, int(stack_size))
+        self.frame_stride = max(1, int(frame_stride))
+        self.frame_history: deque[np.ndarray] | None = None
 
         if self.action_mode in {"relative", "swm_relative"} or (
             self.action_mode == "absolute" and self.action_output_tanh
@@ -209,6 +220,48 @@ class OpenLoopChunkExecutionWrapper(gym.Wrapper):
             low = np.full((self.chunk_size * 2,), 0.0, dtype=np.float32)
             high = np.full((self.chunk_size * 2,), 512.0, dtype=np.float32)
         self.action_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
+        if self.return_rendered_history:
+            if self.target_height is None or self.target_width is None:
+                raise ValueError("Rendered history mode requires target_height and target_width.")
+            self.frame_history = deque(maxlen=(self.stack_size - 1) * self.frame_stride + 1)
+            self.observation_space = gym.spaces.Box(
+                low=0,
+                high=255,
+                shape=(self.stack_size, self.target_height, self.target_width, 3),
+                dtype=np.uint8,
+            )
+
+    def _render_frame(self) -> np.ndarray:
+        frame = self.env.render()
+        if frame is None:
+            raise RuntimeError("Expected renderable RGB frame for chunk history observations.")
+        frame = np.asarray(frame, dtype=np.uint8)
+        if (
+            self.target_height is not None
+            and self.target_width is not None
+            and frame.shape[:2] != (self.target_height, self.target_width)
+        ):
+            frame_tensor = torch.as_tensor(frame, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+            frame_tensor = F.interpolate(
+                frame_tensor,
+                size=(self.target_height, self.target_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+            frame = frame_tensor.squeeze(0).permute(1, 2, 0).clamp(0.0, 255.0).to(torch.uint8).cpu().numpy()
+        return frame
+
+    def _append_current_frame(self) -> None:
+        if self.frame_history is not None:
+            self.frame_history.append(self._render_frame())
+
+    def _stack_frame_history(self) -> np.ndarray:
+        if self.frame_history is None or not self.frame_history:
+            raise RuntimeError("Frame history is empty; call reset() before stepping.")
+        history = list(self.frame_history)
+        newest = len(history) - 1
+        indices = [max(0, newest - i * self.frame_stride) for i in range(self.stack_size - 1, -1, -1)]
+        return np.stack([history[idx] for idx in indices], axis=0)
 
     def _primitive_to_env_action(self, primitive: np.ndarray) -> np.ndarray:
         primitive = np.asarray(primitive, dtype=np.float32)
@@ -217,6 +270,14 @@ class OpenLoopChunkExecutionWrapper(gym.Wrapper):
         if self.action_mode == "absolute" and self.action_output_tanh:
             return np.clip((primitive + 1.0) * 256.0, 0.0, 512.0)
         return np.clip(primitive, 0.0, 512.0)
+
+    def reset(self, **kwargs):
+        observation, info = self.env.reset(**kwargs)
+        if self.frame_history is not None:
+            self.frame_history.clear()
+            self._append_current_frame()
+            return self._stack_frame_history(), info
+        return observation, info
 
     def step(self, macro_action):
         macro_action = np.asarray(macro_action, dtype=np.float32).reshape(self.chunk_size, 2)
@@ -231,6 +292,7 @@ class OpenLoopChunkExecutionWrapper(gym.Wrapper):
             obs, reward, terminated, truncated, info = self.env.step(env_action)
             total_reward += (self.gamma**j) * float(reward)
             executed_actions.append(env_action.astype(np.float32))
+            self._append_current_frame()
             if terminated or truncated:
                 break
 
@@ -238,6 +300,8 @@ class OpenLoopChunkExecutionWrapper(gym.Wrapper):
         info["executed_actions"] = np.asarray(executed_actions, dtype=np.float32)
         info["executed_primitives"] = np.asarray(macro_action[: len(executed_actions)], dtype=np.float32)
         info["num_executed_primitives"] = len(executed_actions)
+        if self.frame_history is not None:
+            obs = self._stack_frame_history()
         return obs, float(total_reward), terminated, truncated, info
 
 
@@ -780,18 +844,14 @@ def make_env(rank: int, seed: int, config: TrainConfig, render_mode: str | None 
             gamma=config.gamma,
             action_mode=config.action_mode,
             action_output_tanh=bool(getattr(config, "action_output_tanh", False)),
+            return_rendered_history=bool(config.network_type == "bc_pixels"),
+            target_height=image_height if config.network_type == "bc_pixels" else None,
+            target_width=image_width if config.network_type == "bc_pixels" else None,
+            stack_size=config.obs_stack_size if config.network_type == "bc_pixels" else 1,
+            frame_stride=config.frame_stride if config.network_type == "bc_pixels" else 1,
         )
         if config.network_type == "bc_pixels":
-            env = RenderedImageObsWrapper(
-                env,
-                target_height=image_height,
-                target_width=image_width,
-            )
-            env = StridedObservationStackWrapper(
-                env,
-                stack_size=config.obs_stack_size,
-                frame_stride=config.frame_stride,
-            )
+            pass
         elif config.network_type == "bc_latent":
             env = TokenizerLatentObsWrapper(
                 env,
