@@ -149,11 +149,13 @@ class PushTNPZSequenceDataset(Dataset):
         end_idx = start_idx + self.raw_seq_len
         images = self.images[start_idx:end_idx]
         actions = self.actions[start_idx:end_idx]
+        states = self.states[start_idx:end_idx]
 
         obs_indices = np.arange(self.seq_len, dtype=np.int64) * self.frame_stride
         action_start = int(obs_indices[-1])
         action_end = action_start + self.action_chunk_size
         images = images[obs_indices]
+        states = states[obs_indices]
         actions = actions[action_start:action_end].reshape(-1)
 
         if images.dtype != np.uint8:
@@ -171,10 +173,34 @@ class PushTNPZSequenceDataset(Dataset):
                 align_corners=False,
             )
         action_tensor = torch.from_numpy(actions).float()
+        state_tensor = torch.from_numpy(states).float()
         return {
             "image": image_tensor,
             "action": action_tensor,
+            "state": state_tensor,
         }
+
+
+class SpatialSoftmax(nn.Module):
+    def __init__(self, temperature=1.0):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_flat = x.view(B, C, H * W) / self.temperature
+        weights = F.softmax(x_flat, dim=-1)
+        weights = weights.view(B, C, H, W)
+
+        device = x.device
+        y_coord = torch.linspace(-1.0, 1.0, H, device=device)
+        x_coord = torch.linspace(-1.0, 1.0, W, device=device)
+        y_grid, x_grid = torch.meshgrid(y_coord, x_coord, indexing='ij')
+        
+        expected_y = torch.sum(weights * y_grid, dim=(2, 3))
+        expected_x = torch.sum(weights * x_grid, dim=(2, 3))
+        
+        return torch.cat([expected_x, expected_y], dim=-1)
 
 
 class CNNBackbone(nn.Module):
@@ -204,12 +230,12 @@ class CNNBackbone(nn.Module):
             conv_block(64, 128, stride=2),
             conv_block(128, 256, stride=2),
             conv_block(256, 256, stride=2),
-            nn.AdaptiveAvgPool2d((1, 1)),
+            SpatialSoftmax(),
         )
 
         self.proj = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(256, self.feature_dim),
+            nn.Linear(256 * 2, self.feature_dim),
             nn.ReLU(),
         )
 
@@ -238,9 +264,9 @@ class DirectChunkPolicyHead(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(int(in_dim) * self.seq_len, int(hidden_dim)),
             nn.ReLU(),
-            # nn.Dropout(float(dropout)),
-            # nn.Linear(int(hidden_dim), int(hidden_dim)),
-            # nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), int(hidden_dim)),
+            nn.ReLU(),
             nn.Dropout(float(dropout)),
             nn.Linear(int(hidden_dim), self.action_dim),
         )
