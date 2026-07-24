@@ -796,6 +796,8 @@ def make_env(rank: int, seed: int, config: TrainConfig, render_mode: str | None 
             )
         else:
             env = PushTObsWrapper(env)
+        if str(config.vector_env) == "manual":
+            env = gym.wrappers.RecordEpisodeStatistics(env)
         env.action_space.seed(seed + rank)
         env.observation_space.seed(seed + rank)
         return env
