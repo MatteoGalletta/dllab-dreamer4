@@ -24,52 +24,7 @@ from .agent import PPOAgent
 from .buffer import PPOVectorBuffer
 from .model_paths import resolve_bc_prior_path, resolve_ppo_checkpoint_path, resolve_tokenizer_path
 from .tokenizer_utils import TokenizerZEncoder, load_tokenizer_from_ckpt
-
-
-def pool_latents(z_unpacked: torch.Tensor) -> torch.Tensor:
-    """Collapses spatial patches by taking their spatial token mean."""
-    return z_unpacked.mean(dim=-2)
-
-
-class LatentContextSampler:
-    def __init__(self, npz_path: str, action_chunk_size: int, device: torch.device):
-        self.device = device
-        self.action_chunk_size = action_chunk_size
-
-        data = np.load(npz_path, allow_pickle=True)
-        self.images = data["images"]
-        self.actions_raw = data["actions"]
-
-        ends = data["episode_ends"]
-        starts = np.zeros_like(ends)
-        starts[1:] = ends[:-1]
-
-        self.episodes = []
-        for s, e in zip(starts, ends):
-            raw_len = e - s
-            seq_len = raw_len // action_chunk_size
-            used = seq_len * action_chunk_size
-
-            if seq_len >= 24:
-                ep_imgs = self.images[s:s + used][::action_chunk_size]
-                ep_acts = self.actions_raw[s:s + used].reshape(seq_len, -1)
-                self.episodes.append((ep_imgs, ep_acts))
-
-    def sample_context(self, batch_size: int, ctx_len: int = 24):
-        batch_imgs, batch_acts = [], []
-        indices = np.random.choice(len(self.episodes), size=batch_size, replace=True)
-
-        for idx in indices:
-            ep_imgs, ep_acts = self.episodes[idx]
-            t_start = np.random.randint(0, len(ep_imgs) - ctx_len)
-
-            batch_imgs.append(ep_imgs[t_start: t_start + ctx_len])
-            batch_acts.append(ep_acts[t_start: t_start + ctx_len])
-
-        imgs_tensor = torch.from_numpy(np.stack(batch_imgs)).permute(0, 1, 4, 2, 3).float() / 255.0
-        acts_tensor = torch.from_numpy(np.stack(batch_acts)).float()
-
-        return imgs_tensor.to(self.device), acts_tensor.to(self.device)
+from .latent_env import LatentContextSampler, LatentImaginationEnv
 
 
 class StridedObservationStackWrapper(gym.ObservationWrapper):
@@ -110,11 +65,11 @@ class ActionChunkingTemporalEnsembleWrapper(gym.Wrapper):
     """
 
     def __init__(
-        self,
-        env: gym.Env,
-        chunk_size: int = 5,
-        max_step_pixels: float = 15.0,
-        ensemble_decay: float = 0.5,
+            self,
+            env: gym.Env,
+            chunk_size: int = 5,
+            max_step_pixels: float = 15.0,
+            ensemble_decay: float = 0.5,
     ):
         super().__init__(env)
         self.chunk_size = chunk_size
@@ -186,12 +141,12 @@ class OpenLoopChunkExecutionWrapper(gym.Wrapper):
     """
 
     def __init__(
-        self,
-        env: gym.Env,
-        *,
-        chunk_size: int,
-        gamma: float,
-        action_mode: str,
+            self,
+            env: gym.Env,
+            *,
+            chunk_size: int,
+            gamma: float,
+            action_mode: str,
     ):
         super().__init__(env)
         self.chunk_size = int(chunk_size)
@@ -223,7 +178,7 @@ class OpenLoopChunkExecutionWrapper(gym.Wrapper):
         for j, primitive in enumerate(macro_action):
             env_action = self._primitive_to_env_action(primitive)
             obs, reward, terminated, truncated, info = self.env.step(env_action)
-            total_reward += (self.gamma**j) * float(reward)
+            total_reward += (self.gamma ** j) * float(reward)
             executed_actions.append(env_action.astype(np.float32))
             if terminated or truncated:
                 break
@@ -301,9 +256,9 @@ class PushTDenseRewardWrapper(gym.Wrapper):
         while env is not None and id(env) not in visited:
             visited.add(id(env))
             if hasattr(env, "window_size") and (
-                hasattr(env, "block")
-                or hasattr(env, "_setup")
-                or hasattr(env, "_get_info")
+                    hasattr(env, "block")
+                    or hasattr(env, "_setup")
+                    or hasattr(env, "_get_info")
             ):
                 return env
             env = getattr(env, "env", None)
@@ -468,11 +423,11 @@ class RenderedImageObsWrapper(gym.ObservationWrapper):
     """
 
     def __init__(
-        self,
-        env: gym.Env,
-        tokenizer_ckpt: str | None = None,
-        target_height: int | None = None,
-        target_width: int | None = None,
+            self,
+            env: gym.Env,
+            tokenizer_ckpt: str | None = None,
+            target_height: int | None = None,
+            target_width: int | None = None,
     ):
         super().__init__(env)
         if tokenizer_ckpt is not None:
@@ -481,7 +436,8 @@ class RenderedImageObsWrapper(gym.ObservationWrapper):
             self.target_width = int(info["W"])
         else:
             if target_height is None or target_width is None:
-                raise ValueError("RenderedImageObsWrapper needs either tokenizer_ckpt or explicit target_height/target_width.")
+                raise ValueError(
+                    "RenderedImageObsWrapper needs either tokenizer_ckpt or explicit target_height/target_width.")
             self.target_height = int(target_height)
             self.target_width = int(target_width)
         self.observation_space = gym.spaces.Box(
@@ -593,14 +549,14 @@ def add_timeout_bootstrap_rewards(rewards, terminations, truncations, infos, age
 
 
 def add_timeout_bootstrap_rewards_manual(
-    rewards,
-    terminations,
-    truncations,
-    final_observations,
-    executed_steps,
-    agent,
-    device,
-    gamma,
+        rewards,
+        terminations,
+        truncations,
+        final_observations,
+        executed_steps,
+        agent,
+        device,
+        gamma,
 ):
     rewards = np.asarray(rewards, dtype=np.float32).copy()
     terminations = np.asarray(terminations, dtype=bool)
@@ -908,16 +864,24 @@ def parse_args():
     parser.add_argument("--no-fixed-target-block-success", action="store_true")
     parser.add_argument("--block-start-near-goal", action="store_true")
     parser.add_argument("--no-block-start-near-goal", action="store_true")
+
+    # === Add these lines at the very end of parse_args() ===
+    parser.add_argument("--dynamics-ckpt", type=str, required=True, help="Path to dynamics checkpoint .pt file")
+    parser.add_argument("--reward-ckpt", type=str, required=True, help="Path to reward checkpoint .pt file")
+    parser.add_argument("--dataset-path", type=str, required=True, help="Path to expert trajectory dataset .npz file")
+    parser.add_argument("--packing-factor", type=int, default=4,
+                        help="Spatial packing factor used by the dynamics model")
+
     return parser.parse_args()
 
 
 def evaluate_current_policy(
-    agent: PPOAgent,
-    config: TrainConfig,
-    *,
-    episodes: int,
-    seed: int,
-    device: torch.device,
+        agent: PPOAgent,
+        config: TrainConfig,
+        *,
+        episodes: int,
+        seed: int,
+        device: torch.device,
 ) -> dict[str, float]:
     env = make_env(0, seed, config, render_mode="rgb_array")()
     returns = []
@@ -967,11 +931,11 @@ def _manual_reset_envs(envs: list[gym.Env], seed: int) -> np.ndarray:
 
 
 def _manual_step_envs(
-    envs: list[gym.Env],
-    actions_np: np.ndarray,
-    *,
-    base_seed: int,
-    global_env_steps: int,
+        envs: list[gym.Env],
+        actions_np: np.ndarray,
+        *,
+        base_seed: int,
+        global_env_steps: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[dict[str, Any]], list[np.ndarray | None], np.ndarray]:
     next_states = []
     rewards = []
@@ -1013,12 +977,12 @@ def _manual_step_envs(
 
 
 def save_ppo_checkpoint(
-    path: Path,
-    *,
-    agent: PPOAgent,
-    config: TrainConfig,
-    global_step: int,
-    success_rate: float | None = None,
+        path: Path,
+        *,
+        agent: PPOAgent,
+        config: TrainConfig,
+        global_step: int,
+        success_rate: float | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -1196,7 +1160,8 @@ def train_pusht():
         envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
 
         if config.vector_env == "async":
-            print("Warning: AsyncVectorEnv creates separate worker processes, so tokenizer models are duplicated per worker.")
+            print(
+                "Warning: AsyncVectorEnv creates separate worker processes, so tokenizer models are duplicated per worker.")
         elif device.type == "cpu" and tokenizer_device.type == "cpu":
             print("Warning: policy and tokenizer are both on CPU, so latent observation training will be slow.")
 
@@ -1239,6 +1204,40 @@ def train_pusht():
         agent.network.log_std.requires_grad_(False)
         agent.set_log_std(config.init_log_std)
     print(agent.prior_load_info.message)
+
+    # =========================================================================
+    # MODEL-BASED IMAGINATION INITIALIZATION
+    # =========================================================================
+    print("Loading world model checkpoints for latent imagination sandbox...")
+
+    # 1. Force the PPO buffer to match our safe dream horizon cap
+    config.rollout_steps = 10
+
+    # 2. Instantiate a clean tokenizer encoder backbone for the sampler sequence
+    encoder_backbone = agent.network.backbone if hasattr(agent.network, "backbone") else None
+
+    # 3. Load the Dynamics and Reward Head networks safely
+    dyn_payload = torch.load(args.dynamics_ckpt, map_location=device)
+    dynamics_model = dyn_payload["model"] if isinstance(dyn_payload, dict) and "model" in dyn_payload else dyn_payload
+
+    reward_payload = torch.load(args.reward_ckpt, map_location=device)
+    reward_model = reward_payload["model"] if isinstance(reward_payload,
+                                                         dict) and "model" in reward_payload else reward_payload
+
+    dynamics_model.eval()
+    reward_model.eval()
+
+    # 4. Instantiate the components
+    sampler = LatentContextSampler(args.dataset_path, action_chunk_size=config.chunk_size, device=device)
+    imag_env = LatentImaginationEnv(
+        dynamics=dynamics_model,
+        reward_head=reward_model,
+        encoder=encoder_backbone,
+        frame_stack=config.obs_stack_size,
+        packing_factor=args.packing_factor,
+        device=device
+    )
+    # =========================================================================
 
     buffer = PPOVectorBuffer(
         buffer_size=config.rollout_steps,
@@ -1285,128 +1284,35 @@ def train_pusht():
         rollout_coverage_proxies = []
         rollout_chunks = []
 
-        for _ in range(config.rollout_steps):
+        # A. Bootstrap Context: Sample 24 frames of real history to anchor the dream
+        real_imgs, real_acts = sampler.sample_context(batch_size=config.num_envs, ctx_len=24)
+        states_tensor = imag_env.reset(real_imgs, real_acts)
+        states = states_tensor.cpu().numpy()
+
+        # B. Dream step-by-step inside the world model sandbox
+        for step in range(config.rollout_steps):
             state_tensor = torch.as_tensor(states, dtype=torch.float32, device=device)
 
             with torch.no_grad():
                 actions, logprobs, _, values = agent.network.get_action_and_value(state_tensor)
 
             actions_np = actions.detach().cpu().numpy().astype(np.float32)
-            env_actions = actions_np
             action_abs_max = max(action_abs_max, float(np.max(np.abs(actions_np))))
 
-            if manual_envs is not None:
-                (
-                    next_states,
-                    rewards,
-                    terminations,
-                    truncations,
-                    infos,
-                    final_observations,
-                    executed_primitives,
-                ) = _manual_step_envs(
-                    manual_envs,
-                    env_actions,
-                    base_seed=config.seed,
-                    global_env_steps=global_env_steps,
-                )
-                global_env_steps += int(np.sum(executed_primitives))
-                rewards, missing_count = add_timeout_bootstrap_rewards_manual(
-                    rewards=rewards,
-                    terminations=terminations,
-                    truncations=truncations,
-                    final_observations=final_observations,
-                    executed_steps=executed_primitives,
-                    agent=agent,
-                    device=device,
-                    gamma=config.gamma,
-                )
-            else:
-                next_states, rewards, terminations, truncations, infos = envs.step(env_actions)
-                executed_primitives = None
-                if "num_executed_primitives" in infos:
-                    try:
-                        executed_primitives = np.asarray(infos["num_executed_primitives"], dtype=np.int32)
-                    except Exception:
-                        executed_primitives = None
-                if executed_primitives is None:
-                    global_env_steps += int(config.num_envs * config.chunk_size)
-                else:
-                    global_env_steps += int(np.sum(executed_primitives))
+            # C. Step the world model forward entirely on the GPU!
+            next_states_tensor, rewards_tensor, dones_tensor = imag_env.step(actions)
 
-                rewards, missing_count = add_timeout_bootstrap_rewards(
-                    rewards=np.asarray(rewards, dtype=np.float32),
-                    terminations=np.asarray(terminations, dtype=bool),
-                    truncations=np.asarray(truncations, dtype=bool),
-                    infos=infos,
-                    agent=agent,
-                    device=device,
-                    gamma=config.gamma,
-                )
+            next_states = next_states_tensor.cpu().numpy()
+            rewards = rewards_tensor.cpu().numpy()
+            dones_for_gae = dones_tensor.cpu().numpy()
 
-            if missing_count > 0 and not warned_missing_timeout_bootstrap:
-                warned_missing_timeout_bootstrap = True
-                print("Warning: TimeLimit bootstrapping is missing final_observation.")
+            # Advance global tracking step counts based on your environment chunks
+            global_env_steps += int(config.num_envs * config.chunk_size)
 
-            dones_for_gae = np.logical_or(terminations, truncations).astype(np.float32)
             if reward_normalizer is not None:
                 rewards = reward_normalizer.normalize(rewards, dones_for_gae)
 
-            if manual_envs is not None:
-                for info in infos:
-                    rollout_chunks.append(float(info.get("num_executed_primitives", config.chunk_size)))
-                    episode = info.get("episode")
-                    if episode is None:
-                        continue
-                    ep_return = as_float(episode.get("r", 0.0))
-                    rollout_returns.append(ep_return)
-                    if "coverage" in info:
-                        rollout_coverages.append(float(info["coverage"]))
-                    if "coverage_proxy" in info:
-                        rollout_coverage_proxies.append(float(info["coverage_proxy"]))
-            else:
-                if "num_active_chunks" in infos:
-                    try:
-                        rollout_chunks.append(float(np.mean(np.asarray(infos["num_active_chunks"], dtype=np.float32))))
-                    except Exception:
-                        pass
-
-                if "episode" in infos and "_episode" in infos:
-                    for i, is_done in enumerate(infos["_episode"]):
-                        if is_done:
-                            ep_return = float(infos["episode"]["r"][i])
-                            coverage = None
-                            if "final_info" in infos and infos["final_info"][i] is not None:
-                                coverage = infos["final_info"][i].get("coverage")
-                            elif "coverage" in infos:
-                                try:
-                                    coverage = infos["coverage"][i]
-                                except Exception:
-                                    coverage = None
-
-                            rollout_returns.append(ep_return)
-                            if coverage is not None:
-                                rollout_coverages.append(float(coverage))
-                            coverage_proxy = None
-                            if "final_info" in infos and infos["final_info"][i] is not None:
-                                coverage_proxy = infos["final_info"][i].get("coverage_proxy")
-                            elif "coverage_proxy" in infos:
-                                try:
-                                    coverage_proxy = infos["coverage_proxy"][i]
-                                except Exception:
-                                    coverage_proxy = None
-                            if coverage_proxy is not None:
-                                rollout_coverage_proxies.append(float(coverage_proxy))
-                elif "final_info" in infos:
-                    for final_info in infos["final_info"]:
-                        if final_info is not None and "episode" in final_info:
-                            ep_return = as_float(final_info["episode"].get("r", 0.0))
-                            rollout_returns.append(ep_return)
-                            if "coverage" in final_info:
-                                rollout_coverages.append(float(final_info["coverage"]))
-                            if "coverage_proxy" in final_info:
-                                rollout_coverage_proxies.append(float(final_info["coverage_proxy"]))
-
+            # D. Store data natively into your existing PPO buffer format
             buffer.store(
                 states,
                 actions.detach(),
@@ -1418,6 +1324,7 @@ def train_pusht():
 
             reward_sum += float(np.sum(rewards))
             reward_count += int(np.size(rewards))
+
             states = next_states
             last_dones_for_gae = dones_for_gae
 
@@ -1470,7 +1377,7 @@ def train_pusht():
             wandb_log_dict["Environment/Max_Coverage"] = max(rollout_coverages)
         if rollout_coverage_proxies:
             wandb_log_dict["Environment/Mean_Coverage_Proxy"] = (
-                sum(rollout_coverage_proxies) / len(rollout_coverage_proxies)
+                    sum(rollout_coverage_proxies) / len(rollout_coverage_proxies)
             )
             wandb_log_dict["Environment/Max_Coverage_Proxy"] = max(rollout_coverage_proxies)
         if rollout_chunks:
