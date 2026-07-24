@@ -8,7 +8,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .networks import BCPixelActorCritic, BCStyleLatentActorCritic, TokenizerLatentBCPPOActorCritic, VectorActorCritic
+from .networks import (
+    BCPixelActorCritic,
+    BCStyleLatentActorCritic,
+    ResidualBCPixelActorCritic,
+    TokenizerLatentBCPPOActorCritic,
+    VectorActorCritic,
+)
 
 
 @dataclass
@@ -243,6 +249,8 @@ class PPOAgent:
         network_type: str = "mlp",
         actor_hidden_dim: int = 512,
         actor_dropout: float = 0.05,
+        bc_pixel_residual: bool = False,
+        bc_pixel_residual_scale: float = 0.05,
         obs_shape: tuple[int, ...] | None = None,
         tokenizer_path: str | None = None,
         backbone_device: torch.device | str = "cpu",
@@ -251,6 +259,8 @@ class PPOAgent:
         self.obs_shape = obs_shape
         self.tokenizer_path = tokenizer_path
         self.backbone_device = torch.device(backbone_device)
+        self.bc_pixel_residual = bool(bc_pixel_residual)
+        self.bc_pixel_residual_scale = float(bc_pixel_residual_scale)
         self.bc_latent_architecture: dict[str, Any] | None = None
         self.bc_pixel_architecture: dict[str, Any] | None = None
         if network_type == "bc_pixels":
@@ -262,16 +272,30 @@ class PPOAgent:
                 action_dim=action_dim,
                 actor_hidden_dim=actor_hidden_dim,
             )
-            self.network = BCPixelActorCritic(
-                image_shape=obs_shape,
-                action_dim=action_dim,
-                hidden_dim=self.bc_pixel_architecture["hidden_dim"],
-                dropout=actor_dropout,
-                policy_style=self.bc_pixel_architecture["policy_style"],
-                backbone_style=self.bc_pixel_architecture["backbone_style"],
-                feature_dim=self.bc_pixel_architecture["feature_dim"],
-                action_output_tanh=self.bc_pixel_architecture["action_output_tanh"],
-            ).to(self.device_override)
+            if self.bc_pixel_residual:
+                self.network = ResidualBCPixelActorCritic(
+                    image_shape=obs_shape,
+                    action_dim=action_dim,
+                    hidden_dim=self.bc_pixel_architecture["hidden_dim"],
+                    dropout=actor_dropout,
+                    policy_style=self.bc_pixel_architecture["policy_style"],
+                    backbone_style=self.bc_pixel_architecture["backbone_style"],
+                    feature_dim=self.bc_pixel_architecture["feature_dim"],
+                    action_output_tanh=self.bc_pixel_architecture["action_output_tanh"],
+                    residual_scale=self.bc_pixel_residual_scale,
+                    init_log_std=prior_log_std_init if prior_log_std_init is not None else -1.0,
+                ).to(self.device_override)
+            else:
+                self.network = BCPixelActorCritic(
+                    image_shape=obs_shape,
+                    action_dim=action_dim,
+                    hidden_dim=self.bc_pixel_architecture["hidden_dim"],
+                    dropout=actor_dropout,
+                    policy_style=self.bc_pixel_architecture["policy_style"],
+                    backbone_style=self.bc_pixel_architecture["backbone_style"],
+                    feature_dim=self.bc_pixel_architecture["feature_dim"],
+                    action_output_tanh=self.bc_pixel_architecture["action_output_tanh"],
+                ).to(self.device_override)
         elif network_type == "bc_latent":
             self.bc_latent_architecture = _infer_bc_latent_architecture(
                 bc_prior_path,
@@ -406,7 +430,15 @@ class PPOAgent:
             if not load_target:
                 return PriorLoadInfo(False, "BC prior does not contain backbone/classifier weights for bc_pixels PPO.")
             try:
-                incompatible = self.network.load_state_dict(load_target, strict=False)
+                if self.bc_pixel_residual:
+                    incompatible = self.network.base_policy.load_state_dict(load_target, strict=False)
+                    residual_incompatible = self.network.residual_policy.load_state_dict(load_target, strict=False)
+                    self.network.zero_residual_actor_head()
+                    self.network.freeze_base_policy()
+                    if residual_incompatible.missing_keys or residual_incompatible.unexpected_keys:
+                        incompatible = residual_incompatible
+                else:
+                    incompatible = self.network.load_state_dict(load_target, strict=False)
             except RuntimeError as error:
                 return PriorLoadInfo(
                     False,
@@ -440,16 +472,19 @@ class PPOAgent:
                 )
 
         if self.network_type == "bc_pixels":
-            prior_network = BCPixelActorCritic(
-                image_shape=self.obs_shape or getattr(self.network, "image_shape"),
-                action_dim=action_dim,
-                hidden_dim=getattr(self.network, "hidden_dim", 512),
-                dropout=0.0,
-                policy_style=getattr(self.network, "policy_style", "sequence_classifier"),
-                backbone_style=getattr(self.network, "backbone_style", "avgpool"),
-                feature_dim=getattr(self.network, "feature_dim", 256),
-                action_output_tanh=getattr(self.network, "action_output_tanh", True),
-            ).to(self.device)
+            if self.bc_pixel_residual:
+                prior_network = self.network.base_policy
+            else:
+                prior_network = BCPixelActorCritic(
+                    image_shape=self.obs_shape or getattr(self.network, "image_shape"),
+                    action_dim=action_dim,
+                    hidden_dim=getattr(self.network, "hidden_dim", 512),
+                    dropout=0.0,
+                    policy_style=getattr(self.network, "policy_style", "sequence_classifier"),
+                    backbone_style=getattr(self.network, "backbone_style", "avgpool"),
+                    feature_dim=getattr(self.network, "feature_dim", 256),
+                    action_output_tanh=getattr(self.network, "action_output_tanh", True),
+                ).to(self.device)
         elif self.network_type == "bc_latent":
             prior_network = TokenizerLatentBCPPOActorCritic(
                 feature_dim=int(self.network.feature_dim),
@@ -465,13 +500,14 @@ class PPOAgent:
                 action_dim=action_dim,
                 actor_output_tanh=actor_output_tanh,
             ).to(self.device)
-        prior_network.load_state_dict(self.network.state_dict(), strict=False)
-        if prior_log_std_init is not None:
-            with torch.no_grad():
-                prior_network.log_std.fill_(prior_log_std_init)
-        prior_network.eval()
-        for parameter in prior_network.parameters():
-            parameter.requires_grad_(False)
+        if not (self.network_type == "bc_pixels" and self.bc_pixel_residual):
+            prior_network.load_state_dict(self.network.state_dict(), strict=False)
+            if prior_log_std_init is not None:
+                with torch.no_grad():
+                    prior_network.log_std.fill_(prior_log_std_init)
+            prior_network.eval()
+            for parameter in prior_network.parameters():
+                parameter.requires_grad_(False)
         self._prior_network = prior_network
 
         missing = list(incompatible.missing_keys)
@@ -502,6 +538,8 @@ class PPOAgent:
                 f"policy={self.bc_pixel_architecture['policy_style']}, "
                 f"backbone={self.bc_pixel_architecture['backbone_style']}, "
                 f"tanh={self.bc_pixel_architecture['action_output_tanh']}, "
+                f"residual={self.bc_pixel_residual}, "
+                f"residual_scale={self.bc_pixel_residual_scale}, "
                 f"source={self.bc_pixel_architecture['source']})"
             )
         return PriorLoadInfo(True, " ".join(parts))

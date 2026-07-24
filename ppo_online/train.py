@@ -678,6 +678,8 @@ class TrainConfig:
     image_width: int = 224
     actor_hidden_dim: int = 256
     actor_dropout: float = 0.05
+    bc_pixel_residual: bool = False
+    bc_pixel_residual_scale: float = 0.05
 
     bc_prior_path: str = "local_models/behavior_cloning/latest.pt"
     bc_stats_path: str | None = None
@@ -909,6 +911,9 @@ def parse_args():
     parser.add_argument("--num-chunks", type=int, default=None)
     parser.add_argument("--total-timesteps", type=int, default=None)
     parser.add_argument("--hidden-dim", type=int, default=None)
+    parser.add_argument("--bc-pixel-residual", action="store_true")
+    parser.add_argument("--no-bc-pixel-residual", action="store_true")
+    parser.add_argument("--bc-pixel-residual-scale", type=float, default=None)
     parser.add_argument("--frame-stack", type=int, default=None)
     parser.add_argument("--frame-stride", type=int, default=None)
     parser.add_argument("--action-chunk-size", type=int, default=None)
@@ -1115,6 +1120,12 @@ def train_pusht():
         config.total_timesteps = int(args.total_timesteps)
     if args.hidden_dim is not None:
         config.actor_hidden_dim = int(args.hidden_dim)
+    if args.bc_pixel_residual:
+        config.bc_pixel_residual = True
+    if args.no_bc_pixel_residual:
+        config.bc_pixel_residual = False
+    if args.bc_pixel_residual_scale is not None:
+        config.bc_pixel_residual_scale = float(args.bc_pixel_residual_scale)
     if args.frame_stack is not None:
         config.obs_stack_size = int(args.frame_stack)
     if args.frame_stride is not None:
@@ -1290,6 +1301,8 @@ def train_pusht():
         network_type=config.network_type,
         actor_hidden_dim=config.actor_hidden_dim,
         actor_dropout=config.actor_dropout,
+        bc_pixel_residual=config.bc_pixel_residual,
+        bc_pixel_residual_scale=config.bc_pixel_residual_scale,
         obs_shape=obs_shape,
         tokenizer_path=config.tokenizer_path,
         backbone_device=tokenizer_device,
@@ -1297,6 +1310,10 @@ def train_pusht():
     if config.anneal_log_std:
         agent.network.log_std.requires_grad_(False)
         agent.set_log_std(config.init_log_std)
+    if config.network_type == "bc_pixels" and agent.bc_pixel_architecture is not None:
+        config.backbone_style = str(agent.bc_pixel_architecture["backbone_style"])
+        config.feature_dim = int(agent.bc_pixel_architecture["feature_dim"])
+        config.action_output_tanh = bool(agent.bc_pixel_architecture["action_output_tanh"])
     print(agent.prior_load_info.message)
 
     buffer = PPOVectorBuffer(

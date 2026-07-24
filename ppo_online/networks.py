@@ -401,6 +401,104 @@ class BCPixelActorCritic(nn.Module):
         return self.critic(self._last_features(image_obs))
 
 
+def zero_bc_pixel_actor_head(module: BCPixelActorCritic) -> None:
+    classifier = module.classifier
+    if hasattr(classifier, "net") and len(classifier.net) > 0 and isinstance(classifier.net[-1], nn.Linear):
+        nn.init.zeros_(classifier.net[-1].weight)
+        nn.init.zeros_(classifier.net[-1].bias)
+    temporal_out = getattr(classifier, "temporal_out", None)
+    if isinstance(temporal_out, nn.Linear):
+        nn.init.zeros_(temporal_out.weight)
+        nn.init.zeros_(temporal_out.bias)
+
+
+class ResidualBCPixelActorCritic(nn.Module):
+    def __init__(
+        self,
+        image_shape: tuple[int, ...],
+        action_dim: int,
+        hidden_dim: int = 512,
+        dropout: float = 0.05,
+        policy_style: str = "sequence_classifier",
+        backbone_style: str = "avgpool",
+        feature_dim: int = 256,
+        action_output_tanh: bool = True,
+        temporal_layers: int = 2,
+        temporal_heads: int = 4,
+        temporal_context: int = 3,
+        residual_scale: float = 0.05,
+        init_log_std: float = -1.0,
+    ):
+        super().__init__()
+        self.image_shape = tuple(image_shape)
+        self.action_dim = int(action_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.policy_style = str(policy_style)
+        self.backbone_style = str(backbone_style)
+        self.feature_dim = int(feature_dim)
+        self.action_output_tanh = bool(action_output_tanh)
+        self.residual_scale = float(residual_scale)
+        self.base_policy = BCPixelActorCritic(
+            image_shape=self.image_shape,
+            action_dim=self.action_dim,
+            hidden_dim=self.hidden_dim,
+            dropout=0.0,
+            policy_style=self.policy_style,
+            backbone_style=self.backbone_style,
+            feature_dim=self.feature_dim,
+            action_output_tanh=self.action_output_tanh,
+            temporal_layers=temporal_layers,
+            temporal_heads=temporal_heads,
+            temporal_context=temporal_context,
+        )
+        self.residual_policy = BCPixelActorCritic(
+            image_shape=self.image_shape,
+            action_dim=self.action_dim,
+            hidden_dim=self.hidden_dim,
+            dropout=dropout,
+            policy_style=self.policy_style,
+            backbone_style=self.backbone_style,
+            feature_dim=self.feature_dim,
+            action_output_tanh=self.action_output_tanh,
+            temporal_layers=temporal_layers,
+            temporal_heads=temporal_heads,
+            temporal_context=temporal_context,
+        )
+        self.log_std = nn.Parameter(torch.full((1, self.action_dim), float(init_log_std)))
+        self.zero_residual_actor_head()
+
+    def freeze_base_policy(self) -> None:
+        self.base_policy.eval()
+        for parameter in self.base_policy.parameters():
+            parameter.requires_grad_(False)
+
+    def zero_residual_actor_head(self) -> None:
+        zero_bc_pixel_actor_head(self.residual_policy)
+
+    def actor_mean(self, image_obs: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            base_mean = self.base_policy.actor_mean(image_obs)
+        residual_mean = self.residual_policy.actor_mean(image_obs)
+        return base_mean + self.residual_scale * residual_mean
+
+    def action_dist(self, image_obs: torch.Tensor) -> Normal:
+        mean = self.actor_mean(image_obs)
+        std = self.log_std.exp().expand_as(mean)
+        return Normal(mean, std)
+
+    def get_action_and_value(self, image_obs: torch.Tensor, action: torch.Tensor | None = None):
+        distribution = self.action_dist(image_obs)
+        if action is None:
+            action = distribution.sample()
+        value = self.get_value(image_obs)
+        log_prob = distribution.log_prob(action).sum(dim=-1)
+        entropy = distribution.entropy().sum(dim=-1)
+        return action, log_prob, entropy, value
+
+    def get_value(self, image_obs: torch.Tensor) -> torch.Tensor:
+        return self.residual_policy.get_value(image_obs)
+
+
 class BCStyleLatentActorCritic(nn.Module):
     """
     PPO actor-critic that matches the BC classifier head while consuming

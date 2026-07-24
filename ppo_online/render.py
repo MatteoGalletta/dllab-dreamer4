@@ -24,7 +24,7 @@ from gymnasium.wrappers import FrameStackObservation
 
 from ppo_online.env_config import make_pusht_env, resolve_pusht_env_id
 from ppo_online.model_paths import resolve_bc_prior_path, resolve_ppo_checkpoint_path, resolve_tokenizer_path
-from ppo_online.networks import BCPixelActorCritic, TokenizerLatentBCPPOActorCritic, VectorActorCritic
+from ppo_online.networks import BCPixelActorCritic, ResidualBCPixelActorCritic, TokenizerLatentBCPPOActorCritic, VectorActorCritic
 from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
 from ppo_online.train import (
     ActionChunkingTemporalEnsembleWrapper,
@@ -139,7 +139,13 @@ def load_bc_prior_into_network(network: torch.nn.Module, path: str, device: torc
         }
         if not actor_state:
             raise ValueError(f"No backbone/classifier weights found in BC prior {path}")
-        incompatible = network.load_state_dict(actor_state, strict=False)
+        if hasattr(network, "base_policy") and hasattr(network, "residual_policy"):
+            incompatible = network.base_policy.load_state_dict(actor_state, strict=False)
+            network.residual_policy.load_state_dict(actor_state, strict=False)
+            network.zero_residual_actor_head()
+            network.freeze_base_policy()
+        else:
+            incompatible = network.load_state_dict(actor_state, strict=False)
     else:
         raise ValueError(f"BC prior loading is only supported for bc_latent/bc_pixels, got {network_type}")
 
@@ -543,16 +549,36 @@ def render_agent_to_video():
         network.policy.load_state_dict(cleaned_bc_state, strict=True)
         print(f"Loaded BC prior from {model_path}.")
     elif config.network_type == "bc_pixels":
-        network = BCPixelActorCritic(
-            image_shape=obs_shape,
-            action_dim=action_dim,
-            hidden_dim=config.actor_hidden_dim,
-            dropout=config.actor_dropout,
-            policy_style=policy_style,
-            temporal_layers=temporal_layers,
-            temporal_heads=temporal_heads,
-            temporal_context=temporal_context,
-        ).to(device)
+        if bool(getattr(config, "bc_pixel_residual", False)):
+            network = ResidualBCPixelActorCritic(
+                image_shape=obs_shape,
+                action_dim=action_dim,
+                hidden_dim=config.actor_hidden_dim,
+                dropout=config.actor_dropout,
+                policy_style=policy_style,
+                backbone_style=str(getattr(config, "backbone_style", "avgpool")),
+                feature_dim=int(getattr(config, "feature_dim", 256)),
+                action_output_tanh=bool(getattr(config, "action_output_tanh", True)),
+                temporal_layers=temporal_layers,
+                temporal_heads=temporal_heads,
+                temporal_context=temporal_context,
+                residual_scale=float(getattr(config, "bc_pixel_residual_scale", 0.05)),
+                init_log_std=config.init_log_std,
+            ).to(device)
+        else:
+            network = BCPixelActorCritic(
+                image_shape=obs_shape,
+                action_dim=action_dim,
+                hidden_dim=config.actor_hidden_dim,
+                dropout=config.actor_dropout,
+                policy_style=policy_style,
+                backbone_style=str(getattr(config, "backbone_style", "avgpool")),
+                feature_dim=int(getattr(config, "feature_dim", 256)),
+                action_output_tanh=bool(getattr(config, "action_output_tanh", True)),
+                temporal_layers=temporal_layers,
+                temporal_heads=temporal_heads,
+                temporal_context=temporal_context,
+            ).to(device)
     elif config.network_type == "bc_latent":
         network = TokenizerLatentBCPPOActorCritic(
             feature_dim=state_dim,
