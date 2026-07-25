@@ -553,6 +553,7 @@ class PPOAgent:
         ppo_epochs: int,
         update_idx: int = 0,
         clip_vloss: bool = True,
+        freeze_actor: bool = False,  # NEU: Parameter hinzugefügt
     ) -> dict[str, float]:
         states = self._to_tensor(self._get_buffer_attr(buffer, ("states", "observations", "obs")))
         actions = self._to_tensor(self._get_buffer_attr(buffer, ("actions", "acts")))
@@ -628,13 +629,18 @@ class PPOAgent:
                     current_action_mean = self.network.actor_mean(b_states[mb_inds])
                     bc_kl_loss = torch.mean((current_action_mean - bc_action_mean).pow(2))
 
-                loss = (
-                    pg_loss
-                    + self.vf_coef * v_loss
-                    - self.ent_coef * entropy_loss
-                    + prior_loss_coef * prior_loss
-                    + self.bc_kl_penalty_coef * bc_kl_loss
-                )
+                if freeze_actor:
+                    # Im Warmup lernt nur der Critic
+                    loss = self.vf_coef * v_loss
+                else:
+                    # Normales PPO-Update inkl. Actor
+                    loss = (
+                        pg_loss
+                        + self.vf_coef * v_loss
+                        - self.ent_coef * entropy_loss
+                        + prior_loss_coef * prior_loss
+                        + self.bc_kl_penalty_coef * bc_kl_loss
+                    )
 
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()

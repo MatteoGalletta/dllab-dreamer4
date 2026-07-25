@@ -769,6 +769,10 @@ class TrainConfig:
     eval_interval: int = 10
     eval_episodes: int = 10
     eval_seed: int = 0
+    norm_reward: bool = True
+    reward_clip: float = 10.0
+    clip_vloss: bool = True
+    critic_warmup_ratio: float = 0.10  # NEU: 10% der Updates als Warmup
 
 
 def resolve_device(device_name: str) -> torch.device:
@@ -1024,6 +1028,7 @@ def parse_args():
     parser.add_argument("--no-fixed-target-block-success", action="store_true")
     parser.add_argument("--block-start-near-goal", action="store_true")
     parser.add_argument("--no-block-start-near-goal", action="store_true")
+    parser.add_argument("--critic-warmup-ratio", type=float, default=None)  # NEU
     return parser.parse_args()
 
 
@@ -1403,12 +1408,16 @@ def train_pusht():
 
     steps_per_update = config.num_envs * config.rollout_steps * config.chunk_size
     num_updates = max(1, config.total_timesteps // steps_per_update)
+    
+    warmup_updates = int(num_updates * config.critic_warmup_ratio)
+    
     global_env_steps = 0
     last_dones_for_gae = np.zeros(config.num_envs, dtype=np.float32)
     warned_missing_timeout_bootstrap = False
     best_eval_success = float("-inf")
 
     for update in range(num_updates):
+        freeze_actor = update < warmup_updates
         frac = 1.0 - (update / max(1, num_updates))
         lr_now = frac * config.learning_rate if config.anneal_lr else config.learning_rate
         agent.optimizer.param_groups[0]["lr"] = lr_now
@@ -1583,6 +1592,7 @@ def train_pusht():
             ppo_epochs=config.ppo_epochs,
             update_idx=update,
             clip_vloss=bool(config.clip_vloss),
+            freeze_actor=freeze_actor,  # NEU: Flag übergeben
         )
 
         global_step = int(global_env_steps)
