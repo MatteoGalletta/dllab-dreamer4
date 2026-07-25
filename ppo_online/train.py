@@ -1045,6 +1045,11 @@ def evaluate_current_policy(
     coverages = []
     successes = []
     lengths = []
+    
+    # KORREKTUR: Trainingsmodus zwischenspeichern und Netzwerk auf Eval schalten
+    was_training = agent.network.training
+    agent.network.eval()
+    
     try:
         with torch.no_grad():
             for episode_idx in range(int(episodes)):
@@ -1069,6 +1074,9 @@ def evaluate_current_policy(
                 success = float(final_info.get("block_success", final_info.get("success", terminated)))
                 successes.append(float(success))
     finally:
+        # KORREKTUR: Nach der Evaluierung zwingend wieder in den Trainingsmodus wechseln
+        if was_training:
+            agent.network.train()
         env.close()
 
     return {
