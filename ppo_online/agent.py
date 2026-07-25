@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+# Ganz oben in agent.py hinzufügen
+from behavioural_cloning.train_base import normalize_image_batch
 
 import numpy as np
 import torch
@@ -351,6 +353,18 @@ class PPOAgent:
                 actor_output_tanh=actor_output_tanh,
                 prior_log_std_init=prior_log_std_init,
             )
+        if self.network_type == "bc_pixels":
+            orig_get_action_and_value = self.network.get_action_and_value
+            orig_actor_mean = self.network.actor_mean
+            orig_get_value = self.network.get_value
+
+            self.network.get_action_and_value = lambda x, *args, **kwargs: orig_get_action_and_value(normalize_image_batch(x), *args, **kwargs)
+            self.network.actor_mean = lambda x, *args, **kwargs: orig_actor_mean(normalize_image_batch(x), *args, **kwargs)
+            self.network.get_value = lambda x, *args, **kwargs: orig_get_value(normalize_image_batch(x), *args, **kwargs)
+
+            if self._prior_network is not None:
+                orig_prior_actor_mean = self._prior_network.actor_mean
+                self._prior_network.actor_mean = lambda x, *args, **kwargs: orig_prior_actor_mean(normalize_image_batch(x), *args, **kwargs)
 
     @property
     def device(self) -> torch.device:
