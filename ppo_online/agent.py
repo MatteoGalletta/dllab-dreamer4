@@ -353,18 +353,30 @@ class PPOAgent:
                 actor_output_tanh=actor_output_tanh,
                 prior_log_std_init=prior_log_std_init,
             )
+# NEU: Monkey-Patching der Backbones anstelle der Top-Level-Methoden
         if self.network_type == "bc_pixels":
-            orig_get_action_and_value = self.network.get_action_and_value
-            orig_actor_mean = self.network.actor_mean
-            orig_get_value = self.network.get_value
+            def patch_backbone(policy_net):
+                if hasattr(policy_net, 'backbone'):
+                    orig_forward = policy_net.backbone.forward
+                    
+                    def new_forward(x, *args, **kwargs):
+                        # Fallback: Falls networks.py die Bilder nicht durch 255.0 geteilt hat
+                        if x.max() > 2.0:
+                            x = x.float() / 255.0
+                        return orig_forward(normalize_image_batch(x), *args, **kwargs)
+                    
+                    policy_net.backbone.forward = new_forward
 
-            self.network.get_action_and_value = lambda x, *args, **kwargs: orig_get_action_and_value(normalize_image_batch(x), *args, **kwargs)
-            self.network.actor_mean = lambda x, *args, **kwargs: orig_actor_mean(normalize_image_batch(x), *args, **kwargs)
-            self.network.get_value = lambda x, *args, **kwargs: orig_get_value(normalize_image_batch(x), *args, **kwargs)
-
+            # Patch auf alle aktiven Sub-Policies anwenden
+            if hasattr(self.network, 'base_policy'):
+                patch_backbone(self.network.base_policy)
+            if hasattr(self.network, 'residual_policy'):
+                patch_backbone(self.network.residual_policy)
+            if hasattr(self.network, 'backbone'): 
+                patch_backbone(self.network)
+                
             if self._prior_network is not None:
-                orig_prior_actor_mean = self._prior_network.actor_mean
-                self._prior_network.actor_mean = lambda x, *args, **kwargs: orig_prior_actor_mean(normalize_image_batch(x), *args, **kwargs)
+                patch_backbone(self._prior_network)
 
     @property
     def device(self) -> torch.device:

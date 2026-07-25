@@ -225,10 +225,10 @@ class OpenLoopChunkExecutionWrapper(gym.Wrapper):
                 raise ValueError("Rendered history mode requires target_height and target_width.")
             self.frame_history = deque(maxlen=(self.stack_size - 1) * self.frame_stride + 1)
             self.observation_space = gym.spaces.Box(
-                low=0.0,
-                high=1.0,
-                shape=(self.stack_size, 3, self.target_height, self.target_width),
-                dtype=np.float32,
+                low=0,
+                high=255,
+                shape=(self.stack_size, self.target_height, self.target_width, 3),
+                dtype=np.uint8,
             )
 
     def _render_frame(self) -> np.ndarray:
@@ -236,24 +236,20 @@ class OpenLoopChunkExecutionWrapper(gym.Wrapper):
         if frame is None:
             raise RuntimeError("Expected renderable RGB frame for chunk history observations.")
         frame = np.asarray(frame, dtype=np.uint8)
-        
-        # In Tensor umwandeln und zu (C, H, W) permutieren
-        frame_tensor = torch.as_tensor(frame, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
-        
         if (
             self.target_height is not None
             and self.target_width is not None
             and frame.shape[:2] != (self.target_height, self.target_width)
         ):
+            frame_tensor = torch.as_tensor(frame, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
             frame_tensor = F.interpolate(
                 frame_tensor,
                 size=(self.target_height, self.target_width),
                 mode="bilinear",
                 align_corners=False,
             )
-            
-        # KORREKTUR: Skaliere auf [0.0, 1.0] und behalte (C, H, W) bei, statt zurück zu (H, W, 3) zu permutieren
-        return (frame_tensor.squeeze(0) / 255.0).cpu().numpy()
+            frame = frame_tensor.squeeze(0).permute(1, 2, 0).clamp(0.0, 255.0).to(torch.uint8).cpu().numpy()
+        return frame
 
     def _append_current_frame(self) -> None:
         if self.frame_history is not None:
