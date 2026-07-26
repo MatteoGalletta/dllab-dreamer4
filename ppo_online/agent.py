@@ -321,8 +321,23 @@ class PPOAgent:
                 actor_output_tanh=actor_output_tanh,
             ).to(self.device_override)
 
+        if self.network_type == "bc_pixels":
+            # Finde den Backbone, je nachdem ob Residual aktiv ist oder nicht
+            backbone_to_freeze = None
+            if hasattr(self.network, 'backbone'):
+                backbone_to_freeze = self.network.backbone
+            elif hasattr(self.network, 'base_policy') and hasattr(self.network.base_policy, 'backbone'):
+                backbone_to_freeze = self.network.base_policy.backbone
+                
+            if backbone_to_freeze is not None:
+                for param in backbone_to_freeze.parameters():
+                    param.requires_grad_(False)
+                print("CNN Backbone erfolgreich eingefroren! Nur die MLP-Köpfe werden trainiert.")
+
+        # ANGEPASST: Wir übergeben dem Optimizer nur die Gewichte, die NICHT eingefroren sind
+        trainable_params = filter(lambda p: p.requires_grad, self.network.parameters())
         self.optimizer = torch.optim.Adam(
-            self.network.parameters(),
+            trainable_params,
             lr=lr,
             eps=1e-5,
         )
@@ -353,21 +368,20 @@ class PPOAgent:
                 actor_output_tanh=actor_output_tanh,
                 prior_log_std_init=prior_log_std_init,
             )
-# NEU: Monkey-Patching der Backbones anstelle der Top-Level-Methoden
+# NEU: Monkey-Patching NUR für die / 255.0 Skalierung (exakt wie in evaluate.py)
         if self.network_type == "bc_pixels":
             def patch_backbone(policy_net):
                 if hasattr(policy_net, 'backbone'):
                     orig_forward = policy_net.backbone.forward
                     
                     def new_forward(x, *args, **kwargs):
-                        # Fallback: Falls networks.py die Bilder nicht durch 255.0 geteilt hat
+                        # Keine ImageNet-Normalisierung, nur [0, 1] Skalierung!
                         if x.max() > 2.0:
                             x = x.float() / 255.0
-                        return orig_forward(normalize_image_batch(x), *args, **kwargs)
+                        return orig_forward(x, *args, **kwargs)
                     
                     policy_net.backbone.forward = new_forward
 
-            # Patch auf alle aktiven Sub-Policies anwenden
             if hasattr(self.network, 'base_policy'):
                 patch_backbone(self.network.base_policy)
             if hasattr(self.network, 'residual_policy'):
