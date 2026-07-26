@@ -321,7 +321,7 @@ class PPOAgent:
                 actor_output_tanh=actor_output_tanh,
             ).to(self.device_override)
 
-        if self.network_type == "bc_pixels":
+        if network_type == "bc_pixels":  # <-- HIER: Nur network_type (ohne self.)
             # Finde den Backbone, je nachdem ob Residual aktiv ist oder nicht
             backbone_to_freeze = None
             if hasattr(self.network, 'backbone'):
