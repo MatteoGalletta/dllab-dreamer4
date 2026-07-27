@@ -192,48 +192,6 @@ If `--video` is used, videos go into the evaluation run directory:
 
 - `runs/evaluations/<timestamp>_bc_<checkpoint-stem>/videos/`
 
-If video saving fails on a cloud machine, the most common missing dependency is `ffmpeg`.
-
-Install on Ubuntu:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y ffmpeg
-```
-
-## Common Cloud Dependencies
-
-For Google Cloud / Ubuntu environments, the following system packages may be needed:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y libgl1 libglib2.0-0 ffmpeg zip
-```
-
-These are useful for:
-
-- OpenCV / environment rendering,
-- video export,
-- downloading zipped video artifacts.
-
-## Interpretation of Current Results
-
-The current evidence suggests:
-
-- `chunk_size=1` is a valid working baseline,
-- `chunk_size=5` is much harder in the current tokenizer-based setup,
-- the tokenizer/domain-resolution mismatch is likely a real bottleneck for larger chunks,
-- the representation may be part of why another group's LeWM-based model can handle `chunk_size=5` while the current tokenizer setup struggles.
-
-## Recommended Next Steps
-
-1. Retrain the tokenizer on the new `.npz` dataset at the correct resolution.
-2. Retrain the BC model using that new tokenizer.
-3. Keep `chunk_size=1` as the baseline.
-4. Test `chunk_size=2` and `chunk_size=3`.
-5. Retry `chunk_size=5` after the tokenizer is retrained.
-6. Compare using the canonical-style evaluation command above.
-
 ## Useful Files
 
 - Training: [behavioural_cloning/train_tokenizer_latent_bc.py](/home/dennis/2nd%20semester/dllab-dreamer4/behavioural_cloning/train_tokenizer_latent_bc.py)
