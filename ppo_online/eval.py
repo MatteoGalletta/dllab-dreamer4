@@ -358,7 +358,6 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
     env = make_eval_env(
         cfg,
         tokenizer_path=str(tokenizer_path),
-        chunk_size=architecture["action_chunk_size"],
         frame_stack=architecture["frame_stack"],
         frame_stride=frame_stride,
     )
