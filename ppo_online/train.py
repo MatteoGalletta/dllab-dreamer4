@@ -6,6 +6,7 @@ import argparse
 import math
 import pickle
 import random
+import shutil
 from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
@@ -1259,6 +1260,18 @@ def save_ppo_checkpoint(
     torch.save(payload, path)
 
 
+def checkpoint_paths(save_path: str | Path) -> dict[str, Path]:
+    legacy_path = Path(save_path)
+    ckpt_dir = legacy_path.parent
+    return {
+        "legacy": legacy_path,
+        "latest": ckpt_dir / "latest.pth",
+        "best": ckpt_dir / "best.pth",
+        "second_best": ckpt_dir / "second_best.pth",
+        "final": ckpt_dir / "final.pth",
+    }
+
+
 def train_pusht():
     args = parse_args()
     config = TrainConfig()
@@ -1514,6 +1527,8 @@ def train_pusht():
     last_dones_for_gae = np.zeros(config.num_envs, dtype=np.float32)
     warned_missing_timeout_bootstrap = False
     best_eval_success = float("-inf")
+    second_best_eval_success = float("-inf")
+    ckpt_paths = checkpoint_paths(config.save_path)
 
     initial_eval = evaluate_current_policy(
         agent,
@@ -1538,6 +1553,26 @@ def train_pusht():
         f"mean_return={initial_eval['mean_return']:.2f} "
         f"mean_length={initial_eval['mean_length']:.1f}"
     )
+    if np.isfinite(best_eval_success):
+        config._reward_normalizer_state = (
+            reward_normalizer.state_dict() if reward_normalizer is not None else None
+        )
+        save_ppo_checkpoint(
+            ckpt_paths["best"],
+            agent=agent,
+            config=config,
+            global_step=0,
+            success_rate=float(best_eval_success),
+        )
+        if ckpt_paths["legacy"] != ckpt_paths["best"]:
+            save_ppo_checkpoint(
+                ckpt_paths["legacy"],
+                agent=agent,
+                config=config,
+                global_step=0,
+                success_rate=float(best_eval_success),
+            )
+        wandb.save(str(ckpt_paths["best"]))
 
     for update in range(num_updates):
         freeze_actor = update < warmup_updates
@@ -1764,23 +1799,44 @@ def train_pusht():
             wandb_log_dict["Eval/Mean_Coverage"] = eval_summary["mean_coverage"]
             wandb_log_dict["Eval/Success_Rate"] = eval_summary["success_rate"]
             wandb_log_dict["Eval/Mean_Length"] = eval_summary["mean_length"]
-            if eval_summary["success_rate"] > best_eval_success:
-                best_eval_success = eval_summary["success_rate"]
-                best_path = Path(config.save_path).with_name("best.pth")
+            eval_success = float(eval_summary["success_rate"])
+            if eval_success > best_eval_success:
+                config._reward_normalizer_state = (
+                    reward_normalizer.state_dict() if reward_normalizer is not None else None
+                )
+                if ckpt_paths["best"].exists():
+                    shutil.copyfile(ckpt_paths["best"], ckpt_paths["second_best"])
+                    second_best_eval_success = best_eval_success
+                    wandb.save(str(ckpt_paths["second_best"]))
+                save_ppo_checkpoint(
+                    ckpt_paths["best"],
+                    agent=agent,
+                    config=config,
+                    global_step=global_step,
+                    success_rate=eval_success,
+                )
+                best_eval_success = eval_success
+                wandb.save(str(ckpt_paths["best"]))
+                print(
+                    f"New best PPO checkpoint at update={update + 1}: "
+                    f"success_rate={eval_success:.3f} saved={ckpt_paths['best']}"
+                )
+            elif eval_success > second_best_eval_success:
                 config._reward_normalizer_state = (
                     reward_normalizer.state_dict() if reward_normalizer is not None else None
                 )
                 save_ppo_checkpoint(
-                    best_path,
+                    ckpt_paths["second_best"],
                     agent=agent,
                     config=config,
                     global_step=global_step,
-                    success_rate=float(eval_summary["success_rate"]),
+                    success_rate=eval_success,
                 )
-                wandb.save(str(best_path))
+                second_best_eval_success = eval_success
+                wandb.save(str(ckpt_paths["second_best"]))
                 print(
-                    f"New best PPO checkpoint at update={update + 1}: "
-                    f"success_rate={eval_summary['success_rate']:.3f} saved={best_path}"
+                    f"New second-best PPO checkpoint at update={update + 1}: "
+                    f"success_rate={eval_success:.3f} saved={ckpt_paths['second_best']}"
                 )
 
         wandb.log(wandb_log_dict, step=global_step)
@@ -1813,24 +1869,42 @@ def train_pusht():
                 reward_normalizer.state_dict() if reward_normalizer is not None else None
             )
             save_ppo_checkpoint(
-                Path(config.save_path),
+                ckpt_paths["latest"],
                 agent=agent,
                 config=config,
                 global_step=global_step,
                 success_rate=wandb_log_dict.get("Eval/Success_Rate"),
             )
-            wandb.save(config.save_path)
+            if ckpt_paths["legacy"] != ckpt_paths["latest"]:
+                save_ppo_checkpoint(
+                    ckpt_paths["legacy"],
+                    agent=agent,
+                    config=config,
+                    global_step=global_step,
+                    success_rate=wandb_log_dict.get("Eval/Success_Rate"),
+                )
+                wandb.save(str(ckpt_paths["legacy"]))
+            wandb.save(str(ckpt_paths["latest"]))
 
     print("Saving final model weights...")
     config._reward_normalizer_state = reward_normalizer.state_dict() if reward_normalizer is not None else None
     save_ppo_checkpoint(
-        Path(config.save_path),
+        ckpt_paths["final"],
         agent=agent,
         config=config,
         global_step=global_step,
         success_rate=best_eval_success if np.isfinite(best_eval_success) else None,
     )
-    wandb.save(config.save_path)
+    if ckpt_paths["legacy"] != ckpt_paths["final"]:
+        save_ppo_checkpoint(
+            ckpt_paths["legacy"],
+            agent=agent,
+            config=config,
+            global_step=global_step,
+            success_rate=best_eval_success if np.isfinite(best_eval_success) else None,
+        )
+        wandb.save(str(ckpt_paths["legacy"]))
+    wandb.save(str(ckpt_paths["final"]))
     print("Training finished.")
     if envs is not None:
         envs.close()
