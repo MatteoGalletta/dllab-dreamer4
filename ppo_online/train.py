@@ -20,7 +20,7 @@ import torch.nn.functional as F
 import wandb
 from gymnasium.wrappers import FrameStackObservation
 
-from .env_config import DEFAULT_PUSHT_ENV_ID, make_pusht_env, resolve_pusht_env_id
+from .env_config import DEFAULT_PUSHT_ENV_ID, PUSHT_FIXED_TARGET_POSE, make_pusht_env, resolve_pusht_env_id
 from .agent import PPOAgent
 from .buffer import PPOVectorBuffer
 from .model_paths import resolve_bc_prior_path, resolve_ppo_checkpoint_path, resolve_tokenizer_path
