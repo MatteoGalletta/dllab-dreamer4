@@ -866,7 +866,7 @@ def make_env(rank: int, seed: int, config: TrainConfig, render_mode: str | None 
             env = StridedObservationStackWrapper(
                 env,
                 stack_size=config.obs_stack_size,
-                frame_stride=config.frame_stride,
+                frame_stride=1,
             )
         else:
             env = PushTObsWrapper(env)
@@ -1233,6 +1233,8 @@ def train_pusht():
     stats_overrides = _load_bc_stats_overrides(config.bc_stats_path)
     for key, value in stats_overrides.items():
         setattr(config, key, value)
+    if config.network_type == "bc_latent":
+        config.actor_output_tanh = False
     if args.network_type is not None:
         config.network_type = str(args.network_type)
     if args.tokenizer_path is not None:
