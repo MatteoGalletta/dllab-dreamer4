@@ -25,6 +25,7 @@ from .agent import PPOAgent
 from .buffer import PPOVectorBuffer
 from .model_paths import resolve_bc_prior_path, resolve_ppo_checkpoint_path, resolve_tokenizer_path
 from .tokenizer_utils import TokenizerZEncoder, load_tokenizer_from_ckpt
+from behavioural_cloning.train_base import TokenizerBackbone, load_tokenizer_encoder
 
 
 def pool_latents(z_unpacked: torch.Tensor) -> torch.Tensor:
@@ -1059,6 +1060,13 @@ def evaluate_current_policy(
     if config.network_type == "bc_latent":
         resolved_env_id = resolve_pusht_env_id(config.env_id)
         _, tokenizer_info = load_tokenizer_from_ckpt(config.tokenizer_path, torch.device("cpu"))
+        encoder = load_tokenizer_encoder(config.tokenizer_path)
+        latent_backbone = TokenizerBackbone(
+            encoder,
+            patch=int(encoder.patch),
+            output_dim=int(encoder.n_latents) * int(encoder.bottleneck_proj.out_features),
+        ).to(device)
+        latent_backbone.eval()
         env = make_pusht_env(
             env_id=resolved_env_id,
             render_mode="rgb_array",
@@ -1068,7 +1076,9 @@ def evaluate_current_policy(
             relative=bool(config.action_mode in {"relative", "swm_relative"}),
             sync_goal_pose=True,
             align_sampled_goal_to_fixed_target=bool(config.fixed_target),
+            fixed_target_pose=tuple(float(x) for x in PUSHT_FIXED_TARGET_POSE.tolist()),
             fixed_target_block_success=bool(config.fixed_target_block_success),
+            fixed_target_max_reset_attempts=100,
             fixed_target_agent_block_coef=float(config.agent_block_coef),
             block_start_near_goal=bool(config.block_start_near_goal),
             block_start_radius=float(config.block_start_radius),
@@ -1114,16 +1124,20 @@ def evaluate_current_policy(
                             for i in range(int(config.obs_stack_size) - 1, -1, -1)
                         ]
                         stacked_frames = np.stack([history[idx] for idx in indices], axis=0)
-                        state = np.stack(
-                            [
-                                TokenizerZEncoder(
-                                    tokenizer_ckpt=config.tokenizer_path,
-                                    device=config.tokenizer_device,
-                                ).encode_frame(frame)
-                                for frame in stacked_frames
-                            ],
-                            axis=0,
-                        ).astype(np.float32)
+                        input_tensor = (
+                            torch.as_tensor(stacked_frames[None], dtype=torch.uint8, device=device)
+                            .permute(0, 1, 4, 2, 3)
+                            .to(torch.float32)
+                            / 255.0
+                        )
+                        state = (
+                            latent_backbone.extract_features(input_tensor)
+                            .squeeze(0)
+                            .detach()
+                            .cpu()
+                            .numpy()
+                            .astype(np.float32)
+                        )
                     state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
                     if config.network_type == "bc_latent":
                         if not pending_actions:

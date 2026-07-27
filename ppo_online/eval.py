@@ -19,6 +19,7 @@ from behavioural_cloning.eval_tokenizer_latent_bc_exact import (
     create_run_directory,
     write_episode_video,
 )
+from behavioural_cloning.train_base import TokenizerBackbone, load_tokenizer_encoder
 from ppo_online.networks import TokenizerLatentBCPPOActorCritic
 from ppo_online.render import (
     PushTDenseRewardWrapper,
@@ -33,7 +34,7 @@ from ppo_online.train import TrainConfig, resolve_device
 from ppo_online.train import OpenLoopChunkExecutionWrapper
 from ppo_online.env_config import DEFAULT_PUSHT_ENV_ID, PUSHT_FIXED_TARGET_POSE, make_pusht_env
 from ppo_online.model_paths import resolve_ppo_checkpoint_path, resolve_tokenizer_path
-from ppo_online.tokenizer_utils import TokenizerZEncoder, load_tokenizer_from_ckpt
+from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
 
 try:
     import wandb
@@ -387,7 +388,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
         f"| execution_mode={cfg.execution_mode} | block_start_radius={cfg.block_start_radius}"
     )
     with torch.no_grad():
-        latent_encoder = TokenizerZEncoder(tokenizer_path, device=device)
+        encoder = load_tokenizer_encoder(tokenizer_path)
+        latent_backbone = TokenizerBackbone(
+            encoder,
+            patch=int(encoder.patch),
+            output_dim=int(encoder.n_latents) * int(encoder.bottleneck_proj.out_features),
+        ).to(device)
+        latent_backbone.eval()
         for episode_index in range(cfg.episodes):
             _, _ = env.reset(seed=cfg.seed + episode_index)
             executor.reset()
@@ -412,10 +419,20 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
                     for i in range(architecture["frame_stack"] - 1, -1, -1)
                 ]
                 stacked_frames = np.stack([history[idx] for idx in indices], axis=0)
-                obs = np.stack(
-                    [latent_encoder.encode_frame(frame_item) for frame_item in stacked_frames],
-                    axis=0,
-                ).astype(np.float32)
+                input_tensor = (
+                    torch.as_tensor(stacked_frames[None], dtype=torch.uint8, device=device)
+                    .permute(0, 1, 4, 2, 3)
+                    .to(torch.float32)
+                    / 255.0
+                )
+                obs = (
+                    latent_backbone.extract_features(input_tensor)
+                    .squeeze(0)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                )
                 state_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                 if cfg.stochastic:
                     action_flat, _, _, _ = network.get_action_and_value(state_tensor)
