@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import pickle
 # Ganz oben in agent.py hinzufügen
 from behavioural_cloning.train_base import normalize_image_batch
 
@@ -82,6 +83,8 @@ def _load_bc_prior_payload(prior_path: Path, device: torch.device) -> Any:
         return torch.load(prior_path, map_location=device, weights_only=True)
     except TypeError:
         return torch.load(prior_path, map_location=device)
+    except pickle.UnpicklingError:
+        return torch.load(prior_path, map_location=device, weights_only=False)
 
 
 def _infer_prior_format(state_dict: dict[str, torch.Tensor]) -> str:

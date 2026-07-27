@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import pickle
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +52,12 @@ def load_tokenizer_from_ckpt(tokenizer_ckpt: str, device: torch.device):
     if cache_key in _TOKENIZER_CACHE:
         return _TOKENIZER_CACHE[cache_key]
 
-    ckpt = torch.load(tokenizer_ckpt, map_location="cpu")
+    try:
+        ckpt = torch.load(tokenizer_ckpt, map_location="cpu", weights_only=True)
+    except TypeError:
+        ckpt = torch.load(tokenizer_ckpt, map_location="cpu")
+    except pickle.UnpicklingError:
+        ckpt = torch.load(tokenizer_ckpt, map_location="cpu", weights_only=False)
     args = ckpt.get("args", {}) or {}
 
     H = int(args.get("H", 128))
