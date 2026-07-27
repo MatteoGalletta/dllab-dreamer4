@@ -30,8 +30,10 @@ from ppo_online.render import (
     load_state_dict_safe,
 )
 from ppo_online.train import TrainConfig, resolve_device
+from ppo_online.train import OpenLoopChunkExecutionWrapper
 from ppo_online.env_config import DEFAULT_PUSHT_ENV_ID, PUSHT_FIXED_TARGET_POSE, make_pusht_env
 from ppo_online.model_paths import resolve_ppo_checkpoint_path, resolve_tokenizer_path
+from ppo_online.tokenizer_utils import TokenizerZEncoder, load_tokenizer_from_ckpt
 
 try:
     import wandb
@@ -180,9 +182,12 @@ def make_eval_env(
     frame_stack: int,
     frame_stride: int,
 ) -> gym.Env:
+    _, tokenizer_info = load_tokenizer_from_ckpt(tokenizer_path, torch.device("cpu"))
     env = make_pusht_env(
         env_id=config.env_id,
         render_mode="rgb_array",
+        image_height=int(tokenizer_info["H"]),
+        image_width=int(tokenizer_info["W"]),
         sync_goal_pose=True,
         align_sampled_goal_to_fixed_target=True,
         max_episode_steps=int(config.max_episode_steps),
@@ -196,13 +201,6 @@ def make_eval_env(
         render_obs=False,
     )
     env = PushTDenseRewardWrapper(env, env_id=config.env_id)
-    env = TokenizerLatentObsWrapper(
-        env,
-        tokenizer_ckpt=tokenizer_path,
-        tokenizer_device="cpu",
-    )
-    env = StridedObservationStackWrapper(env, stack_size=frame_stack, frame_stride=frame_stride)
-    env = gym.wrappers.RecordEpisodeStatistics(env)
     return env
 
 
@@ -359,6 +357,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
     env = make_eval_env(
         cfg,
         tokenizer_path=str(tokenizer_path),
+        chunk_size=architecture["action_chunk_size"],
         frame_stack=architecture["frame_stack"],
         frame_stride=frame_stride,
     )
@@ -388,8 +387,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
         f"| execution_mode={cfg.execution_mode} | block_start_radius={cfg.block_start_radius}"
     )
     with torch.no_grad():
+        latent_encoder = TokenizerZEncoder(tokenizer_path, device=device)
         for episode_index in range(cfg.episodes):
-            obs, _ = env.reset(seed=cfg.seed + episode_index)
+            _, _ = env.reset(seed=cfg.seed + episode_index)
             executor.reset()
             frames = [] if cfg.video else None
             done = False
@@ -398,9 +398,24 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
             final_info: dict = {}
             terminated = False
             truncated = False
+            max_history_len = (architecture["frame_stack"] - 1) * frame_stride + 1
+            frame_history: deque[np.ndarray] = deque(maxlen=max_history_len)
             while not done:
+                frame = np.asarray(env.render(), dtype=np.uint8)
+                frame_history.append(frame)
                 if frames is not None:
-                    frames.append(np.asarray(env.render(), dtype=np.uint8).copy())
+                    frames.append(frame.copy())
+                history = list(frame_history)
+                newest = len(history) - 1
+                indices = [
+                    max(0, newest - i * frame_stride)
+                    for i in range(architecture["frame_stack"] - 1, -1, -1)
+                ]
+                stacked_frames = np.stack([history[idx] for idx in indices], axis=0)
+                obs = np.stack(
+                    [latent_encoder.encode_frame(frame_item) for frame_item in stacked_frames],
+                    axis=0,
+                ).astype(np.float32)
                 state_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                 if cfg.stochastic:
                     action_flat, _, _, _ = network.get_action_and_value(state_tensor)

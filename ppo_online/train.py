@@ -1076,24 +1076,6 @@ def evaluate_current_policy(
             render_obs=False,
         )
         env = PushTDenseRewardWrapper(env, env_id=resolved_env_id)
-        env = OpenLoopChunkExecutionWrapper(
-            env,
-            chunk_size=config.chunk_size,
-            gamma=config.gamma,
-            action_mode=config.action_mode,
-            action_output_tanh=bool(getattr(config, "action_output_tanh", False)),
-            return_rendered_history=True,
-            target_height=int(tokenizer_info["H"]),
-            target_width=int(tokenizer_info["W"]),
-            stack_size=config.obs_stack_size,
-            frame_stride=config.frame_stride,
-        )
-        env = TokenizerLatentObsWrapper(
-            env,
-            tokenizer_ckpt=config.tokenizer_path,
-            tokenizer_device=config.tokenizer_device,
-        )
-        env = gym.wrappers.RecordEpisodeStatistics(env)
     else:
         env = make_env(0, seed, config, render_mode="rgb_array")()
     returns = []
@@ -1108,7 +1090,13 @@ def evaluate_current_policy(
     try:
         with torch.no_grad():
             for episode_idx in range(int(episodes)):
-                state, _ = env.reset(seed=int(seed) + episode_idx)
+                if config.network_type == "bc_latent":
+                    _, _ = env.reset(seed=int(seed) + episode_idx)
+                    max_history_len = (int(config.obs_stack_size) - 1) * int(config.frame_stride) + 1
+                    frame_history: deque[np.ndarray] = deque(maxlen=max_history_len)
+                    state = None
+                else:
+                    state, _ = env.reset(seed=int(seed) + episode_idx)
                 done = False
                 total_reward = 0.0
                 step_count = 0
@@ -1116,6 +1104,26 @@ def evaluate_current_policy(
                 terminated = False
                 pending_actions: deque[np.ndarray] = deque()
                 while not done:
+                    if config.network_type == "bc_latent":
+                        frame = np.asarray(env.render(), dtype=np.uint8)
+                        frame_history.append(frame)
+                        history = list(frame_history)
+                        newest = len(history) - 1
+                        indices = [
+                            max(0, newest - i * int(config.frame_stride))
+                            for i in range(int(config.obs_stack_size) - 1, -1, -1)
+                        ]
+                        stacked_frames = np.stack([history[idx] for idx in indices], axis=0)
+                        state = np.stack(
+                            [
+                                TokenizerZEncoder(
+                                    tokenizer_ckpt=config.tokenizer_path,
+                                    device=config.tokenizer_device,
+                                ).encode_frame(frame)
+                                for frame in stacked_frames
+                            ],
+                            axis=0,
+                        ).astype(np.float32)
                     state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
                     if config.network_type == "bc_latent":
                         if not pending_actions:
