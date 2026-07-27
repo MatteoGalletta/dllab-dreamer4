@@ -514,12 +514,23 @@ class TokenizerLatentObsWrapper(gym.ObservationWrapper):
         super().__init__(env)
         self.latent_encoder = TokenizerZEncoder(tokenizer_ckpt=tokenizer_ckpt, device=tokenizer_device)
         latent_dim = self.latent_encoder.latent_dim
-        self.observation_space = gym.spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(latent_dim,),
-            dtype=np.float32,
-        )
+        base_shape = tuple(getattr(env.observation_space, "shape", ()) or ())
+        if len(base_shape) == 4 and base_shape[-1] == 3:
+            self.stack_size = int(base_shape[0])
+            self.observation_space = gym.spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(self.stack_size, latent_dim),
+                dtype=np.float32,
+            )
+        else:
+            self.stack_size = None
+            self.observation_space = gym.spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(latent_dim,),
+                dtype=np.float32,
+            )
 
     def _render_frame(self) -> np.ndarray:
         frame = self.env.render()
@@ -528,7 +539,11 @@ class TokenizerLatentObsWrapper(gym.ObservationWrapper):
         return np.asarray(frame, dtype=np.uint8)
 
     def observation(self, observation):
-        del observation
+        obs = np.asarray(observation)
+        if obs.ndim == 4 and obs.shape[-1] == 3:
+            return np.stack([self.latent_encoder.encode_frame(frame) for frame in obs], axis=0).astype(np.float32)
+        if obs.ndim == 3 and obs.shape[-1] == 3:
+            return self.latent_encoder.encode_frame(obs)
         return self.latent_encoder.encode_frame(self._render_frame())
 
 
@@ -849,11 +864,11 @@ def make_env(rank: int, seed: int, config: TrainConfig, render_mode: str | None 
             gamma=config.gamma,
             action_mode=config.action_mode,
             action_output_tanh=bool(getattr(config, "action_output_tanh", False)),
-            return_rendered_history=bool(config.network_type == "bc_pixels"),
-            target_height=image_height if config.network_type == "bc_pixels" else None,
-            target_width=image_width if config.network_type == "bc_pixels" else None,
-            stack_size=config.obs_stack_size if config.network_type == "bc_pixels" else 1,
-            frame_stride=config.frame_stride if config.network_type == "bc_pixels" else 1,
+            return_rendered_history=bool(config.network_type in {"bc_pixels", "bc_latent"}),
+            target_height=image_height if config.network_type in {"bc_pixels", "bc_latent"} else None,
+            target_width=image_width if config.network_type in {"bc_pixels", "bc_latent"} else None,
+            stack_size=config.obs_stack_size if config.network_type in {"bc_pixels", "bc_latent"} else 1,
+            frame_stride=config.frame_stride if config.network_type in {"bc_pixels", "bc_latent"} else 1,
         )
         if config.network_type == "bc_pixels":
             pass
@@ -862,11 +877,6 @@ def make_env(rank: int, seed: int, config: TrainConfig, render_mode: str | None 
                 env,
                 tokenizer_ckpt=config.tokenizer_path,
                 tokenizer_device=config.tokenizer_device,
-            )
-            env = StridedObservationStackWrapper(
-                env,
-                stack_size=config.obs_stack_size,
-                frame_stride=1,
             )
         else:
             env = PushTObsWrapper(env)
@@ -1048,11 +1058,12 @@ def evaluate_current_policy(
 ) -> dict[str, float]:
     if config.network_type == "bc_latent":
         resolved_env_id = resolve_pusht_env_id(config.env_id)
+        _, tokenizer_info = load_tokenizer_from_ckpt(config.tokenizer_path, torch.device("cpu"))
         env = make_pusht_env(
             env_id=resolved_env_id,
             render_mode="rgb_array",
-            image_height=int(getattr(config, "image_height", 224)),
-            image_width=int(getattr(config, "image_width", 224)),
+            image_height=int(tokenizer_info["H"]),
+            image_width=int(tokenizer_info["W"]),
             max_episode_steps=int(config.max_episode_steps),
             relative=bool(config.action_mode in {"relative", "swm_relative"}),
             sync_goal_pose=True,
@@ -1065,15 +1076,22 @@ def evaluate_current_policy(
             render_obs=False,
         )
         env = PushTDenseRewardWrapper(env, env_id=resolved_env_id)
+        env = OpenLoopChunkExecutionWrapper(
+            env,
+            chunk_size=config.chunk_size,
+            gamma=config.gamma,
+            action_mode=config.action_mode,
+            action_output_tanh=bool(getattr(config, "action_output_tanh", False)),
+            return_rendered_history=True,
+            target_height=int(tokenizer_info["H"]),
+            target_width=int(tokenizer_info["W"]),
+            stack_size=config.obs_stack_size,
+            frame_stride=config.frame_stride,
+        )
         env = TokenizerLatentObsWrapper(
             env,
             tokenizer_ckpt=config.tokenizer_path,
             tokenizer_device=config.tokenizer_device,
-        )
-        env = StridedObservationStackWrapper(
-            env,
-            stack_size=config.obs_stack_size,
-            frame_stride=config.frame_stride,
         )
         env = gym.wrappers.RecordEpisodeStatistics(env)
     else:
@@ -1474,6 +1492,30 @@ def train_pusht():
     last_dones_for_gae = np.zeros(config.num_envs, dtype=np.float32)
     warned_missing_timeout_bootstrap = False
     best_eval_success = float("-inf")
+
+    initial_eval = evaluate_current_policy(
+        agent,
+        config,
+        episodes=config.eval_episodes,
+        seed=config.eval_seed,
+        device=device,
+    )
+    best_eval_success = initial_eval["success_rate"]
+    wandb.log(
+        {
+            "Eval/Mean_Return": initial_eval["mean_return"],
+            "Eval/Mean_Coverage": initial_eval["mean_coverage"],
+            "Eval/Success_Rate": initial_eval["success_rate"],
+            "Eval/Mean_Length": initial_eval["mean_length"],
+        },
+        step=0,
+    )
+    print(
+        "initial_eval "
+        f"step=0 success={initial_eval['success_rate']:.3f} "
+        f"mean_return={initial_eval['mean_return']:.2f} "
+        f"mean_length={initial_eval['mean_length']:.1f}"
+    )
 
     for update in range(num_updates):
         freeze_actor = update < warmup_updates
