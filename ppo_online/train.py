@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import pickle
 import random
 from pathlib import Path
 from collections import deque
@@ -910,6 +911,8 @@ def _load_bc_contract_overrides(bc_prior_path: str) -> dict[str, Any]:
         payload = torch.load(bc_prior_path, map_location="cpu", weights_only=True)
     except TypeError:
         payload = torch.load(bc_prior_path, map_location="cpu")
+    except pickle.UnpicklingError:
+        payload = torch.load(bc_prior_path, map_location="cpu", weights_only=False)
     except Exception as error:
         print(f"Warning: could not read BC checkpoint args from {bc_prior_path}: {error}")
         return {}
@@ -927,6 +930,7 @@ def _load_bc_contract_overrides(bc_prior_path: str) -> dict[str, Any]:
         overrides["actor_hidden_dim"] = int(ckpt_args["hidden_dim"])
     if ckpt_args.get("tokenizer_ckpt_name"):
         overrides["tokenizer_path"] = str(ckpt_args["tokenizer_ckpt_name"])
+        overrides["network_type"] = "bc_latent"
     if ckpt_args.get("action_mode") is not None:
         overrides["action_mode"] = str(ckpt_args["action_mode"])
     image_hw = ckpt_args.get("image_hw")
@@ -938,6 +942,8 @@ def _load_bc_contract_overrides(bc_prior_path: str) -> dict[str, Any]:
         state_keys = list(state_dict.keys())
         if any(key.startswith("backbone.") or key.startswith("classifier.") for key in state_keys):
             overrides["network_type"] = "bc_pixels"
+        elif any(key.startswith("net.") for key in state_keys):
+            overrides["network_type"] = "bc_latent"
     return overrides
 
 
@@ -1040,7 +1046,38 @@ def evaluate_current_policy(
     seed: int,
     device: torch.device,
 ) -> dict[str, float]:
-    env = make_env(0, seed, config, render_mode="rgb_array")()
+    if config.network_type == "bc_latent":
+        resolved_env_id = resolve_pusht_env_id(config.env_id)
+        env = make_pusht_env(
+            env_id=resolved_env_id,
+            render_mode="rgb_array",
+            image_height=int(getattr(config, "image_height", 224)),
+            image_width=int(getattr(config, "image_width", 224)),
+            max_episode_steps=int(config.max_episode_steps),
+            relative=bool(config.action_mode in {"relative", "swm_relative"}),
+            sync_goal_pose=True,
+            align_sampled_goal_to_fixed_target=bool(config.fixed_target),
+            fixed_target_block_success=bool(config.fixed_target_block_success),
+            fixed_target_agent_block_coef=float(config.agent_block_coef),
+            block_start_near_goal=bool(config.block_start_near_goal),
+            block_start_radius=float(config.block_start_radius),
+            reward_mode=str(config.reward_mode),
+            render_obs=False,
+        )
+        env = PushTDenseRewardWrapper(env, env_id=resolved_env_id)
+        env = TokenizerLatentObsWrapper(
+            env,
+            tokenizer_ckpt=config.tokenizer_path,
+            tokenizer_device=config.tokenizer_device,
+        )
+        env = StridedObservationStackWrapper(
+            env,
+            stack_size=config.obs_stack_size,
+            frame_stride=config.frame_stride,
+        )
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+    else:
+        env = make_env(0, seed, config, render_mode="rgb_array")()
     returns = []
     coverages = []
     successes = []
@@ -1059,10 +1096,22 @@ def evaluate_current_policy(
                 step_count = 0
                 final_info = {}
                 terminated = False
+                pending_actions: deque[np.ndarray] = deque()
                 while not done:
                     state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-                    action_mean = agent.network.actor_mean(state_tensor)
-                    env_action = action_mean.squeeze(0).cpu().numpy()
+                    if config.network_type == "bc_latent":
+                        if not pending_actions:
+                            action_flat = agent.network.actor_mean(state_tensor).squeeze(0).cpu().numpy()
+                            chunk = np.asarray(action_flat, dtype=np.float32).reshape(int(config.chunk_size), 2)
+                            pending_actions.extend(chunk)
+                        primitive = np.asarray(pending_actions.popleft(), dtype=np.float32)
+                        if config.action_mode in {"relative", "swm_relative"}:
+                            env_action = np.clip(primitive, -1.0, 1.0)
+                        else:
+                            env_action = np.clip(primitive, 0.0, 512.0)
+                    else:
+                        action_mean = agent.network.actor_mean(state_tensor)
+                        env_action = action_mean.squeeze(0).cpu().numpy()
                     state, reward, terminated, truncated, info = env.step(env_action)
                     total_reward += float(reward)
                     step_count += 1
