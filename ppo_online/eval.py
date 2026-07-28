@@ -117,9 +117,6 @@ def _success_from_info(info: dict, terminated: bool) -> float:
     for key in ("success", "is_success", "task_success", "block_success"):
         if key in info:
             return float(np.asarray(info[key]).squeeze())
-    coverage = info.get("coverage")
-    if coverage is not None:
-        return float(float(coverage) >= 0.95)
     return float(bool(terminated))
 
 
@@ -446,11 +443,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
                 else:
                     primitive = executor.next_open_loop(chunk)
 
-                primitive = np.asarray(primitive, dtype=np.float32)
-                if cfg.action_mode in {"relative", "swm_relative"}:
-                    env_action = np.clip(primitive, -1.0, 1.0)
-                else:
-                    env_action = np.clip(primitive, 0.0, 512.0)
+                env_action = np.asarray(primitive, dtype=np.float32)
 
                 obs, reward, terminated, truncated, info = env.step(env_action)
                 final_info = dict(info)

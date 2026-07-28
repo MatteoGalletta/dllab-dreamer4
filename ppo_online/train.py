@@ -1145,11 +1145,7 @@ def evaluate_current_policy(
                             action_flat = agent.network.actor_mean(state_tensor).squeeze(0).cpu().numpy()
                             chunk = np.asarray(action_flat, dtype=np.float32).reshape(int(config.chunk_size), 2)
                             pending_actions.extend(chunk)
-                        primitive = np.asarray(pending_actions.popleft(), dtype=np.float32)
-                        if config.action_mode in {"relative", "swm_relative"}:
-                            env_action = np.clip(primitive, -1.0, 1.0)
-                        else:
-                            env_action = np.clip(primitive, 0.0, 512.0)
+                        env_action = np.asarray(pending_actions.popleft(), dtype=np.float32)
                     else:
                         action_mean = agent.network.actor_mean(state_tensor)
                         env_action = action_mean.squeeze(0).cpu().numpy()
