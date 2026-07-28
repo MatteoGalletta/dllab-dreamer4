@@ -9,7 +9,7 @@ import os
 import math
 import re
 import sys
-from collections import deque
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 import shutil
@@ -60,6 +60,18 @@ def resolve_device(device_name: str) -> torch.device:
             print(f"CUDA auto-detection failed ({error}). Falling back to CPU.")
             return torch.device("cpu")
     return torch.device(device_name)
+
+
+def temporal_ensemble_action(predictions: list[torch.Tensor], decay: float) -> torch.Tensor:
+    if not predictions:
+        raise ValueError("temporal ensemble needs at least one action prediction")
+    stacked = torch.stack(list(predictions), dim=0)
+    if decay == 0.0 or len(predictions) == 1:
+        return stacked.mean(dim=0)
+    age = torch.arange(len(predictions), dtype=stacked.dtype, device=stacked.device)
+    weights = torch.exp(-decay * age)
+    weights = weights / weights.sum()
+    return (stacked * weights[:, None]).sum(dim=0)
 
 
 def extract_state_array(observation) -> np.ndarray:
@@ -497,6 +509,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
             max_history_len = (seq_len - 1) * frame_stride + 1
             frame_history: deque[np.ndarray] = deque(maxlen=max_history_len)
             action_buffer: deque[np.ndarray] = deque()
+            temporal_predictions: dict[int, list[torch.Tensor]] = defaultdict(list)
             done = False
             total_reward = 0.0
             step_count = 0
@@ -509,7 +522,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
                 if episode_frames is not None:
                     episode_frames.append(frame.copy())
 
-                if not action_buffer:
+                if args.temporal_ensemble or not action_buffer:
                     stacked_frames = pad_history(frame_history, seq_len, frame_stride)
                     input_tensor = (
                         torch.as_tensor(stacked_frames[None], dtype=torch.uint8, device=device)
@@ -523,12 +536,20 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
                     if normalize_actions:
                         pred = pred * action_scale
                     if args.temporal_ensemble:
-                        action_buffer.clear()
-                        action_buffer.extend([np.asarray(action, dtype=np.float32) for action in pred])
+                        for offset, action in enumerate(pred):
+                            temporal_predictions[step_count + offset].append(
+                                torch.as_tensor(action, dtype=torch.float32)
+                            )
                     else:
                         action_buffer.extend([np.asarray(action, dtype=np.float32) for action in pred])
 
-                env_action = np.asarray(action_buffer.popleft(), dtype=np.float32)
+                if args.temporal_ensemble:
+                    env_action = temporal_ensemble_action(
+                        temporal_predictions.pop(step_count),
+                        float(args.temporal_ensemble_decay),
+                    ).cpu().numpy().astype(np.float32, copy=False)
+                else:
+                    env_action = np.asarray(action_buffer.popleft(), dtype=np.float32)
                 _, reward, terminated, truncated, info = env.step(env_action)
                 total_reward += float(reward)
                 step_count += 1
