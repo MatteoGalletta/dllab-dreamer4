@@ -302,7 +302,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
     tokenizer_default = args.tokenizer_path or payload_config.get("tokenizer_path") or checkpoint_args.get("tokenizer_ckpt_name") or TrainConfig().tokenizer_path
     tokenizer_path = resolve_tokenizer_path(tokenizer_default)
     action_mode = str(payload_config.get("action_mode", "absolute"))
-    frame_stride = int(payload_config.get("frame_stride", architecture.get("frame_stride", 1)))
+    frame_stride = 1
 
     network = TokenizerLatentBCPPOActorCritic(
         feature_dim=architecture["feature_dim"],
