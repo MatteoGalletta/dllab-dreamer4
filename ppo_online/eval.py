@@ -68,6 +68,7 @@ class PPOEvalConfig:
     max_step_pixels: float = 15.0
     action_mode: str = "absolute"
     frame_stride: int = 5
+    reward_mode: str = "dense"
     wandb: bool = False
     wandb_project: str = "pusht-ppo"
     wandb_entity: str | None = None
@@ -196,6 +197,7 @@ def make_eval_env(
         block_start_near_goal=config.block_start_radius is not None,
         block_start_radius=float(config.block_start_radius or 0.0),
         relative=bool(config.action_mode in {"relative", "swm_relative"}),
+        reward_mode=str(config.reward_mode),
         render_obs=False,
     )
     env = PushTDenseRewardWrapper(env, env_id=config.env_id)
@@ -302,7 +304,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
     tokenizer_default = args.tokenizer_path or payload_config.get("tokenizer_path") or checkpoint_args.get("tokenizer_ckpt_name") or TrainConfig().tokenizer_path
     tokenizer_path = resolve_tokenizer_path(tokenizer_default)
     action_mode = str(payload_config.get("action_mode", "absolute"))
-    frame_stride = 1
+    frame_stride = int(payload_config.get("frame_stride", architecture.get("frame_stride", TrainConfig().frame_stride)))
+    reward_mode = str(payload_config.get("reward_mode", TrainConfig().reward_mode))
 
     network = TokenizerLatentBCPPOActorCritic(
         feature_dim=architecture["feature_dim"],
@@ -343,6 +346,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
         max_step_pixels=float(args.max_step_pixels),
         action_mode=action_mode,
         frame_stride=frame_stride,
+        reward_mode=reward_mode,
         wandb=bool(args.wandb),
         wandb_project=str(args.wandb_project),
         wandb_entity=args.wandb_entity,
