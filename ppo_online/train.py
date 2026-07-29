@@ -8,6 +8,7 @@ import math
 import pickle
 import random
 import shutil
+import time
 from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
@@ -100,6 +101,7 @@ class LatentContextSampler:
         cache_key = (int(ctx_len), min_goal_dist, max_goal_dist)
         valid_windows = self._window_cache.get(cache_key)
         if valid_windows is None:
+            cache_build_start = time.perf_counter()
             windows: list[tuple[int, int]] = []
             for ep_idx, (ep_imgs, _ep_acts, ep_states) in enumerate(self.episodes):
                 if len(ep_imgs) <= ctx_len:
@@ -114,6 +116,12 @@ class LatentContextSampler:
                     windows.append((ep_idx, t_start))
             valid_windows = np.asarray(windows, dtype=np.int32)
             self._window_cache[cache_key] = valid_windows
+            cache_build_secs = time.perf_counter() - cache_build_start
+            print(
+                "Imagination context cache built: "
+                f"ctx_len={ctx_len} goal_dist=[{min_goal_dist}, {max_goal_dist}] "
+                f"windows={len(valid_windows)} build_s={cache_build_secs:.2f}"
+            )
 
         if len(valid_windows) == 0:
             raise ValueError(
@@ -1999,6 +2007,7 @@ def train_pusht():
     second_best_eval_success = float("-inf")
     ckpt_paths = checkpoint_paths(config.save_path)
 
+    initial_eval_start = time.perf_counter()
     initial_eval = evaluate_current_policy(
         agent,
         config,
@@ -2006,6 +2015,7 @@ def train_pusht():
         seed=config.eval_seed,
         device=device,
     )
+    initial_eval_secs = time.perf_counter() - initial_eval_start
     best_eval_success = initial_eval["success_rate"]
     wandb.log(
         {
@@ -2020,7 +2030,8 @@ def train_pusht():
         "initial_eval "
         f"step=0 success={initial_eval['success_rate']:.3f} "
         f"mean_return={initial_eval['mean_return']:.2f} "
-        f"mean_length={initial_eval['mean_length']:.1f}"
+        f"mean_length={initial_eval['mean_length']:.1f} "
+        f"time_s={initial_eval_secs:.2f}"
     )
     if np.isfinite(best_eval_success):
         config._reward_normalizer_state = (
@@ -2044,6 +2055,7 @@ def train_pusht():
         wandb.save(str(ckpt_paths["best"]))
 
     for update in range(num_updates):
+        update_start = time.perf_counter()
         freeze_actor = update < warmup_updates
         frac = 1.0 - (update / max(1, num_updates))
         lr_now = frac * config.learning_rate if config.anneal_lr else config.learning_rate
@@ -2063,6 +2075,7 @@ def train_pusht():
         rollout_coverages = []
         rollout_coverage_proxies = []
         rollout_chunks = []
+        rollout_start = time.perf_counter()
 
         for _ in range(config.rollout_steps):
             state_tensor = torch.as_tensor(states, dtype=torch.float32, device=device)
@@ -2216,6 +2229,7 @@ def train_pusht():
             reward_count += int(np.size(rewards))
             states = next_states
             last_dones_for_gae = dones_for_gae
+        rollout_secs = time.perf_counter() - rollout_start
 
         with torch.no_grad():
             next_state_tensor = torch.as_tensor(states, dtype=torch.float32, device=device)
@@ -2228,6 +2242,7 @@ def train_pusht():
             gae_lambda=config.gae_lambda,
         )
 
+        ppo_update_start = time.perf_counter()
         stats = agent.update(
             buffer,
             advantages.flatten(),
@@ -2238,6 +2253,7 @@ def train_pusht():
             clip_vloss=bool(config.clip_vloss),
             freeze_actor=freeze_actor,  # NEU: Flag übergeben
         )
+        ppo_update_secs = time.perf_counter() - ppo_update_start
 
         global_step = int(global_env_steps)
         mean_step_reward = reward_sum / max(1, reward_count)
@@ -2255,6 +2271,8 @@ def train_pusht():
             "PPO/BC_KL_Loss": stats["bc_kl_loss"],
             "PPO/Prior_Loss_Coef": stats["prior_loss_coef"],
             "PPO/BC_KL_Penalty_Coef": stats["bc_kl_penalty_coef"],
+            "Timing/Rollout_s": rollout_secs,
+            "Timing/PPO_Update_s": ppo_update_secs,
             "Hyperparameters/Learning_Rate": lr_now,
             "Hyperparameters/Entropy_Coef": agent.ent_coef,
             "Hyperparameters/Log_Std": scheduled_log_std,
@@ -2274,6 +2292,7 @@ def train_pusht():
             wandb_log_dict["Chunking/Mean_Active_Chunks"] = sum(rollout_chunks) / len(rollout_chunks)
 
         if config.eval_interval > 0 and (update + 1) % config.eval_interval == 0:
+            eval_start = time.perf_counter()
             eval_summary = evaluate_current_policy(
                 agent,
                 config,
@@ -2281,10 +2300,12 @@ def train_pusht():
                 seed=config.eval_seed,
                 device=device,
             )
+            eval_secs = time.perf_counter() - eval_start
             wandb_log_dict["Eval/Mean_Return"] = eval_summary["mean_return"]
             wandb_log_dict["Eval/Mean_Coverage"] = eval_summary["mean_coverage"]
             wandb_log_dict["Eval/Success_Rate"] = eval_summary["success_rate"]
             wandb_log_dict["Eval/Mean_Length"] = eval_summary["mean_length"]
+            wandb_log_dict["Timing/Eval_s"] = eval_secs
             eval_success = float(eval_summary["success_rate"])
             if eval_success > best_eval_success:
                 config._reward_normalizer_state = (
@@ -2325,6 +2346,8 @@ def train_pusht():
                     f"success_rate={eval_success:.3f} saved={ckpt_paths['second_best']}"
                 )
 
+        update_secs = time.perf_counter() - update_start
+        wandb_log_dict["Timing/Update_Total_s"] = update_secs
         wandb.log(wandb_log_dict, step=global_step)
 
         if (update + 1) % max(1, config.log_interval) == 0:
@@ -2334,6 +2357,7 @@ def train_pusht():
             mean_coverage_proxy = wandb_log_dict.get("Environment/Mean_Coverage_Proxy", float("nan"))
             mean_active_chunks = wandb_log_dict.get("Chunking/Mean_Active_Chunks", float("nan"))
             eval_success = wandb_log_dict.get("Eval/Success_Rate", float("nan"))
+            eval_secs = wandb_log_dict.get("Timing/Eval_s", float("nan"))
             print(
                 f"update={update + 1}/{num_updates} "
                 f"step={global_step} "
@@ -2347,7 +2371,11 @@ def train_pusht():
                 f"entropy={stats['entropy']:.3f} "
                 f"log_std={scheduled_log_std:.3f} "
                 f"chunks={mean_active_chunks:.2f} "
-                f"eval_success={eval_success:.3f}"
+                f"eval_success={eval_success:.3f} "
+                f"rollout_s={rollout_secs:.2f} "
+                f"ppo_s={ppo_update_secs:.2f} "
+                f"eval_s={eval_secs:.2f} "
+                f"total_s={update_secs:.2f}"
             )
 
         if (update + 1) % max(1, config.save_interval) == 0:
