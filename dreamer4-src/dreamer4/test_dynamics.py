@@ -85,6 +85,9 @@ def main(args):
     # Load Tokenizer
     print(f"Loading tokenizer from {args.tokenizer_ckpt}...")
     encoder, decoder, tok_args = load_frozen_tokenizer_from_pt_ckpt(args.tokenizer_ckpt, device=device)
+    encoder.eval()
+    decoder.eval()
+
 
     H = int(tok_args.get("H", 128))
     W = int(tok_args.get("W", 128))
