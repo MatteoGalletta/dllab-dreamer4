@@ -286,18 +286,26 @@ class ImaginedLatentVecEnv:
             return
         if self.obs_history is None or self.z_spatial_seq is None or self.a_seq is None:
             raise RuntimeError("Imagined latent env history is not initialized.")
-        z_spatial_seq, a_seq, flattened = self._sample_initial_batch(
-            int(done_indices.size),
+        if done_indices.size != self.num_envs:
+            raise RuntimeError(
+                "Imagined PPO expected synchronized horizon resets across all envs, "
+                f"but got partial reset for {done_indices.size}/{self.num_envs} envs."
+            )
+        self.z_spatial_seq, self.a_seq, flattened = self._sample_initial_batch(
+            self.num_envs,
             ctx_len=self.ctx_len,
             min_goal_dist=self.min_goal_dist,
             max_goal_dist=self.max_goal_dist,
         )
-        self.z_spatial_seq[done_indices] = z_spatial_seq
-        self.a_seq[done_indices] = a_seq
-        for hist_idx in range(self.frame_stack):
-            self.obs_history[hist_idx][done_indices] = flattened[:, flattened.shape[1] - self.frame_stack + hist_idx]
-        self.steps[done_indices] = 0
-        self.return_sums[done_indices] = 0.0
+        self.obs_history = deque(
+            [
+                flattened[:, t]
+                for t in range(flattened.shape[1] - self.frame_stack, flattened.shape[1])
+            ],
+            maxlen=self.frame_stack,
+        )
+        self.steps.fill(0)
+        self.return_sums.fill(0.0)
 
     @torch.no_grad()
     def reset_all(
