@@ -35,6 +35,22 @@ def pool_latents(z_unpacked: torch.Tensor) -> torch.Tensor:
     return z_unpacked.mean(dim=-2)
 
 
+class ImaginedRewardHead(torch.nn.Module):
+    def __init__(self, latent_dim: int, hidden: int = 256, dropout: float = 0.0):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(latent_dim, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, 1),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z).squeeze(-1)
+
+
 class LatentContextSampler:
     def __init__(self, npz_path: str, action_chunk_size: int, device: torch.device):
         self.device = device
@@ -118,22 +134,15 @@ class LatentContextSampler:
 def _load_dreamer_training_modules():
     project_root = Path(__file__).resolve().parents[1]
     dynamics_path = project_root / "dreamer4-src" / "dreamer4" / "train_dynamics.py"
-    reward_path = project_root / "dreamer4-src" / "dreamer4" / "train_reward.py"
-    if not dynamics_path.exists() or not reward_path.exists():
-        raise FileNotFoundError("Could not locate dreamer4 dynamics/reward training scripts.")
+    if not dynamics_path.exists():
+        raise FileNotFoundError("Could not locate dreamer4 dynamics training script.")
 
     dyn_spec = importlib.util.spec_from_file_location("ppo_online_dreamer_train_dynamics", dynamics_path)
     if dyn_spec is None or dyn_spec.loader is None:
         raise RuntimeError(f"Could not load dynamics module from {dynamics_path}")
     dyn_module = importlib.util.module_from_spec(dyn_spec)
     dyn_spec.loader.exec_module(dyn_module)
-
-    reward_spec = importlib.util.spec_from_file_location("ppo_online_dreamer_train_reward", reward_path)
-    if reward_spec is None or reward_spec.loader is None:
-        raise RuntimeError(f"Could not load reward module from {reward_path}")
-    reward_module = importlib.util.module_from_spec(reward_spec)
-    reward_spec.loader.exec_module(reward_module)
-    return dyn_module, reward_module
+    return dyn_module
 
 
 def _flatten_tokenizer_latents(z_btLd: torch.Tensor) -> torch.Tensor:
@@ -1053,7 +1062,7 @@ def load_imagination_components(config: TrainConfig, device: torch.device) -> di
             + ", ".join(f"--{name.replace('_', '-')}" for name in missing)
         )
 
-    dyn_module, reward_module = _load_dreamer_training_modules()
+    dyn_module = _load_dreamer_training_modules()
     # Reuse the exact checkpoint reconstruction from check_reward_imagination.py.
     checker_spec_path = Path(__file__).resolve().parents[1] / "dreamer4-src" / "dreamer4" / "check_reward_imagination.py"
     checker_spec = importlib.util.spec_from_file_location("ppo_online_check_reward_imagination", checker_spec_path)
@@ -1068,7 +1077,7 @@ def load_imagination_components(config: TrainConfig, device: torch.device) -> di
         tokenizer_ckpt_override=str(config.tokenizer_path),
     )
     reward_payload = torch.load(str(config.reward_ckpt), map_location="cpu")
-    reward_head = reward_module.RewardHead(
+    reward_head = ImaginedRewardHead(
         latent_dim=int(tok_args["d_bottleneck"]),
         hidden=256,
     ).to(device)
