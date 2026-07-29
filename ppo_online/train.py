@@ -1063,19 +1063,49 @@ def load_imagination_components(config: TrainConfig, device: torch.device) -> di
         )
 
     dyn_module = _load_dreamer_training_modules()
-    # Reuse the exact checkpoint reconstruction from check_reward_imagination.py.
-    checker_spec_path = Path(__file__).resolve().parents[1] / "dreamer4-src" / "dreamer4" / "check_reward_imagination.py"
-    checker_spec = importlib.util.spec_from_file_location("ppo_online_check_reward_imagination", checker_spec_path)
-    if checker_spec is None or checker_spec.loader is None:
-        raise RuntimeError(f"Could not load imagination helper module from {checker_spec_path}")
-    checker_module = importlib.util.module_from_spec(checker_spec)
-    checker_spec.loader.exec_module(checker_module)
-
-    dyn_model, dyn_args, encoder, _decoder, tok_args, packing_factor = checker_module.load_dynamics_from_ckpt(
-        str(config.dynamics_ckpt),
-        device,
-        tokenizer_ckpt_override=str(config.tokenizer_path),
+    dyn_ckpt = torch.load(str(config.dynamics_ckpt), map_location="cpu")
+    dyn_args = dict(dyn_ckpt["args"])
+    tokenizer_path = str(config.tokenizer_path or dyn_args["tokenizer_ckpt"])
+    override = {
+        key: dyn_args[key]
+        for key in ("H", "W", "C", "patch")
+        if dyn_args.get(key) is not None
+    }
+    encoder, _decoder, tok_args = dyn_module.load_frozen_tokenizer_from_pt_ckpt(
+        tokenizer_path,
+        device=device,
+        override=override,
     )
+    n_latents = int(tok_args.get("n_latents", 16))
+    d_bottleneck = int(tok_args.get("d_bottleneck", 32))
+    packing_factor = int(dyn_args["packing_factor"])
+    if n_latents % packing_factor != 0:
+        raise ValueError(
+            f"Tokenizer n_latents={n_latents} is not divisible by packing_factor={packing_factor}"
+        )
+    n_spatial = n_latents // packing_factor
+    d_spatial = d_bottleneck * packing_factor
+    dyn_model = dyn_module.Dynamics(
+        d_model=int(dyn_args["d_model_dyn"]),
+        d_bottleneck=d_bottleneck,
+        d_spatial=d_spatial,
+        n_spatial=n_spatial,
+        n_register=int(dyn_args["n_register"]),
+        n_agent=int(dyn_args["n_agent"]),
+        n_heads=int(dyn_args["n_heads"]),
+        depth=int(dyn_args["dyn_depth"]),
+        k_max=int(dyn_args["k_max"]),
+        dropout=0.0,
+        mlp_ratio=float(dyn_args["mlp_ratio"]),
+        time_every=int(dyn_args["time_every"]),
+        space_mode=str(dyn_args["space_mode"]),
+        scale_pos_embeds=bool(dyn_args.get("scale_pos_embeds", False)),
+    ).to(device)
+    dyn_model.load_state_dict(dyn_ckpt["dynamics"], strict=True)
+    dyn_model.eval()
+    for param in dyn_model.parameters():
+        param.requires_grad_(False)
+
     reward_payload = torch.load(str(config.reward_ckpt), map_location="cpu")
     reward_head = ImaginedRewardHead(
         latent_dim=int(tok_args["d_bottleneck"]),
@@ -1099,9 +1129,9 @@ def load_imagination_components(config: TrainConfig, device: torch.device) -> di
         "tok_args": tok_args,
         "packing_factor": packing_factor,
         "reward_head": reward_head,
-        "temporal_patchify": checker_module.temporal_patchify,
-        "pack_bottleneck_to_spatial": checker_module.pack_bottleneck_to_spatial,
-        "unpack_spatial_to_bottleneck": checker_module.unpack_spatial_to_bottleneck,
+        "temporal_patchify": dyn_module.temporal_patchify,
+        "pack_bottleneck_to_spatial": dyn_module.pack_bottleneck_to_spatial,
+        "unpack_spatial_to_bottleneck": dyn_module.unpack_spatial_to_bottleneck,
         "sample_one_timestep_packed": dyn_module.sample_one_timestep_packed,
         "make_tau_schedule": dyn_module.make_tau_schedule,
     }
