@@ -56,6 +56,7 @@ class LatentContextSampler:
         self.device = device
         self.action_chunk_size = action_chunk_size
         self.goal_pose = PUSHT_FIXED_TARGET_POSE.astype(np.float32)
+        self._window_cache: dict[tuple[int, float | None, float | None], np.ndarray] = {}
 
         data = np.load(npz_path, allow_pickle=True)
         self.images = data["images"]
@@ -96,20 +97,25 @@ class LatentContextSampler:
         min_goal_dist: float | None = None,
         max_goal_dist: float | None = None,
     ):
-        valid_windows: list[tuple[int, int]] = []
-        for ep_idx, (ep_imgs, _ep_acts, ep_states) in enumerate(self.episodes):
-            if len(ep_imgs) <= ctx_len:
-                continue
-            for t_start in range(0, len(ep_imgs) - ctx_len):
-                t_end = t_start + ctx_len - 1
-                goal_dist = self._window_goal_distance(ep_states, t_end)
-                if min_goal_dist is not None and goal_dist is not None and goal_dist < min_goal_dist:
+        cache_key = (int(ctx_len), min_goal_dist, max_goal_dist)
+        valid_windows = self._window_cache.get(cache_key)
+        if valid_windows is None:
+            windows: list[tuple[int, int]] = []
+            for ep_idx, (ep_imgs, _ep_acts, ep_states) in enumerate(self.episodes):
+                if len(ep_imgs) <= ctx_len:
                     continue
-                if max_goal_dist is not None and goal_dist is not None and goal_dist > max_goal_dist:
-                    continue
-                valid_windows.append((ep_idx, t_start))
+                for t_start in range(0, len(ep_imgs) - ctx_len):
+                    t_end = t_start + ctx_len - 1
+                    goal_dist = self._window_goal_distance(ep_states, t_end)
+                    if min_goal_dist is not None and goal_dist is not None and goal_dist < min_goal_dist:
+                        continue
+                    if max_goal_dist is not None and goal_dist is not None and goal_dist > max_goal_dist:
+                        continue
+                    windows.append((ep_idx, t_start))
+            valid_windows = np.asarray(windows, dtype=np.int32)
+            self._window_cache[cache_key] = valid_windows
 
-        if not valid_windows:
+        if len(valid_windows) == 0:
             raise ValueError(
                 "No imagination context windows matched the requested goal-distance filter. "
                 f"ctx_len={ctx_len} min_goal_dist={min_goal_dist} max_goal_dist={max_goal_dist}"
@@ -214,6 +220,9 @@ class ImaginedLatentVecEnv:
         self.obs_history: deque[torch.Tensor] | None = None
         self.steps = np.zeros(self.num_envs, dtype=np.int32)
         self.return_sums = np.zeros(self.num_envs, dtype=np.float32)
+        self.ctx_len = 0
+        self.min_goal_dist: float | None = None
+        self.max_goal_dist: float | None = None
 
         self.dyn.eval()
         self.reward_head.eval()
@@ -236,15 +245,16 @@ class ImaginedLatentVecEnv:
         return obs.detach().cpu().numpy().astype(np.float32)
 
     @torch.no_grad()
-    def reset_all(
+    def _sample_initial_batch(
         self,
+        batch_size: int,
         *,
         ctx_len: int,
         min_goal_dist: float | None = None,
         max_goal_dist: float | None = None,
-    ) -> np.ndarray:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         real_frames, real_actions = self.sampler.sample_context(
-            self.num_envs,
+            batch_size,
             ctx_len=ctx_len,
             min_goal_dist=min_goal_dist,
             max_goal_dist=max_goal_dist,
@@ -252,14 +262,52 @@ class ImaginedLatentVecEnv:
         patches = self.temporal_patchify_fn(real_frames, self.patch)
         z_btLd, _ = self.encoder(patches)
         n_spatial = z_btLd.shape[2] // self.packing_factor
-        self.z_spatial_seq = self.pack_bottleneck_to_spatial_fn(
+        z_spatial_seq = self.pack_bottleneck_to_spatial_fn(
             z_btLd,
             n_spatial=n_spatial,
             k=self.packing_factor,
         )
-        self.a_seq = torch.zeros((self.num_envs, real_actions.shape[1], 16), device=self.device, dtype=torch.float32)
-        self.a_seq[..., : real_actions.shape[-1]] = self._action_to_model_space(real_actions)
+        a_seq = torch.zeros((batch_size, real_actions.shape[1], 16), device=self.device, dtype=torch.float32)
+        a_seq[..., : real_actions.shape[-1]] = self._action_to_model_space(real_actions)
         flattened = _flatten_tokenizer_latents(z_btLd)
+        return z_spatial_seq, a_seq, flattened
+
+    @torch.no_grad()
+    def _reset_done_envs(self, done_indices: np.ndarray) -> None:
+        if done_indices.size == 0:
+            return
+        if self.obs_history is None or self.z_spatial_seq is None or self.a_seq is None:
+            raise RuntimeError("Imagined latent env history is not initialized.")
+        z_spatial_seq, a_seq, flattened = self._sample_initial_batch(
+            int(done_indices.size),
+            ctx_len=self.ctx_len,
+            min_goal_dist=self.min_goal_dist,
+            max_goal_dist=self.max_goal_dist,
+        )
+        self.z_spatial_seq[done_indices] = z_spatial_seq
+        self.a_seq[done_indices] = a_seq
+        for hist_idx in range(self.frame_stack):
+            self.obs_history[hist_idx][done_indices] = flattened[:, flattened.shape[1] - self.frame_stack + hist_idx]
+        self.steps[done_indices] = 0
+        self.return_sums[done_indices] = 0.0
+
+    @torch.no_grad()
+    def reset_all(
+        self,
+        *,
+        ctx_len: int,
+        min_goal_dist: float | None = None,
+        max_goal_dist: float | None = None,
+    ) -> np.ndarray:
+        self.ctx_len = int(ctx_len)
+        self.min_goal_dist = min_goal_dist
+        self.max_goal_dist = max_goal_dist
+        self.z_spatial_seq, self.a_seq, flattened = self._sample_initial_batch(
+            self.num_envs,
+            ctx_len=self.ctx_len,
+            min_goal_dist=self.min_goal_dist,
+            max_goal_dist=self.max_goal_dist,
+        )
         self.obs_history = deque(
             [flattened[:, t] for t in range(flattened.shape[1] - self.frame_stack, flattened.shape[1])],
             maxlen=self.frame_stack,
@@ -314,6 +362,10 @@ class ImaginedLatentVecEnv:
                 info["episode"] = {"r": float(self.return_sums[env_idx]), "l": int(self.steps[env_idx])}
                 info["success"] = float(success_scores[env_idx].item() >= self.reward_threshold)
             infos.append(info)
+        done_indices = np.flatnonzero(dones)
+        if done_indices.size > 0:
+            self._reset_done_envs(done_indices)
+            next_obs = self._build_obs()
         return next_obs, rewards_np, np.zeros(self.num_envs, dtype=bool), dones.astype(bool), infos
 
 
