@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import math
 import pickle
 import random
@@ -38,10 +39,12 @@ class LatentContextSampler:
     def __init__(self, npz_path: str, action_chunk_size: int, device: torch.device):
         self.device = device
         self.action_chunk_size = action_chunk_size
+        self.goal_pose = PUSHT_FIXED_TARGET_POSE.astype(np.float32)
 
         data = np.load(npz_path, allow_pickle=True)
         self.images = data["images"]
         self.actions_raw = data["actions"]
+        self.states = data["states"] if "states" in data else None
 
         ends = data["episode_ends"]
         starts = np.zeros_like(ends)
@@ -53,18 +56,55 @@ class LatentContextSampler:
             seq_len = raw_len // action_chunk_size
             used = seq_len * action_chunk_size
 
-            if seq_len >= 24:
+            if seq_len >= 2:
                 ep_imgs = self.images[s:s + used][::action_chunk_size]
                 ep_acts = self.actions_raw[s:s + used].reshape(seq_len, -1)
-                self.episodes.append((ep_imgs, ep_acts))
+                ep_states = None
+                if self.states is not None:
+                    ep_states = self.states[s:s + used][::action_chunk_size]
+                self.episodes.append((ep_imgs, ep_acts, ep_states))
 
-    def sample_context(self, batch_size: int, ctx_len: int = 24):
+    def _window_goal_distance(self, ep_states: np.ndarray | None, t_end: int) -> float | None:
+        if ep_states is None:
+            return None
+        state = np.asarray(ep_states[t_end], dtype=np.float32)
+        if state.shape[0] < 4:
+            return None
+        return float(np.linalg.norm(state[2:4] - self.goal_pose[:2]))
+
+    def sample_context(
+        self,
+        batch_size: int,
+        ctx_len: int = 24,
+        *,
+        min_goal_dist: float | None = None,
+        max_goal_dist: float | None = None,
+    ):
+        valid_windows: list[tuple[int, int]] = []
+        for ep_idx, (ep_imgs, _ep_acts, ep_states) in enumerate(self.episodes):
+            if len(ep_imgs) <= ctx_len:
+                continue
+            for t_start in range(0, len(ep_imgs) - ctx_len):
+                t_end = t_start + ctx_len - 1
+                goal_dist = self._window_goal_distance(ep_states, t_end)
+                if min_goal_dist is not None and goal_dist is not None and goal_dist < min_goal_dist:
+                    continue
+                if max_goal_dist is not None and goal_dist is not None and goal_dist > max_goal_dist:
+                    continue
+                valid_windows.append((ep_idx, t_start))
+
+        if not valid_windows:
+            raise ValueError(
+                "No imagination context windows matched the requested goal-distance filter. "
+                f"ctx_len={ctx_len} min_goal_dist={min_goal_dist} max_goal_dist={max_goal_dist}"
+            )
+
         batch_imgs, batch_acts = [], []
-        indices = np.random.choice(len(self.episodes), size=batch_size, replace=True)
+        indices = np.random.choice(len(valid_windows), size=batch_size, replace=True)
 
         for idx in indices:
-            ep_imgs, ep_acts = self.episodes[idx]
-            t_start = np.random.randint(0, len(ep_imgs) - ctx_len)
+            ep_idx, t_start = valid_windows[int(idx)]
+            ep_imgs, ep_acts, _ep_states = self.episodes[ep_idx]
 
             batch_imgs.append(ep_imgs[t_start: t_start + ctx_len])
             batch_acts.append(ep_acts[t_start: t_start + ctx_len])
@@ -73,6 +113,199 @@ class LatentContextSampler:
         acts_tensor = torch.from_numpy(np.stack(batch_acts)).float()
 
         return imgs_tensor.to(self.device), acts_tensor.to(self.device)
+
+
+def _load_dreamer_training_modules():
+    project_root = Path(__file__).resolve().parents[1]
+    dynamics_path = project_root / "dreamer4-src" / "dreamer4" / "train_dynamics.py"
+    reward_path = project_root / "dreamer4-src" / "dreamer4" / "train_reward.py"
+    if not dynamics_path.exists() or not reward_path.exists():
+        raise FileNotFoundError("Could not locate dreamer4 dynamics/reward training scripts.")
+
+    dyn_spec = importlib.util.spec_from_file_location("ppo_online_dreamer_train_dynamics", dynamics_path)
+    if dyn_spec is None or dyn_spec.loader is None:
+        raise RuntimeError(f"Could not load dynamics module from {dynamics_path}")
+    dyn_module = importlib.util.module_from_spec(dyn_spec)
+    dyn_spec.loader.exec_module(dyn_module)
+
+    reward_spec = importlib.util.spec_from_file_location("ppo_online_dreamer_train_reward", reward_path)
+    if reward_spec is None or reward_spec.loader is None:
+        raise RuntimeError(f"Could not load reward module from {reward_path}")
+    reward_module = importlib.util.module_from_spec(reward_spec)
+    reward_spec.loader.exec_module(reward_module)
+    return dyn_module, reward_module
+
+
+def _flatten_tokenizer_latents(z_btLd: torch.Tensor) -> torch.Tensor:
+    if z_btLd.ndim != 4:
+        raise ValueError(f"Expected latents with shape (B, T, L, D), got {tuple(z_btLd.shape)}")
+    return z_btLd.reshape(z_btLd.shape[0], z_btLd.shape[1], -1)
+
+
+class ImaginedLatentVecEnv:
+    def __init__(
+        self,
+        *,
+        sampler: LatentContextSampler,
+        encoder,
+        dyn,
+        reward_head,
+        tok_args: dict[str, Any],
+        dyn_args: dict[str, Any],
+        packing_factor: int,
+        frame_stack: int,
+        num_envs: int,
+        reward_mode: str,
+        action_mode: str,
+        max_horizon: int,
+        reward_threshold: float,
+        schedule: str,
+        eval_d: float,
+        device: torch.device,
+        temporal_patchify_fn,
+        pack_bottleneck_to_spatial_fn,
+        unpack_spatial_to_bottleneck_fn,
+        sample_one_timestep_fn,
+        make_tau_schedule_fn,
+    ):
+        self.sampler = sampler
+        self.encoder = encoder
+        self.dyn = dyn
+        self.reward_head = reward_head
+        self.tok_args = dict(tok_args)
+        self.dyn_args = dict(dyn_args)
+        self.packing_factor = int(packing_factor)
+        self.frame_stack = int(frame_stack)
+        self.num_envs = int(num_envs)
+        self.reward_mode = str(reward_mode)
+        self.action_mode = str(action_mode)
+        self.max_horizon = int(max_horizon)
+        self.reward_threshold = float(reward_threshold)
+        self.schedule = str(schedule)
+        self.eval_d = float(eval_d)
+        self.device = device
+        self.temporal_patchify_fn = temporal_patchify_fn
+        self.pack_bottleneck_to_spatial_fn = pack_bottleneck_to_spatial_fn
+        self.unpack_spatial_to_bottleneck_fn = unpack_spatial_to_bottleneck_fn
+        self._sample_one_timestep = sample_one_timestep_fn
+        self._make_tau_schedule = make_tau_schedule_fn
+
+        self.patch = int(self.tok_args.get("patch", 4))
+        self.action_dim = int(self.dyn_args.get("action_chunk_size", 5)) * 2
+        self.act_mask = torch.zeros(16, device=self.device, dtype=torch.float32)
+        self.act_mask[: self.action_dim] = 1.0
+        self.sched = self._make_tau_schedule(
+            k_max=int(self.dyn_args["k_max"]),
+            schedule=self.schedule,
+            d=self.eval_d,
+        )
+
+        self.z_spatial_seq: torch.Tensor | None = None
+        self.a_seq: torch.Tensor | None = None
+        self.obs_history: deque[torch.Tensor] | None = None
+        self.steps = np.zeros(self.num_envs, dtype=np.int32)
+        self.return_sums = np.zeros(self.num_envs, dtype=np.float32)
+
+        self.dyn.eval()
+        self.reward_head.eval()
+        self.encoder.eval()
+
+    def _action_to_model_space(self, actions: torch.Tensor) -> torch.Tensor:
+        if self.action_mode == "absolute":
+            return (actions / 256.0) - 1.0
+        return torch.clamp(actions, -1.0, 1.0)
+
+    def _reward_from_scores(self, success_scores: torch.Tensor) -> torch.Tensor:
+        if self.reward_mode == "sparse":
+            return (success_scores >= self.reward_threshold).to(torch.float32)
+        return success_scores
+
+    def _build_obs(self) -> np.ndarray:
+        if self.obs_history is None or len(self.obs_history) != self.frame_stack:
+            raise RuntimeError("Imagined latent history is not initialized.")
+        obs = torch.stack(list(self.obs_history), dim=1)
+        return obs.detach().cpu().numpy().astype(np.float32)
+
+    @torch.no_grad()
+    def reset_all(
+        self,
+        *,
+        ctx_len: int,
+        min_goal_dist: float | None = None,
+        max_goal_dist: float | None = None,
+    ) -> np.ndarray:
+        real_frames, real_actions = self.sampler.sample_context(
+            self.num_envs,
+            ctx_len=ctx_len,
+            min_goal_dist=min_goal_dist,
+            max_goal_dist=max_goal_dist,
+        )
+        patches = self.temporal_patchify_fn(real_frames, self.patch)
+        z_btLd, _ = self.encoder(patches)
+        n_spatial = z_btLd.shape[2] // self.packing_factor
+        self.z_spatial_seq = self.pack_bottleneck_to_spatial_fn(
+            z_btLd,
+            n_spatial=n_spatial,
+            k=self.packing_factor,
+        )
+        self.a_seq = torch.zeros((self.num_envs, real_actions.shape[1], 16), device=self.device, dtype=torch.float32)
+        self.a_seq[..., : real_actions.shape[-1]] = self._action_to_model_space(real_actions)
+        flattened = _flatten_tokenizer_latents(z_btLd)
+        self.obs_history = deque(
+            [flattened[:, t] for t in range(flattened.shape[1] - self.frame_stack, flattened.shape[1])],
+            maxlen=self.frame_stack,
+        )
+        self.steps.fill(0)
+        self.return_sums.fill(0.0)
+        return self._build_obs()
+
+    @torch.no_grad()
+    def step(self, actions_np: np.ndarray):
+        if self.z_spatial_seq is None or self.a_seq is None:
+            raise RuntimeError("Imagined latent env must be reset before stepping.")
+        actions = torch.as_tensor(actions_np, dtype=torch.float32, device=self.device)
+        actions = actions.view(self.num_envs, -1)
+        actions_model = self._action_to_model_space(actions)
+        new_actions = torch.zeros((self.num_envs, 1, 16), device=self.device, dtype=torch.float32)
+        new_actions[..., : actions_model.shape[-1]] = actions_model.unsqueeze(1)
+        self.a_seq = torch.cat([self.a_seq, new_actions], dim=1)
+
+        next_z = self._sample_one_timestep(
+            self.dyn,
+            past_packed=self.z_spatial_seq,
+            k_max=int(self.dyn_args["k_max"]),
+            sched=self.sched,
+            actions=self.a_seq,
+            act_mask=self.act_mask,
+        )
+        next_z = next_z.unsqueeze(1)
+        self.z_spatial_seq = torch.cat([self.z_spatial_seq, next_z], dim=1)
+
+        z_unpacked = self.unpack_spatial_to_bottleneck_fn(next_z, k=self.packing_factor)
+        pooled = pool_latents(z_unpacked).squeeze(1)
+        flattened = _flatten_tokenizer_latents(z_unpacked).squeeze(1)
+        self.obs_history.append(flattened)
+        next_obs = self._build_obs()
+
+        success_scores = torch.sigmoid(self.reward_head(pooled)).reshape(-1)
+        rewards = self._reward_from_scores(success_scores)
+        rewards_np = rewards.detach().cpu().numpy().astype(np.float32)
+        self.return_sums += rewards_np
+        self.steps += 1
+        dones = self.steps >= self.max_horizon
+
+        infos: list[dict[str, Any]] = []
+        for env_idx in range(self.num_envs):
+            info: dict[str, Any] = {
+                "coverage_proxy": float(success_scores[env_idx].item()),
+                "imagined_reward_score": float(success_scores[env_idx].item()),
+                "num_executed_primitives": 1,
+            }
+            if dones[env_idx]:
+                info["episode"] = {"r": float(self.return_sums[env_idx]), "l": int(self.steps[env_idx])}
+                info["success"] = float(success_scores[env_idx].item() >= self.reward_threshold)
+            infos.append(info)
+        return next_obs, rewards_np, np.zeros(self.num_envs, dtype=bool), dones.astype(bool), infos
 
 
 class StridedObservationStackWrapper(gym.ObservationWrapper):
@@ -777,6 +1010,17 @@ class TrainConfig:
     bc_kl_penalty_coef: float = 0.0
     tokenizer_path: str = "logs/tokenizer_ckpts/latest.pt"
     tokenizer_device: str = "auto"
+    env_source: str = "real"
+    imagination_dataset: str | None = None
+    dynamics_ckpt: str | None = None
+    reward_ckpt: str | None = None
+    imagination_context_len: int = 24
+    imagination_horizon: int = 10
+    imagination_schedule: str = "shortcut"
+    imagination_eval_d: float = 0.25
+    imagination_reward_threshold: float = 0.5
+    imagination_min_goal_dist: float | None = None
+    imagination_max_goal_dist: float | None = None
 
     seed: int = 42
     device: str = "auto"
@@ -791,6 +1035,67 @@ class TrainConfig:
     reward_clip: float = 10.0
     clip_vloss: bool = True
     critic_warmup_ratio: float = 0.10  # NEU: 10% der Updates als Warmup
+
+
+def load_imagination_components(config: TrainConfig, device: torch.device) -> dict[str, Any]:
+    if config.env_source != "imagination":
+        raise ValueError("load_imagination_components called without imagination env_source.")
+    if config.network_type != "bc_latent":
+        raise ValueError("Imagined PPO is currently only supported for network_type=bc_latent.")
+    missing = [
+        name
+        for name in ("imagination_dataset", "dynamics_ckpt", "reward_ckpt")
+        if getattr(config, name) in (None, "")
+    ]
+    if missing:
+        raise ValueError(
+            "Imagined PPO requires the following flags: "
+            + ", ".join(f"--{name.replace('_', '-')}" for name in missing)
+        )
+
+    dyn_module, reward_module = _load_dreamer_training_modules()
+    # Reuse the exact checkpoint reconstruction from check_reward_imagination.py.
+    checker_spec_path = Path(__file__).resolve().parents[1] / "dreamer4-src" / "dreamer4" / "check_reward_imagination.py"
+    checker_spec = importlib.util.spec_from_file_location("ppo_online_check_reward_imagination", checker_spec_path)
+    if checker_spec is None or checker_spec.loader is None:
+        raise RuntimeError(f"Could not load imagination helper module from {checker_spec_path}")
+    checker_module = importlib.util.module_from_spec(checker_spec)
+    checker_spec.loader.exec_module(checker_module)
+
+    dyn_model, dyn_args, encoder, _decoder, tok_args, packing_factor = checker_module.load_dynamics_from_ckpt(
+        str(config.dynamics_ckpt),
+        device,
+        tokenizer_ckpt_override=str(config.tokenizer_path),
+    )
+    reward_payload = torch.load(str(config.reward_ckpt), map_location="cpu")
+    reward_head = reward_module.RewardHead(
+        latent_dim=int(tok_args["d_bottleneck"]),
+        hidden=256,
+    ).to(device)
+    reward_head.load_state_dict(reward_payload["model"], strict=True)
+    reward_head.eval()
+    for param in reward_head.parameters():
+        param.requires_grad_(False)
+
+    sampler = LatentContextSampler(
+        str(config.imagination_dataset),
+        action_chunk_size=int(config.chunk_size),
+        device=device,
+    )
+    return {
+        "sampler": sampler,
+        "dynamics": dyn_model,
+        "dyn_args": dyn_args,
+        "encoder": encoder,
+        "tok_args": tok_args,
+        "packing_factor": packing_factor,
+        "reward_head": reward_head,
+        "temporal_patchify": checker_module.temporal_patchify,
+        "pack_bottleneck_to_spatial": checker_module.pack_bottleneck_to_spatial,
+        "unpack_spatial_to_bottleneck": checker_module.unpack_spatial_to_bottleneck,
+        "sample_one_timestep_packed": dyn_module.sample_one_timestep_packed,
+        "make_tau_schedule": dyn_module.make_tau_schedule,
+    }
 
 
 def resolve_device(device_name: str) -> torch.device:
@@ -992,7 +1297,18 @@ def parse_args():
     parser.add_argument("--bc-prior-path", "--bc_checkpoint", dest="bc_prior_path", type=str, default=None)
     parser.add_argument("--bc-stats", type=str, default=None)
     parser.add_argument("--network-type", choices=("bc_latent", "bc_pixels", "mlp"), default=None)
+    parser.add_argument("--env-source", choices=("real", "imagination"), default=None)
     parser.add_argument("--tokenizer-path", type=str, default=None)
+    parser.add_argument("--imagination-dataset", type=str, default=None)
+    parser.add_argument("--dynamics-ckpt", type=str, default=None)
+    parser.add_argument("--reward-ckpt", type=str, default=None)
+    parser.add_argument("--imagination-context-len", type=int, default=None)
+    parser.add_argument("--imagination-horizon", type=int, default=None)
+    parser.add_argument("--imagination-schedule", choices=("finest", "shortcut"), default=None)
+    parser.add_argument("--imagination-eval-d", type=float, default=None)
+    parser.add_argument("--imagination-reward-threshold", type=float, default=None)
+    parser.add_argument("--imagination-min-goal-dist", type=float, default=None)
+    parser.add_argument("--imagination-max-goal-dist", type=float, default=None)
     parser.add_argument("--save-path", type=str, default=None)
     parser.add_argument("--wandb-mode", type=str, default=None)
     parser.add_argument("--vector-env", choices=("sync", "async", "manual"), default=None)
@@ -1286,8 +1602,30 @@ def train_pusht():
         config.actor_output_tanh = False
     if args.network_type is not None:
         config.network_type = str(args.network_type)
+    if args.env_source is not None:
+        config.env_source = str(args.env_source)
     if args.tokenizer_path is not None:
         config.tokenizer_path = args.tokenizer_path
+    if args.imagination_dataset is not None:
+        config.imagination_dataset = str(args.imagination_dataset)
+    if args.dynamics_ckpt is not None:
+        config.dynamics_ckpt = str(args.dynamics_ckpt)
+    if args.reward_ckpt is not None:
+        config.reward_ckpt = str(args.reward_ckpt)
+    if args.imagination_context_len is not None:
+        config.imagination_context_len = int(args.imagination_context_len)
+    if args.imagination_horizon is not None:
+        config.imagination_horizon = int(args.imagination_horizon)
+    if args.imagination_schedule is not None:
+        config.imagination_schedule = str(args.imagination_schedule)
+    if args.imagination_eval_d is not None:
+        config.imagination_eval_d = float(args.imagination_eval_d)
+    if args.imagination_reward_threshold is not None:
+        config.imagination_reward_threshold = float(args.imagination_reward_threshold)
+    if args.imagination_min_goal_dist is not None:
+        config.imagination_min_goal_dist = float(args.imagination_min_goal_dist)
+    if args.imagination_max_goal_dist is not None:
+        config.imagination_max_goal_dist = float(args.imagination_max_goal_dist)
     if args.save_path is not None:
         config.save_path = args.save_path
     if args.vector_env is not None:
@@ -1424,12 +1762,56 @@ def train_pusht():
         f"rollout_steps={config.rollout_steps} num_envs={config.num_envs} "
         f"max_episode_steps={config.max_episode_steps} fixed_target={config.fixed_target} "
         f"reward_mode={config.reward_mode} "
-        f"block_start_radius={config.block_start_radius} action_mode={config.action_mode}"
+        f"block_start_radius={config.block_start_radius} action_mode={config.action_mode} "
+        f"env_source={config.env_source}"
     )
 
+    imagined_env: ImaginedLatentVecEnv | None = None
     env_fns = [make_env(rank, config.seed, config) for rank in range(config.num_envs)]
     manual_envs: list[gym.Env] | None = None
-    if config.vector_env == "manual":
+    if config.env_source == "imagination":
+        if config.vector_env != "manual":
+            raise ValueError("Imagined PPO currently requires --vector-env manual.")
+        imagination = load_imagination_components(config, tokenizer_device)
+        imagined_env = ImaginedLatentVecEnv(
+            sampler=imagination["sampler"],
+            encoder=imagination["encoder"],
+            dyn=imagination["dynamics"],
+            reward_head=imagination["reward_head"],
+            tok_args=imagination["tok_args"],
+            dyn_args=imagination["dyn_args"],
+            packing_factor=imagination["packing_factor"],
+            frame_stack=config.obs_stack_size,
+            num_envs=config.num_envs,
+            reward_mode=config.reward_mode,
+            action_mode=config.action_mode,
+            max_horizon=config.imagination_horizon,
+            reward_threshold=config.imagination_reward_threshold,
+            schedule=config.imagination_schedule,
+            eval_d=config.imagination_eval_d,
+            device=tokenizer_device,
+            temporal_patchify_fn=imagination["temporal_patchify"],
+            pack_bottleneck_to_spatial_fn=imagination["pack_bottleneck_to_spatial"],
+            unpack_spatial_to_bottleneck_fn=imagination["unpack_spatial_to_bottleneck"],
+            sample_one_timestep_fn=imagination["sample_one_timestep_packed"],
+            make_tau_schedule_fn=imagination["make_tau_schedule"],
+        )
+        states = imagined_env.reset_all(
+            ctx_len=config.imagination_context_len,
+            min_goal_dist=config.imagination_min_goal_dist,
+            max_goal_dist=config.imagination_max_goal_dist,
+        )
+        obs_shape = tuple(states.shape[1:])
+        action_dim = int(config.chunk_size * 2)
+        observation_dtype = np.float32
+        envs = None
+        print(
+            "Imagination setup: "
+            f"ctx_len={config.imagination_context_len} horizon={config.imagination_horizon} "
+            f"dataset={config.imagination_dataset} "
+            f"goal_dist=[{config.imagination_min_goal_dist}, {config.imagination_max_goal_dist}]"
+        )
+    elif config.vector_env == "manual":
         manual_envs = [fn() for fn in env_fns]
         if device.type == "cpu" and tokenizer_device.type == "cpu":
             print("Warning: policy and tokenizer are both on CPU, so latent observation training will be slow.")
@@ -1601,7 +1983,13 @@ def train_pusht():
             env_actions = actions_np
             action_abs_max = max(action_abs_max, float(np.max(np.abs(actions_np))))
 
-            if manual_envs is not None:
+            if imagined_env is not None:
+                next_states, rewards, terminations, truncations, infos = imagined_env.step(env_actions)
+                executed_primitives = np.ones(config.num_envs, dtype=np.int32)
+                final_observations = [None] * config.num_envs
+                global_env_steps += int(config.num_envs * config.chunk_size)
+                missing_count = 0
+            elif manual_envs is not None:
                 (
                     next_states,
                     rewards,
@@ -1658,7 +2046,18 @@ def train_pusht():
             if reward_normalizer is not None:
                 rewards = reward_normalizer.normalize(rewards, dones_for_gae)
 
-            if manual_envs is not None:
+            if imagined_env is not None:
+                for info in infos:
+                    rollout_chunks.append(float(info.get("num_executed_primitives", 1)))
+                    episode = info.get("episode")
+                    if episode is None:
+                        continue
+                    rollout_returns.append(as_float(episode.get("r", 0.0)))
+                    if "coverage" in info:
+                        rollout_coverages.append(float(info["coverage"]))
+                    if "coverage_proxy" in info:
+                        rollout_coverage_proxies.append(float(info["coverage_proxy"]))
+            elif manual_envs is not None:
                 for info in infos:
                     rollout_chunks.append(float(info.get("num_executed_primitives", config.chunk_size)))
                     episode = info.get("episode")
