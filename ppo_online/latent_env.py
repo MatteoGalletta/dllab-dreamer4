@@ -1,139 +1,142 @@
 import os
-
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Dict, Any
 import sys
 from pathlib import Path
-import torch
-import numpy as np
 
-project_root = Path(__file__).resolve().parents[1]
-dreamer_src_path = os.path.join(project_root, "dreamer4-src")
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(ROOT / "dreamer4-src"))
 
-if dreamer_src_path not in sys.path:
-    sys.path.append(dreamer_src_path)
-
-from dreamer4.model import temporal_patchify, pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck
+from dreamer4.train_dynamics import make_tau_schedule, sample_one_timestep_packed
 
 
-def pool_latents(z_unpacked: torch.Tensor) -> torch.Tensor:
-    """Collapses spatial patches by taking their spatial token mean."""
-    return z_unpacked.mean(dim=-2)
+from model import (
+    temporal_patchify,
+    pack_bottleneck_to_spatial,
+    unpack_spatial_to_bottleneck
+)
+#from train_dynamics import make_tau_schedule, sample_one_timestep_packed
 
 
-class LatentContextSampler:
-    def __init__(self, npz_path: str, action_chunk_size: int, device: torch.device):
-        self.device = device
-        self.action_chunk_size = action_chunk_size
+class LatentWorldModelEnv:
+    """
+    An imagination environment that lives entirely within the packed latent space
+    of the Tokenizer, using the Dynamics Flow Model for state transitions and the
+    Reward Head for dense reward calculation. Ideal for PPO rollouts.
+    """
 
-        data = np.load(npz_path, allow_pickle=True)
-        self.images = data["images"]
-        self.actions_raw = data["actions"]
+    def __init__(
+            self,
+            encoder: nn.Module,
+            dynamics: nn.Module,
+            reward_head: nn.Module,
+            k_max: int = 8,
+            packing_factor: int = 2,
+            eval_schedule: str = "shortcut",
+            eval_d: float = 0.25,
+            device: torch.device = torch.device("cuda")
+    ):
+        self.encoder = encoder.eval()
+        self.dynamics = dynamics.eval()
+        self.reward_head = reward_head.eval()
 
-        ends = data["episode_ends"]
-        starts = np.zeros_like(ends)
-        starts[1:] = ends[:-1]
-
-        self.episodes = []
-        for s, e in zip(starts, ends):
-            raw_len = e - s
-            seq_len = raw_len // action_chunk_size
-            used = seq_len * action_chunk_size
-
-            if seq_len >= 24:
-                ep_imgs = self.images[s:s + used][::action_chunk_size]
-                ep_acts = self.actions_raw[s:s + used].reshape(seq_len, -1)
-                self.episodes.append((ep_imgs, ep_acts))
-
-    def sample_context(self, batch_size: int, ctx_len: int = 24):
-        batch_imgs, batch_acts = [], []
-        indices = np.random.choice(len(self.episodes), size=batch_size, replace=True)
-
-        for idx in indices:
-            ep_imgs, ep_acts = self.episodes[idx]
-            t_start = np.random.randint(0, len(ep_imgs) - ctx_len)
-
-            batch_imgs.append(ep_imgs[t_start: t_start + ctx_len])
-            batch_acts.append(ep_acts[t_start: t_start + ctx_len])
-
-        imgs_tensor = torch.from_numpy(np.stack(batch_imgs)).permute(0, 1, 4, 2, 3).float() / 255.0
-        acts_tensor = torch.from_numpy(np.stack(batch_acts)).float()
-
-        return imgs_tensor.to(self.device), acts_tensor.to(self.device)
-
-
-class LatentImaginationEnv:
-    def __init__(self, dynamics, reward_head, encoder, frame_stack, packing_factor, device):
-        self.dyn = dynamics
-        self.reward_head = reward_head
-        self.encoder = encoder
-
-        self.frame_stack = frame_stack
+        self.k_max = k_max
         self.packing_factor = packing_factor
         self.device = device
 
-        self.max_horizon = 10  # Hard capped dream length
-        self.current_step = 0
+        # Build the ODE integration schedule for the flow matching dynamics
+        self.sched = make_tau_schedule(k_max=self.k_max, schedule=eval_schedule, d=eval_d)
 
-        self.z_spatial_seq = None
-        self.a_seq = None
-        self.pooled_history = []
-
-        self.dyn.eval()
-        self.reward_head.eval()
-        self.encoder.eval()
+        # Internal trajectory buffers
+        self.past_packed_buffer = None  # (B, t, n_spatial, d_spatial)
+        self.past_actions_buffer = None  # (B, t, 16)
+        self.act_mask = None  # (16,)
 
     @torch.no_grad()
-    def reset(self, real_frames, real_actions):
-        self.current_step = 0
-        B, T = real_frames.shape[:2]
+    def reset(self, initial_frames: torch.Tensor, patch: int = 4) -> torch.Tensor:
+        """
+        Resets the imagination environment with real context frames.
+        Args:
+            initial_frames: (B, T_ctx, C, H, W) normalized float [0, 1]
+            patch: patch size for the encoder
+        Returns:
+            latest_latent: (B, n_spatial, d_spatial) - The current packed latent state
+        """
+        B, T_ctx = initial_frames.shape[:2]
+        initial_frames = initial_frames.to(self.device)
 
-        patches = temporal_patchify(real_frames, patch_size=4)
-        z_btLd, _ = self.encoder(patches)
-        n_spatial = z_btLd.shape[2] // self.packing_factor
-        self.z_spatial_seq = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=self.packing_factor)
+        # 1. Map frames through the spatial patchifier and encoder
+        patches = temporal_patchify(initial_frames, patch)
+        z_btLd, _ = self.encoder(patches)  # (B, T_ctx, n_latents, d_bottleneck)
 
-        z_unpacked = unpack_spatial_to_bottleneck(self.z_spatial_seq, k=self.packing_factor)
-        all_pooled = pool_latents(z_unpacked)
+        # 2. Determine spatial dimensions and pack them down
+        n_latents = z_btLd.shape[2]
+        assert n_latents % self.packing_factor == 0, "n_latents must be divisible by packing_factor"
+        n_spatial = n_latents // self.packing_factor
 
-        self.pooled_history = [all_pooled[:, t] for t in range(T - self.frame_stack, T)]
+        # (B, T_ctx, n_spatial, d_spatial)
+        self.past_packed_buffer = pack_bottleneck_to_spatial(
+            z_btLd, n_spatial=n_spatial, k=self.packing_factor
+        )
 
-        self.a_seq = torch.zeros((B, T, 16), device=self.device)
-        self.a_seq[..., :real_actions.shape[-1]] = real_actions.clamp(-1, 1)
+        # 3. Initialize empty historical actions buffer
+        self.past_actions_buffer = torch.zeros((B, 0, 16), device=self.device, dtype=torch.float32)
+        self.act_mask = torch.ones(16, device=self.device, dtype=torch.float32)  # Full action padding mask
 
-        return self._build_ppo_observation()
+        # Return the most recent latent state in the batch context
+        return self.past_packed_buffer[:, -1]
 
     @torch.no_grad()
-    def step(self, ppo_action):
-        B = self.z_spatial_seq.shape[0]
-        self.current_step += 1
+    def step(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Advances the imagination environment by one step using the dynamics flow network.
+        Args:
+            action: (B, action_dim) raw actions from your PPO policy network
+        Returns:
+            next_latent: (B, n_spatial, d_spatial) - The predicted next environment latent state
+            reward: (B, 1) - Extracted dense environment reward bounds [0, 1]
+            done: (B, 1) - Boolean indicator tensor (all zeros for pure imagination)
+        """
+        B = action.shape[0]
+        action = action.to(self.device).clamp(-1, 1)
 
-        new_a = torch.zeros((B, 1, 16), device=self.device)
-        new_a[..., :ppo_action.shape[-1]] = ppo_action.clamp(-1, 1)
-        self.a_seq = torch.cat([self.a_seq, new_a], dim=1)
+        # Pad standard actions out to the structural vector length of 16
+        padded_action = torch.zeros((B, 1, 16), device=self.device, dtype=torch.float32)
+        padded_action[..., :action.shape[-1]] = action.unsqueeze(1)
 
-        act_mask = torch.zeros(16, device=self.device)
-        act_mask[:ppo_action.shape[-1]] = 1.0
+        # Append action to tracking context sequence
+        self.past_actions_buffer = torch.cat([self.past_actions_buffer, padded_action], dim=1)
 
-        z_pred = self.dyn(self.z_spatial_seq, actions=self.a_seq, act_mask=act_mask)
-        next_z_packed = z_pred[:, -1:]
+        # 1. Autoregressively sample the next latent state timestep
+        # Expects: (B, t, n_spatial, d_spatial) -> Returns: (B, n_spatial, d_spatial)
+        next_latent = sample_one_timestep_packed(
+            dyn=self.dynamics,
+            past_packed=self.past_packed_buffer,
+            k_max=self.k_max,
+            sched=self.sched,
+            actions=self.past_actions_buffer,
+            act_mask=self.act_mask
+        )
 
-        self.z_spatial_seq = torch.cat([self.z_spatial_seq, next_z_packed], dim=1)
+        # Append the new state prediction into the historical track buffer
+        self.past_packed_buffer = torch.cat([self.past_packed_buffer, next_latent.unsqueeze(1)], dim=1)
 
-        z_unpacked = unpack_spatial_to_bottleneck(next_z_packed, k=self.packing_factor)
-        step_pooled = pool_latents(z_unpacked).squeeze(1)
+        # 2. Extract Reward: Unpack spatial tokens back to pooled bottleneck latents for RewardHead
+        # Shape output from unpack: (B, 1, n_latents, d_bottleneck)
+        z_btLd = unpack_spatial_to_bottleneck(next_latent.unsqueeze(1), k=self.packing_factor)
 
-        reward_logit = self.reward_head(step_pooled)
-        rewards = torch.sigmoid(reward_logit).squeeze(-1)
+        # Pool latents spatially over the n_latents dimension to match RewardHead requirements
+        z_pooled = z_btLd.mean(dim=2)  # Yields (B, 1, d_bottleneck)
 
-        self.pooled_history.pop(0)
-        self.pooled_history.append(step_pooled)
-        next_obs = self._build_ppo_observation()
+        # Feed pooled latents through RewardHead to extract task-success proxy metrics
+        reward_logits = self.reward_head(z_pooled).squeeze(1)  # Yields (B, 1) raw logit scalar
+        reward = torch.sigmoid(reward_logits)  # Map to a smooth [0, 1] dense space
 
-        dones = torch.zeros(B, device=self.device)
-        if self.current_step >= self.max_horizon:
-            dones = torch.ones(B, device=self.device)
+        # Imagination tracks run until a fixed horizon limit inside the PPO loop
+        done = torch.zeros((B, 1), device=self.device, dtype=torch.bool)
 
-        return next_obs, rewards, dones
-
-    def _build_ppo_observation(self):
-        return torch.stack(self.pooled_history, dim=1)
+        return next_latent, reward, done
