@@ -17,6 +17,7 @@ import subprocess
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = Path(__file__).resolve().parent
