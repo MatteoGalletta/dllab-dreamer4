@@ -305,6 +305,107 @@ def _infer_eval_image_hw(ckpt_args: dict) -> tuple[int, int]:
     return (96, 96)
 
 
+class LegacyCNNBackbone(nn.Module):
+    def __init__(self, *, in_channels: int = 3, feature_dim: int = 256):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.feature_dim = int(feature_dim)
+
+        def conv_block(in_ch: int, out_ch: int, *, stride: int = 2) -> nn.Sequential:
+            kernel = 5 if stride == 2 else 3
+            padding = 2 if kernel == 5 else 1
+            groups = min(8, out_ch)
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=kernel, stride=stride, padding=padding, bias=False),
+                nn.GroupNorm(groups, out_ch),
+                nn.ReLU(),
+            )
+
+        self.backbone = nn.Sequential(
+            conv_block(self.in_channels, 32, stride=2),
+            conv_block(32, 64, stride=2),
+            conv_block(64, 128, stride=2),
+            conv_block(128, 256, stride=2),
+            conv_block(256, 256, stride=2),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.proj = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256, self.feature_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, x_btchw: torch.Tensor) -> torch.Tensor:
+        batch, steps, channels, height, width = x_btchw.shape
+        x = x_btchw.reshape(batch * steps, channels, height, width)
+        features = self.proj(self.backbone(x))
+        return features.view(batch, steps, -1)
+
+
+class LegacyDirectChunkPolicyHead(nn.Module):
+    def __init__(
+        self,
+        *,
+        in_dim: int,
+        seq_len: int,
+        hidden_dim: int,
+        action_dim: int,
+        dropout: float = 0.0,
+        output_tanh: bool = False,
+    ):
+        super().__init__()
+        self.seq_len = int(seq_len)
+        self.action_dim = int(action_dim)
+        self.output_tanh = bool(output_tanh)
+        self.net = nn.Sequential(
+            nn.Linear(int(in_dim) * self.seq_len, int(hidden_dim)),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), self.action_dim),
+        )
+
+    def forward(self, features_btD: torch.Tensor) -> torch.Tensor:
+        if features_btD.ndim != 3:
+            raise ValueError(f"Expected feature sequence with shape (B, T, D), got {tuple(features_btD.shape)}")
+        batch, steps, feature_dim = features_btD.shape
+        if steps != self.seq_len:
+            raise ValueError(f"Expected seq_len={self.seq_len}, got {steps}")
+        logits = self.net(features_btD.reshape(batch, steps * feature_dim))
+        return torch.tanh(logits) if self.output_tanh else logits
+
+
+def _infer_cnn_eval_architecture(
+    state_dict: dict[str, torch.Tensor],
+    ckpt_args: dict,
+) -> dict[str, Any]:
+    proj_weight = state_dict.get("backbone.proj.1.weight")
+    if proj_weight is None:
+        raise KeyError("Checkpoint is missing backbone.proj.1.weight")
+
+    backbone_style = "spatial_softmax" if int(proj_weight.shape[1]) == 512 else "avgpool"
+    feature_dim = int(proj_weight.shape[0])
+
+    if "classifier.net.6.weight" in state_dict:
+        head_style = "direct_chunk_two_hidden"
+        hidden_dim = int(state_dict["classifier.net.0.weight"].shape[0])
+    elif "classifier.net.3.weight" in state_dict:
+        head_style = "direct_chunk_one_hidden"
+        hidden_dim = int(state_dict["classifier.net.0.weight"].shape[0])
+    else:
+        raise KeyError("Could not infer CNN BC classifier head layout from checkpoint")
+
+    return {
+        "backbone_style": backbone_style,
+        "head_style": head_style,
+        "feature_dim": feature_dim,
+        "hidden_dim": hidden_dim,
+        "seq_len": int(ckpt_args.get("seq_len", 3)),
+        "chunk_size": int(ckpt_args.get("action_chunk_size", 1)),
+        "dropout": float(ckpt_args.get("dropout", 0.0)),
+        "action_output_tanh": bool(ckpt_args.get("action_output_tanh", False)),
+    }
+
+
 def create_run_directory(output_root: str, checkpoint: str, run_name: str | None = None) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     parts = [timestamp, "cnn_bc", _slug(Path(checkpoint).stem)]
@@ -438,15 +539,30 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
     img_h, img_w = _infer_eval_image_hw(ckpt_args)
 
     action_dim = chunk_size * 2
-    backbone = CNNBackbone(in_channels=3, feature_dim=cnn_feature_dim)
-    classifier = DirectChunkPolicyHead(
-        in_dim=cnn_feature_dim,
-        seq_len=seq_len,
-        hidden_dim=hidden_dim,
-        action_dim=action_dim,
-        dropout=dropout,
-        output_tanh=action_output_tanh,
-    )
+    arch = _infer_cnn_eval_architecture(ckpt["model"], ckpt_args)
+    if arch["backbone_style"] == "spatial_softmax":
+        backbone = CNNBackbone(in_channels=3, feature_dim=arch["feature_dim"])
+    else:
+        backbone = LegacyCNNBackbone(in_channels=3, feature_dim=arch["feature_dim"])
+
+    if arch["head_style"] == "direct_chunk_two_hidden":
+        classifier = DirectChunkPolicyHead(
+            in_dim=arch["feature_dim"],
+            seq_len=arch["seq_len"],
+            hidden_dim=arch["hidden_dim"],
+            action_dim=action_dim,
+            dropout=arch["dropout"],
+            output_tanh=arch["action_output_tanh"],
+        )
+    else:
+        classifier = LegacyDirectChunkPolicyHead(
+            in_dim=arch["feature_dim"],
+            seq_len=arch["seq_len"],
+            hidden_dim=arch["hidden_dim"],
+            action_dim=action_dim,
+            dropout=arch["dropout"],
+            output_tanh=arch["action_output_tanh"],
+        )
     model = CNNBCPolicy(backbone=backbone, classifier=classifier).to(device)
     model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
@@ -492,9 +608,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, float]:
     print(
         f"Loaded CNN BC from {args.checkpoint} "
         f"| seq_len={seq_len} frame_stride={frame_stride} chunk={chunk_size} "
-        f"| image_hw=({img_h}, {img_w}) cnn_feature_dim={cnn_feature_dim} "
+        f"| image_hw=({img_h}, {img_w}) cnn_feature_dim={arch['feature_dim']} "
         f"| action_mode={action_mode} normalize_actions={normalize_actions} "
         f"action_scale={action_scale} swm_action_scale={swm_action_scale} "
+        f"| backbone_style={arch['backbone_style']} head_style={arch['head_style']} "
         f"temporal_ensemble={args.temporal_ensemble} "
         f"| fixed_target_pose={tuple(float(x) for x in args.fixed_target_pose)} "
         f"| fixed_target_block_success={not bool(args.fixed_target_full_state_success)} "
