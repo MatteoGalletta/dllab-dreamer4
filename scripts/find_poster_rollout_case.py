@@ -78,15 +78,23 @@ class _LatentBCAgent:
     def act(self, frame_history: deque[np.ndarray], step_index: int) -> np.ndarray:
         del step_index
         if not self.pending_actions:
-            stacked_frames = _pad_history(frame_history, self.frame_stack, self.frame_stride)
-            input_tensor = (
-                torch.as_tensor(stacked_frames[None], dtype=torch.uint8, device=self.device)
-                .permute(0, 1, 4, 2, 3)
-                .to(torch.float32)
-                / 255.0
-            )
-            latent_stack = self.backbone.extract_features(input_tensor)
-            pred = self.model(latent_stack).view(1, self.chunk_size, 2).squeeze(0).cpu().numpy()
+            with torch.no_grad():
+                stacked_frames = _pad_history(frame_history, self.frame_stack, self.frame_stride)
+                input_tensor = (
+                    torch.as_tensor(stacked_frames[None], dtype=torch.uint8, device=self.device)
+                    .permute(0, 1, 4, 2, 3)
+                    .to(torch.float32)
+                    / 255.0
+                )
+                latent_stack = self.backbone.extract_features(input_tensor)
+                pred = (
+                    self.model(latent_stack)
+                    .view(1, self.chunk_size, 2)
+                    .squeeze(0)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
             if self.action_mode == "swm_relative" and self.swm_action_scale != 100.0:
                 pred = pred * (self.swm_action_scale / 100.0)
             if self.normalize_actions:
@@ -160,33 +168,34 @@ class _LatentPPOAgent:
 
     def act(self, frame_history: deque[np.ndarray], step_index: int) -> np.ndarray:
         del step_index
-        history = list(frame_history)
-        newest = len(history) - 1
-        indices = [
-            max(0, newest - i * self.frame_stride)
-            for i in range(self.frame_stack - 1, -1, -1)
-        ]
-        stacked_frames = np.stack([history[idx] for idx in indices], axis=0)
-        input_tensor = (
-            torch.as_tensor(stacked_frames[None], dtype=torch.uint8, device=self.device)
-            .permute(0, 1, 4, 2, 3)
-            .to(torch.float32)
-            / 255.0
-        )
-        obs = (
-            self.backbone.extract_features(input_tensor)
-            .squeeze(0)
-            .detach()
-            .cpu()
-            .numpy()
-            .astype(np.float32)
-        )
-        state_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-        if self.stochastic:
-            action_flat, _, _, _ = self.network.get_action_and_value(state_tensor)
-            action_flat = action_flat.squeeze(0).cpu().numpy()
-        else:
-            action_flat = self.network.actor_mean(state_tensor).squeeze(0).cpu().numpy()
+        with torch.no_grad():
+            history = list(frame_history)
+            newest = len(history) - 1
+            indices = [
+                max(0, newest - i * self.frame_stride)
+                for i in range(self.frame_stack - 1, -1, -1)
+            ]
+            stacked_frames = np.stack([history[idx] for idx in indices], axis=0)
+            input_tensor = (
+                torch.as_tensor(stacked_frames[None], dtype=torch.uint8, device=self.device)
+                .permute(0, 1, 4, 2, 3)
+                .to(torch.float32)
+                / 255.0
+            )
+            obs = (
+                self.backbone.extract_features(input_tensor)
+                .squeeze(0)
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32)
+            )
+            state_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+            if self.stochastic:
+                action_flat, _, _, _ = self.network.get_action_and_value(state_tensor)
+                action_flat = action_flat.squeeze(0).detach().cpu().numpy()
+            else:
+                action_flat = self.network.actor_mean(state_tensor).squeeze(0).detach().cpu().numpy()
         chunk = np.asarray(action_flat, dtype=np.float32).reshape(self.chunk_size, 2)
         if self.execution_mode == "temporal-ensemble":
             return self.executor.next_temporal_ensemble(chunk)
