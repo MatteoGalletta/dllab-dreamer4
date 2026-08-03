@@ -99,7 +99,25 @@ def _match_checkpoint(eval_checkpoint: str | None, checkpoint_path: Path) -> boo
     return eval_path == ckpt_abs or eval_path.endswith(ckpt_rel) or ckpt_abs.endswith(eval_path)
 
 
-def _best_eval_for_checkpoint(eval_root: Path, checkpoint_path: Path) -> EvalSummary:
+def _matches_block_start_radius(
+    config: dict[str, Any],
+    required_block_start_radius: float | None,
+) -> bool:
+    if required_block_start_radius is None:
+        return True
+    value = config.get("block_start_radius")
+    actual = _safe_float(value)
+    if actual is None:
+        return False
+    return abs(actual - float(required_block_start_radius)) <= 1e-6
+
+
+def _best_eval_for_checkpoint(
+    eval_root: Path,
+    checkpoint_path: Path,
+    *,
+    required_block_start_radius: float | None = None,
+) -> EvalSummary:
     if not eval_root.exists():
         return EvalSummary()
 
@@ -113,6 +131,8 @@ def _best_eval_for_checkpoint(eval_root: Path, checkpoint_path: Path) -> EvalSum
         config = payload.get("config", {}) or {}
         checkpoint = config.get("checkpoint")
         if not _match_checkpoint(checkpoint, checkpoint_path):
+            continue
+        if not _matches_block_start_radius(config, required_block_start_radius):
             continue
 
         summary = payload.get("summary", {}) or {}
@@ -135,7 +155,12 @@ def _best_eval_for_checkpoint(eval_root: Path, checkpoint_path: Path) -> EvalSum
     return best or EvalSummary()
 
 
-def collect_rows(base_dir: Path, eval_root: Path) -> list[BCRunRow]:
+def collect_rows(
+    base_dir: Path,
+    eval_root: Path,
+    *,
+    required_block_start_radius: float | None = None,
+) -> list[BCRunRow]:
     rows: list[BCRunRow] = []
     for checkpoint_path in sorted(base_dir.glob("*/best.pt")):
         try:
@@ -171,7 +196,11 @@ def collect_rows(base_dir: Path, eval_root: Path) -> list[BCRunRow]:
 
         args = dict(ckpt.get("args") or {})
         family, variant = _infer_family(args)
-        eval_summary = _best_eval_for_checkpoint(eval_root, checkpoint_path)
+        eval_summary = _best_eval_for_checkpoint(
+            eval_root,
+            checkpoint_path,
+            required_block_start_radius=required_block_start_radius,
+        )
         rows.append(
             BCRunRow(
                 run_dir=checkpoint_path.parent.name,
@@ -294,6 +323,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional family filter, e.g. --family-filter CNN 'Frozen Tokenizer Encoder'",
     )
+    parser.add_argument(
+        "--block-start-radius",
+        type=float,
+        default=None,
+        help="Only use eval metrics whose config.block_start_radius matches this value exactly.",
+    )
     return parser.parse_args()
 
 
@@ -303,7 +338,11 @@ def main() -> None:
     eval_root = Path(args.eval_root)
     out_dir = Path(args.out_dir)
 
-    rows = collect_rows(base_dir, eval_root)
+    rows = collect_rows(
+        base_dir,
+        eval_root,
+        required_block_start_radius=args.block_start_radius,
+    )
     if args.family_filter:
         allowed = set(args.family_filter)
         rows = [row for row in rows if row.family in allowed]
