@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -10,6 +11,10 @@ from typing import Any
 import imageio.v2 as imageio
 import numpy as np
 import torch
+
+repo_root = Path(__file__).resolve().parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
 from behavioural_cloning.train_base import TokenizerBackbone, load_tokenizer_encoder
 from behavioural_cloning.train_tokenizer_latent_bc import TokenizerLatentBCPolicy
