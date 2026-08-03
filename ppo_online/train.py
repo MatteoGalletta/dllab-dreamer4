@@ -82,13 +82,17 @@ class LatentContextSampler:
                     ep_states = self.states[s:s + used][::action_chunk_size]
                 self.episodes.append((ep_imgs, ep_acts, ep_states))
 
-    def _window_goal_distance(self, ep_states: np.ndarray | None, t_end: int) -> float | None:
+    def _window_goal_metrics(
+        self, ep_states: np.ndarray | None, t_end: int
+    ) -> tuple[float | None, float | None]:
         if ep_states is None:
-            return None
+            return None, None
         state = np.asarray(ep_states[t_end], dtype=np.float32)
-        if state.shape[0] < 4:
-            return None
-        return float(np.linalg.norm(state[2:4] - self.goal_pose[:2]))
+        if state.shape[0] < 5:
+            return None, None
+        pos_dist = float(np.linalg.norm(state[2:4] - self.goal_pose[:2]))
+        angle_dist = float(abs(((state[4] - self.goal_pose[2] + np.pi) % (2.0 * np.pi)) - np.pi))
+        return pos_dist, angle_dist
 
     def sample_context(
         self,
@@ -97,8 +101,16 @@ class LatentContextSampler:
         *,
         min_goal_dist: float | None = None,
         max_goal_dist: float | None = None,
+        min_goal_angle_dist: float | None = None,
+        max_goal_angle_dist: float | None = None,
     ):
-        cache_key = (int(ctx_len), min_goal_dist, max_goal_dist)
+        cache_key = (
+            int(ctx_len),
+            min_goal_dist,
+            max_goal_dist,
+            min_goal_angle_dist,
+            max_goal_angle_dist,
+        )
         valid_windows = self._window_cache.get(cache_key)
         if valid_windows is None:
             cache_build_start = time.perf_counter()
@@ -108,10 +120,22 @@ class LatentContextSampler:
                     continue
                 for t_start in range(0, len(ep_imgs) - ctx_len):
                     t_end = t_start + ctx_len - 1
-                    goal_dist = self._window_goal_distance(ep_states, t_end)
+                    goal_dist, goal_angle_dist = self._window_goal_metrics(ep_states, t_end)
                     if min_goal_dist is not None and goal_dist is not None and goal_dist < min_goal_dist:
                         continue
                     if max_goal_dist is not None and goal_dist is not None and goal_dist > max_goal_dist:
+                        continue
+                    if (
+                        min_goal_angle_dist is not None
+                        and goal_angle_dist is not None
+                        and goal_angle_dist < min_goal_angle_dist
+                    ):
+                        continue
+                    if (
+                        max_goal_angle_dist is not None
+                        and goal_angle_dist is not None
+                        and goal_angle_dist > max_goal_angle_dist
+                    ):
                         continue
                     windows.append((ep_idx, t_start))
             valid_windows = np.asarray(windows, dtype=np.int32)
@@ -120,13 +144,15 @@ class LatentContextSampler:
             print(
                 "Imagination context cache built: "
                 f"ctx_len={ctx_len} goal_dist=[{min_goal_dist}, {max_goal_dist}] "
+                f"goal_angle_dist=[{min_goal_angle_dist}, {max_goal_angle_dist}] "
                 f"windows={len(valid_windows)} build_s={cache_build_secs:.2f}"
             )
 
         if len(valid_windows) == 0:
             raise ValueError(
                 "No imagination context windows matched the requested goal-distance filter. "
-                f"ctx_len={ctx_len} min_goal_dist={min_goal_dist} max_goal_dist={max_goal_dist}"
+                f"ctx_len={ctx_len} min_goal_dist={min_goal_dist} max_goal_dist={max_goal_dist} "
+                f"min_goal_angle_dist={min_goal_angle_dist} max_goal_angle_dist={max_goal_angle_dist}"
             )
 
         batch_imgs, batch_acts = [], []
@@ -214,7 +240,8 @@ class ImaginedLatentVecEnv:
         self._make_tau_schedule = make_tau_schedule_fn
 
         self.patch = int(self.tok_args.get("patch", 4))
-        self.action_dim = int(self.dyn_args.get("action_chunk_size", 5)) * 2
+        self.chunk_size = int(self.dyn_args.get("action_chunk_size", 5))
+        self.action_dim = self.chunk_size * 2
         self.act_mask = torch.zeros(16, device=self.device, dtype=torch.float32)
         self.act_mask[: self.action_dim] = 1.0
         self.sched = self._make_tau_schedule(
@@ -231,6 +258,8 @@ class ImaginedLatentVecEnv:
         self.ctx_len = 0
         self.min_goal_dist: float | None = None
         self.max_goal_dist: float | None = None
+        self.min_goal_angle_dist: float | None = None
+        self.max_goal_angle_dist: float | None = None
 
         self.dyn.eval()
         self.reward_head.eval()
@@ -260,12 +289,16 @@ class ImaginedLatentVecEnv:
         ctx_len: int,
         min_goal_dist: float | None = None,
         max_goal_dist: float | None = None,
+        min_goal_angle_dist: float | None = None,
+        max_goal_angle_dist: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         real_frames, real_actions = self.sampler.sample_context(
             batch_size,
             ctx_len=ctx_len,
             min_goal_dist=min_goal_dist,
             max_goal_dist=max_goal_dist,
+            min_goal_angle_dist=min_goal_angle_dist,
+            max_goal_angle_dist=max_goal_angle_dist,
         )
         patches = self.temporal_patchify_fn(real_frames, self.patch)
         z_btLd, _ = self.encoder(patches)
@@ -296,6 +329,8 @@ class ImaginedLatentVecEnv:
             ctx_len=self.ctx_len,
             min_goal_dist=self.min_goal_dist,
             max_goal_dist=self.max_goal_dist,
+            min_goal_angle_dist=self.min_goal_angle_dist,
+            max_goal_angle_dist=self.max_goal_angle_dist,
         )
         self.obs_history = deque(
             [
@@ -314,15 +349,21 @@ class ImaginedLatentVecEnv:
         ctx_len: int,
         min_goal_dist: float | None = None,
         max_goal_dist: float | None = None,
+        min_goal_angle_dist: float | None = None,
+        max_goal_angle_dist: float | None = None,
     ) -> np.ndarray:
         self.ctx_len = int(ctx_len)
         self.min_goal_dist = min_goal_dist
         self.max_goal_dist = max_goal_dist
+        self.min_goal_angle_dist = min_goal_angle_dist
+        self.max_goal_angle_dist = max_goal_angle_dist
         self.z_spatial_seq, self.a_seq, flattened = self._sample_initial_batch(
             self.num_envs,
             ctx_len=self.ctx_len,
             min_goal_dist=self.min_goal_dist,
             max_goal_dist=self.max_goal_dist,
+            min_goal_angle_dist=self.min_goal_angle_dist,
+            max_goal_angle_dist=self.max_goal_angle_dist,
         )
         self.obs_history = deque(
             [flattened[:, t] for t in range(flattened.shape[1] - self.frame_stack, flattened.shape[1])],
@@ -372,7 +413,8 @@ class ImaginedLatentVecEnv:
             info: dict[str, Any] = {
                 "coverage_proxy": float(success_scores[env_idx].item()),
                 "imagined_reward_score": float(success_scores[env_idx].item()),
-                "num_executed_primitives": 1,
+                # One imagined transition corresponds to one predicted action chunk.
+                "num_executed_primitives": self.chunk_size,
             }
             if dones[env_idx]:
                 info["episode"] = {"r": float(self.return_sums[env_idx]), "l": int(self.steps[env_idx])}
@@ -1098,6 +1140,8 @@ class TrainConfig:
     imagination_reward_threshold: float = 0.5
     imagination_min_goal_dist: float | None = None
     imagination_max_goal_dist: float | None = None
+    imagination_min_goal_angle_dist: float | None = None
+    imagination_max_goal_angle_dist: float | None = None
 
     seed: int = 42
     device: str = "auto"
@@ -1416,6 +1460,8 @@ def parse_args():
     parser.add_argument("--imagination-reward-threshold", type=float, default=None)
     parser.add_argument("--imagination-min-goal-dist", type=float, default=None)
     parser.add_argument("--imagination-max-goal-dist", type=float, default=None)
+    parser.add_argument("--imagination-min-goal-angle-dist", type=float, default=None)
+    parser.add_argument("--imagination-max-goal-angle-dist", type=float, default=None)
     parser.add_argument("--save-path", type=str, default=None)
     parser.add_argument("--wandb-mode", type=str, default=None)
     parser.add_argument("--vector-env", choices=("sync", "async", "manual"), default=None)
@@ -1733,6 +1779,10 @@ def train_pusht():
         config.imagination_min_goal_dist = float(args.imagination_min_goal_dist)
     if args.imagination_max_goal_dist is not None:
         config.imagination_max_goal_dist = float(args.imagination_max_goal_dist)
+    if args.imagination_min_goal_angle_dist is not None:
+        config.imagination_min_goal_angle_dist = float(args.imagination_min_goal_angle_dist)
+    if args.imagination_max_goal_angle_dist is not None:
+        config.imagination_max_goal_angle_dist = float(args.imagination_max_goal_angle_dist)
     if args.save_path is not None:
         config.save_path = args.save_path
     if args.vector_env is not None:
@@ -1907,6 +1957,8 @@ def train_pusht():
             ctx_len=config.imagination_context_len,
             min_goal_dist=config.imagination_min_goal_dist,
             max_goal_dist=config.imagination_max_goal_dist,
+            min_goal_angle_dist=config.imagination_min_goal_angle_dist,
+            max_goal_angle_dist=config.imagination_max_goal_angle_dist,
         )
         obs_shape = tuple(states.shape[1:])
         action_dim = int(config.chunk_size * 2)
@@ -1916,7 +1968,9 @@ def train_pusht():
             "Imagination setup: "
             f"ctx_len={config.imagination_context_len} horizon={config.imagination_horizon} "
             f"dataset={config.imagination_dataset} "
-            f"goal_dist=[{config.imagination_min_goal_dist}, {config.imagination_max_goal_dist}]"
+            f"goal_dist=[{config.imagination_min_goal_dist}, {config.imagination_max_goal_dist}] "
+            f"goal_angle_dist=[{config.imagination_min_goal_angle_dist}, {config.imagination_max_goal_angle_dist}] "
+            f"eval_block_start_radius={config.block_start_radius}"
         )
     elif config.vector_env == "manual":
         manual_envs = [fn() for fn in env_fns]
