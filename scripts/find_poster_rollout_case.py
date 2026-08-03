@@ -21,7 +21,8 @@ from behavioural_cloning.train_tokenizer_latent_bc import TokenizerLatentBCPolic
 from ppo_online.env_config import DEFAULT_PUSHT_ENV_ID, PUSHT_FIXED_TARGET_POSE, make_pusht_env
 from ppo_online.eval import ChunkExecutionState, _success_from_info, infer_ppo_latent_architecture
 from ppo_online.render import extract_checkpoint_args, extract_checkpoint_state_dict, load_state_dict_safe
-from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt, resolve_tokenizer_path
+from ppo_online.model_paths import resolve_tokenizer_path
+from ppo_online.tokenizer_utils import load_tokenizer_from_ckpt
 from ppo_online.train import PushTDenseRewardWrapper, TrainConfig, resolve_device
 from ppo_online.networks import TokenizerLatentBCPPOActorCritic
 
