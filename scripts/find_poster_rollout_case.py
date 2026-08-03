@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
 import sys
 from collections import deque
 from dataclasses import asdict, dataclass
@@ -307,14 +309,42 @@ def _write_video(frames: list[np.ndarray], path: Path, fps: int) -> None:
     if suffix == ".gif":
         imageio.mimsave(path, frames, fps=int(fps))
         return
-    imageio.mimsave(
-        path,
-        frames,
-        fps=int(fps),
-        format="FFMPEG",
-        codec="libx264",
-        pixelformat="yuv420p",
-    )
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError("ffmpeg is required to save mp4 poster rollouts.")
+
+    temp_dir = path.parent / f".{path.stem}_frames"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        for index, frame in enumerate(frames):
+            frame_path = temp_dir / f"frame_{index:06d}.png"
+            imageio.imwrite(frame_path, np.asarray(frame, dtype=np.uint8))
+
+        cmd = [
+            ffmpeg_path,
+            "-y",
+            "-loglevel",
+            "error",
+            "-framerate",
+            str(int(fps)),
+            "-i",
+            str(temp_dir / "frame_%06d.png"),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            message = result.stderr.strip() or result.stdout.strip() or "unknown ffmpeg error"
+            raise RuntimeError(f"Could not encode video {path}: {message}")
+    finally:
+        for frame_path in temp_dir.glob("*.png"):
+            frame_path.unlink(missing_ok=True)
+        temp_dir.rmdir()
 
 
 def parse_args() -> argparse.Namespace:
