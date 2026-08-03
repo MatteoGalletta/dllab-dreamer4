@@ -303,7 +303,18 @@ def _make_side_by_side(left_frames: list[np.ndarray], right_frames: list[np.ndar
 
 def _write_video(frames: list[np.ndarray], path: Path, fps: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    imageio.mimsave(path, frames, fps=int(fps))
+    suffix = path.suffix.lower()
+    if suffix == ".gif":
+        imageio.mimsave(path, frames, fps=int(fps))
+        return
+    imageio.mimsave(
+        path,
+        frames,
+        fps=int(fps),
+        format="FFMPEG",
+        codec="libx264",
+        pixelformat="yuv420p",
+    )
 
 
 def parse_args() -> argparse.Namespace:
