@@ -1483,6 +1483,7 @@ def parse_args():
     parser.add_argument("--eval-episodes", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--max-episode-steps", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--eval-seed", type=int, default=None)
     parser.add_argument("--reward-clip", type=float, default=None)
     parser.add_argument("--norm-reward", action="store_true")
@@ -1823,6 +1824,8 @@ def train_pusht():
         config.learning_rate = float(args.learning_rate)
     if args.max_episode_steps is not None:
         config.max_episode_steps = int(args.max_episode_steps)
+    if args.seed is not None:
+        config.seed = int(args.seed)
     if args.eval_seed is not None:
         config.eval_seed = int(args.eval_seed)
     if args.reward_clip is not None:
