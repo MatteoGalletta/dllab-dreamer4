@@ -159,6 +159,17 @@ def _run_command(cmd: list[str]) -> None:
         raise RuntimeError(f"Evaluation command failed with exit code {completed.returncode}")
 
 
+def _checkpoint_run_name(checkpoint_path: Path) -> str:
+    checkpoint_abs = checkpoint_path.resolve()
+    bc_root = (PROJECT_ROOT / "local_models" / "behavior_cloning").resolve()
+    try:
+        suffix = checkpoint_abs.relative_to(bc_root)
+        label = str(suffix)
+    except ValueError:
+        label = checkpoint_abs.stem
+    return f"sweep-{_slug(label)}"
+
+
 def evaluate_checkpoint(
     checkpoint_path: Path,
     *,
@@ -173,7 +184,7 @@ def evaluate_checkpoint(
     evaluator = _infer_evaluator(checkpoint_path, ckpt_args)
     eval_root = out_dir / "_eval_runs"
     eval_root.mkdir(parents=True, exist_ok=True)
-    run_name = f"sweep-{_slug(str(checkpoint_path.relative_to(PROJECT_ROOT / 'local_models' / 'behavior_cloning')) if 'local_models/behavior_cloning' in checkpoint_path.as_posix() else checkpoint_path.stem)}"
+    run_name = _checkpoint_run_name(checkpoint_path)
 
     if evaluator == "cnn_exact":
         cmd = [
