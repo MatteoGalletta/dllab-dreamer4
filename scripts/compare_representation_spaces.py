@@ -31,6 +31,26 @@ class EncoderBundle:
     model: torch.nn.Module
 
 
+class TokenizerEncoderOnlyBackbone(torch.nn.Module):
+    def __init__(self, encoder: torch.nn.Module, patch: int):
+        super().__init__()
+        self.encoder = encoder
+        self.patch = int(patch)
+        self.raw_feature_dim = int(self.encoder.n_latents) * int(self.encoder.bottleneck_proj.out_features)
+        self.feature_dim = self.raw_feature_dim
+
+    def extract_features(self, x_btchw: torch.Tensor) -> torch.Tensor:
+        from behavioural_cloning.train_base import temporal_patchify
+
+        patches = temporal_patchify(x_btchw, self.patch)
+        with torch.no_grad():
+            z, _ = self.encoder(patches)
+        return z.reshape(z.shape[0], z.shape[1], -1)
+
+    def forward(self, x_btchw: torch.Tensor) -> torch.Tensor:
+        return self.extract_features(x_btchw)
+
+
 def _load_checkpoint(path: str | Path) -> dict:
     checkpoint = torch.load(path, map_location="cpu")
     if not isinstance(checkpoint, dict) or "model" not in checkpoint:
@@ -80,14 +100,33 @@ def load_tokenizer_encoder_bundle(
     state_dict = checkpoint["model"]
     args = checkpoint.get("args", {}) or {}
 
-    feature_dim = int(args.get("tokenizer_feature_dim", state_dict["backbone.projector.1.weight"].shape[0]))
     encoder = load_tokenizer_encoder(str(tokenizer_checkpoint_path))
-    backbone = TokenizerBackbone(
-        encoder,
-        patch=int(encoder.patch),
-        output_dim=feature_dim,
-    )
-    backbone.load_state_dict(_subset_state_dict(state_dict, "backbone"), strict=True)
+    backbone_state = _subset_state_dict(state_dict, "backbone")
+    has_projector = any(key.startswith("projector.") for key in backbone_state)
+
+    if has_projector:
+        feature_dim = int(
+            args.get(
+                "tokenizer_feature_dim",
+                backbone_state["projector.1.weight"].shape[0],
+            )
+        )
+        backbone = TokenizerBackbone(
+            encoder,
+            patch=int(encoder.patch),
+            output_dim=feature_dim,
+        )
+        backbone.load_state_dict(backbone_state, strict=True)
+    else:
+        backbone = TokenizerEncoderOnlyBackbone(
+            encoder,
+            patch=int(encoder.patch),
+        )
+        encoder_state = {key: value for key, value in backbone_state.items() if key.startswith("encoder.")}
+        if encoder_state:
+            backbone.load_state_dict(encoder_state, strict=False)
+        feature_dim = int(backbone.feature_dim)
+
     backbone.to(device)
     backbone.eval()
 
