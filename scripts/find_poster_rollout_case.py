@@ -347,6 +347,112 @@ def _write_video(frames: list[np.ndarray], path: Path, fps: int) -> None:
         temp_dir.rmdir()
 
 
+def _sample_storyboard_indices(num_frames: int, num_panels: int) -> list[int]:
+    if num_frames <= 0:
+        return []
+    if num_panels <= 1:
+        return [0]
+    if num_frames <= num_panels:
+        return list(range(num_frames))
+    raw = np.linspace(0, num_frames - 1, num=num_panels)
+    indices = [int(round(value)) for value in raw]
+    deduped: list[int] = []
+    for index in indices:
+        if not deduped or deduped[-1] != index:
+            deduped.append(index)
+    if deduped[-1] != num_frames - 1:
+        deduped[-1] = num_frames - 1
+    return deduped
+
+
+def _resize_nearest(frame: np.ndarray, output_hw: tuple[int, int]) -> np.ndarray:
+    out_h, out_w = int(output_hw[0]), int(output_hw[1])
+    frame = np.asarray(frame, dtype=np.uint8)
+    in_h, in_w = frame.shape[:2]
+    if (in_h, in_w) == (out_h, out_w):
+        return frame
+    y_idx = np.linspace(0, in_h - 1, out_h).round().astype(np.int32)
+    x_idx = np.linspace(0, in_w - 1, out_w).round().astype(np.int32)
+    return frame[y_idx][:, x_idx]
+
+
+def _make_storyboard(
+    bc_run: AgentRun,
+    ppo_run: AgentRun,
+    *,
+    num_panels: int,
+    panel_hw: tuple[int, int],
+    gap: int = 10,
+    border: int = 4,
+    pad_value: int = 255,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    bc_indices = _sample_storyboard_indices(len(bc_run.frames), num_panels)
+    ppo_indices = _sample_storyboard_indices(len(ppo_run.frames), num_panels)
+    count = max(len(bc_indices), len(ppo_indices))
+    if count == 0:
+        raise ValueError("Cannot create storyboard from empty frame sequences")
+
+    panel_h, panel_w = int(panel_hw[0]), int(panel_hw[1])
+    sidebar_w = 16
+    row_gap = 18
+    header_h = 12
+    canvas_h = (2 * (header_h + border * 2 + panel_h)) + row_gap
+    canvas_w = sidebar_w + (count * (panel_w + border * 2)) + ((count - 1) * gap)
+    canvas = np.full((canvas_h, canvas_w, 3), pad_value, dtype=np.uint8)
+
+    def draw_row(
+        frames: list[np.ndarray],
+        indices: list[int],
+        *,
+        y0: int,
+        color: tuple[int, int, int],
+    ) -> list[int]:
+        used_indices: list[int] = []
+        canvas[y0 : y0 + header_h, :canvas_w] = np.asarray(color, dtype=np.uint8)
+        canvas[y0 : y0 + header_h + border * 2 + panel_h, :sidebar_w] = np.asarray(color, dtype=np.uint8)
+        for col in range(count):
+            if col < len(indices):
+                frame_idx = int(indices[col])
+            else:
+                frame_idx = int(indices[-1])
+            used_indices.append(frame_idx)
+            frame = _resize_nearest(frames[frame_idx], (panel_h, panel_w))
+            x0 = sidebar_w + col * (panel_w + border * 2 + gap)
+            y_panel = y0 + header_h
+            canvas[y_panel : y_panel + border * 2 + panel_h, x0 : x0 + border * 2 + panel_w] = 245
+            canvas[
+                y_panel + border : y_panel + border + panel_h,
+                x0 + border : x0 + border + panel_w,
+            ] = frame
+        return used_indices
+
+    bc_used = draw_row(
+        bc_run.frames,
+        bc_indices,
+        y0=0,
+        color=(54, 116, 181),
+    )
+    ppo_y = header_h + border * 2 + panel_h + row_gap
+    ppo_used = draw_row(
+        ppo_run.frames,
+        ppo_indices,
+        y0=ppo_y,
+        color=(214, 95, 0),
+    )
+    metadata = {
+        "num_panels": count,
+        "panel_hw": [panel_h, panel_w],
+        "bc_frame_indices": bc_used,
+        "ppo_frame_indices": ppo_used,
+    }
+    return canvas, metadata
+
+
+def _write_image(image: np.ndarray, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.imwrite(path, np.asarray(image, dtype=np.uint8))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Find a shared PushT seed where BC fails and PPO succeeds, then save comparison rollouts."
@@ -360,6 +466,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--block-start-radius", type=float, default=200.0)
     parser.add_argument("--fps", type=int, default=10)
+    parser.add_argument("--storyboard-panels", type=int, default=6)
+    parser.add_argument("--storyboard-panel-size", type=int, default=144)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--stochastic-ppo", action="store_true")
     parser.add_argument(
@@ -418,12 +526,20 @@ def main() -> None:
         )
 
     side_by_side = _make_side_by_side(best_case["bc"].frames, best_case["ppo"].frames)
+    storyboard_image, storyboard_meta = _make_storyboard(
+        best_case["bc"],
+        best_case["ppo"],
+        num_panels=int(args.storyboard_panels),
+        panel_hw=(int(args.storyboard_panel_size), int(args.storyboard_panel_size)),
+    )
     side_path = out_dir / f"seed_{best_case['seed']:04d}_bc_fail_ppo_success_side_by_side.mp4"
     bc_path = out_dir / f"seed_{best_case['seed']:04d}_bc.mp4"
     ppo_path = out_dir / f"seed_{best_case['seed']:04d}_ppo.mp4"
+    storyboard_path = out_dir / f"seed_{best_case['seed']:04d}_storyboard.png"
     _write_video(side_by_side, side_path, int(args.fps))
     _write_video(best_case["bc"].frames, bc_path, int(args.fps))
     _write_video(best_case["ppo"].frames, ppo_path, int(args.fps))
+    _write_image(storyboard_image, storyboard_path)
 
     summary = {
         "seed": int(best_case["seed"]),
@@ -436,6 +552,8 @@ def main() -> None:
         "side_by_side_video": str(side_path),
         "bc_video": str(bc_path),
         "ppo_video": str(ppo_path),
+        "storyboard_image": str(storyboard_path),
+        "storyboard": storyboard_meta,
     }
     summary_path = out_dir / f"seed_{best_case['seed']:04d}_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
@@ -443,6 +561,7 @@ def main() -> None:
     print(f"  side_by_side={side_path}")
     print(f"  bc_video={bc_path}")
     print(f"  ppo_video={ppo_path}")
+    print(f"  storyboard={storyboard_path}")
     print(f"  summary={summary_path}")
 
 
