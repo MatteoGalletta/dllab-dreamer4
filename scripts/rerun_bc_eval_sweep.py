@@ -97,6 +97,20 @@ def discover_checkpoints(base_dir: Path, *, include_snapshots: bool) -> list[Pat
     return unique
 
 
+def _matches_filters(
+    path: Path,
+    *,
+    include_substrings: list[str],
+    exclude_substrings: list[str],
+) -> bool:
+    haystack = path.as_posix().lower()
+    if include_substrings and not any(pattern in haystack for pattern in include_substrings):
+        return False
+    if exclude_substrings and any(pattern in haystack for pattern in exclude_substrings):
+        return False
+    return True
+
+
 def _load_checkpoint_payload(checkpoint_path: Path) -> dict[str, Any]:
     payload = torch.load(checkpoint_path, map_location="cpu")
     if not isinstance(payload, dict):
@@ -316,6 +330,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--block-start-radius", type=float, default=200.0)
     parser.add_argument("--include-snapshots", action="store_true")
+    parser.add_argument(
+        "--include-substring",
+        action="append",
+        default=[],
+        help="Only evaluate checkpoints whose path contains this substring. Can be passed multiple times.",
+    )
+    parser.add_argument(
+        "--exclude-substring",
+        action="append",
+        default=[],
+        help="Skip checkpoints whose path contains this substring. Can be passed multiple times.",
+    )
     return parser.parse_args()
 
 
@@ -326,6 +352,17 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoints = discover_checkpoints(base_dir, include_snapshots=bool(args.include_snapshots))
+    include_substrings = [value.lower() for value in args.include_substring]
+    exclude_substrings = [value.lower() for value in args.exclude_substring]
+    checkpoints = [
+        path
+        for path in checkpoints
+        if _matches_filters(
+            path,
+            include_substrings=include_substrings,
+            exclude_substrings=exclude_substrings,
+        )
+    ]
     if not checkpoints:
         raise SystemExit(f"No checkpoints found under {base_dir}")
 
