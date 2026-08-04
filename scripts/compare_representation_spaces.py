@@ -69,6 +69,15 @@ def _subset_state_dict(state_dict: dict[str, torch.Tensor], prefix: str) -> dict
     return subset
 
 
+def _optional_subset_state_dict(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
+    subset = {}
+    needle = f"{prefix}."
+    for key, value in state_dict.items():
+        if key.startswith(needle):
+            subset[key[len(needle) :]] = value
+    return subset
+
+
 def load_cnn_encoder(checkpoint_path: str | Path, device: torch.device) -> EncoderBundle:
     checkpoint = _load_checkpoint(checkpoint_path)
     state_dict = checkpoint["model"]
@@ -101,7 +110,7 @@ def load_tokenizer_encoder_bundle(
     args = checkpoint.get("args", {}) or {}
 
     encoder = load_tokenizer_encoder(str(tokenizer_checkpoint_path))
-    backbone_state = _subset_state_dict(state_dict, "backbone")
+    backbone_state = _optional_subset_state_dict(state_dict, "backbone")
     has_projector = any(key.startswith("projector.") for key in backbone_state)
 
     if has_projector:
