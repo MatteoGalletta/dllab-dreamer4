@@ -289,7 +289,10 @@ class ImaginedLatentVecEnv:
         obs = torch.stack(list(self.obs_history), dim=1)
         if self.network_type == "bc_pixels" and self.decoder is not None and self.temporal_unpatchify_fn is not None:
             with torch.no_grad():
-                patches = self.decoder(obs)
+                n_latents = int(self.tok_args.get("n_latents", 16))
+                d_bottleneck = int(self.tok_args.get("d_bottleneck", 32))
+                obs_4d = obs.reshape(obs.shape[0], obs.shape[1], n_latents, d_bottleneck)
+                patches = self.decoder(obs_4d)
                 H = int(self.tok_args.get("H", 224))
                 W = int(self.tok_args.get("W", 224))
                 C = int(self.tok_args.get("C", 3))
