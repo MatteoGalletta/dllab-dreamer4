@@ -197,6 +197,7 @@ class ImaginedLatentVecEnv:
         *,
         sampler: LatentContextSampler,
         encoder,
+        decoder=None,
         dyn,
         reward_head,
         tok_args: dict[str, Any],
@@ -206,12 +207,14 @@ class ImaginedLatentVecEnv:
         num_envs: int,
         reward_mode: str,
         action_mode: str,
+        network_type: str = "bc_latent",
         max_horizon: int,
         reward_threshold: float,
         schedule: str,
         eval_d: float,
         device: torch.device,
         temporal_patchify_fn,
+        temporal_unpatchify_fn=None,
         pack_bottleneck_to_spatial_fn,
         unpack_spatial_to_bottleneck_fn,
         sample_one_timestep_fn,
@@ -219,6 +222,7 @@ class ImaginedLatentVecEnv:
     ):
         self.sampler = sampler
         self.encoder = encoder
+        self.decoder = decoder
         self.dyn = dyn
         self.reward_head = reward_head
         self.tok_args = dict(tok_args)
@@ -228,12 +232,14 @@ class ImaginedLatentVecEnv:
         self.num_envs = int(num_envs)
         self.reward_mode = str(reward_mode)
         self.action_mode = str(action_mode)
+        self.network_type = str(network_type)
         self.max_horizon = int(max_horizon)
         self.reward_threshold = float(reward_threshold)
         self.schedule = str(schedule)
         self.eval_d = float(eval_d)
         self.device = device
         self.temporal_patchify_fn = temporal_patchify_fn
+        self.temporal_unpatchify_fn = temporal_unpatchify_fn
         self.pack_bottleneck_to_spatial_fn = pack_bottleneck_to_spatial_fn
         self.unpack_spatial_to_bottleneck_fn = unpack_spatial_to_bottleneck_fn
         self._sample_one_timestep = sample_one_timestep_fn
@@ -264,6 +270,8 @@ class ImaginedLatentVecEnv:
         self.dyn.eval()
         self.reward_head.eval()
         self.encoder.eval()
+        if self.decoder is not None:
+            self.decoder.eval()
 
     def _action_to_model_space(self, actions: torch.Tensor) -> torch.Tensor:
         if self.action_mode == "absolute":
@@ -279,6 +287,14 @@ class ImaginedLatentVecEnv:
         if self.obs_history is None or len(self.obs_history) != self.frame_stack:
             raise RuntimeError("Imagined latent history is not initialized.")
         obs = torch.stack(list(self.obs_history), dim=1)
+        if self.network_type == "bc_pixels" and self.decoder is not None and self.temporal_unpatchify_fn is not None:
+            with torch.no_grad():
+                patches = self.decoder(obs)
+                H = int(self.tok_args.get("H", 224))
+                W = int(self.tok_args.get("W", 224))
+                C = int(self.tok_args.get("C", 3))
+                frames = self.temporal_unpatchify_fn(patches, H, W, C, self.patch)
+                return frames.clamp(0.0, 1.0).detach().cpu().numpy().astype(np.float32)
         return obs.detach().cpu().numpy().astype(np.float32)
 
     @torch.no_grad()
@@ -1161,8 +1177,8 @@ class TrainConfig:
 def load_imagination_components(config: TrainConfig, device: torch.device) -> dict[str, Any]:
     if config.env_source != "imagination":
         raise ValueError("load_imagination_components called without imagination env_source.")
-    if config.network_type != "bc_latent":
-        raise ValueError("Imagined PPO is currently only supported for network_type=bc_latent.")
+    if config.network_type not in ("bc_latent", "bc_pixels"):
+        raise ValueError("Imagined PPO is currently only supported for network_type=bc_latent or network_type=bc_pixels.")
     missing = [
         name
         for name in ("imagination_dataset", "dynamics_ckpt", "reward_ckpt")
@@ -1183,7 +1199,7 @@ def load_imagination_components(config: TrainConfig, device: torch.device) -> di
         for key in ("H", "W", "C", "patch")
         if dyn_args.get(key) is not None
     }
-    encoder, _decoder, tok_args = dyn_module.load_frozen_tokenizer_from_pt_ckpt(
+    encoder, decoder, tok_args = dyn_module.load_frozen_tokenizer_from_pt_ckpt(
         tokenizer_path,
         device=device,
         override=override,
@@ -1238,10 +1254,12 @@ def load_imagination_components(config: TrainConfig, device: torch.device) -> di
         "dynamics": dyn_model,
         "dyn_args": dyn_args,
         "encoder": encoder,
+        "decoder": decoder,
         "tok_args": tok_args,
         "packing_factor": packing_factor,
         "reward_head": reward_head,
         "temporal_patchify": dyn_module.temporal_patchify,
+        "temporal_unpatchify": dyn_module.temporal_unpatchify,
         "pack_bottleneck_to_spatial": dyn_module.pack_bottleneck_to_spatial,
         "unpack_spatial_to_bottleneck": dyn_module.unpack_spatial_to_bottleneck,
         "sample_one_timestep_packed": dyn_module.sample_one_timestep_packed,
@@ -1936,6 +1954,7 @@ def train_pusht():
         imagined_env = ImaginedLatentVecEnv(
             sampler=imagination["sampler"],
             encoder=imagination["encoder"],
+            decoder=imagination.get("decoder"),
             dyn=imagination["dynamics"],
             reward_head=imagination["reward_head"],
             tok_args=imagination["tok_args"],
@@ -1945,12 +1964,14 @@ def train_pusht():
             num_envs=config.num_envs,
             reward_mode=config.reward_mode,
             action_mode=config.action_mode,
+            network_type=config.network_type,
             max_horizon=config.imagination_horizon,
             reward_threshold=config.imagination_reward_threshold,
             schedule=config.imagination_schedule,
             eval_d=config.imagination_eval_d,
             device=tokenizer_device,
             temporal_patchify_fn=imagination["temporal_patchify"],
+            temporal_unpatchify_fn=imagination.get("temporal_unpatchify"),
             pack_bottleneck_to_spatial_fn=imagination["pack_bottleneck_to_spatial"],
             unpack_spatial_to_bottleneck_fn=imagination["unpack_spatial_to_bottleneck"],
             sample_one_timestep_fn=imagination["sample_one_timestep_packed"],

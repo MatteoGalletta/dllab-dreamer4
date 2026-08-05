@@ -74,6 +74,17 @@ class TokenizerEvaluator:
         total_mae_mse = 0.0
         total_psnr = 0.0
         total_lpips = 0.0
+        
+        total_r2_acc = 0.0
+        total_pixel_acc_5pct = 0.0
+        total_pixel_acc_2pct = 0.0
+        total_nrmse_acc = 0.0
+
+        total_masked_r2_acc = 0.0
+        total_masked_pixel_acc_5pct = 0.0
+        total_masked_pixel_acc_2pct = 0.0
+        total_masked_nrmse_acc = 0.0
+        
         batches_run = 0
 
         for i, batch in enumerate(self.dataloader):
@@ -93,17 +104,56 @@ class TokenizerEvaluator:
             # Forward pass
             pred, mae_mask, keep_prob = self.model(patches)
 
-            # 1. Full Frame Reconstruction MSE (across all patches)
-            full_mse = F.mse_loss(pred.float(), patches.float())
+            # 1. Full Frame Reconstruction MSE & PSNR (across all patches)
+            patches_float = patches.float()
+            pred_float = pred.float()
+            full_mse = F.mse_loss(pred_float, patches_float)
             psnr = 10.0 * torch.log10(1.0 / full_mse.clamp_min(1e-10))
 
             total_full_mse += full_mse.item()
             total_psnr += psnr.item()
 
-            # 2. Masked Patch MSE (if masking is enabled)
+            # Full Frame Percentage Accuracy Metrics
+            full_var = torch.var(patches_float, unbiased=False).clamp_min(1e-8)
+            full_r2 = 1.0 - (full_mse / full_var)
+            full_r2_acc = max(0.0, full_r2.item()) * 100.0
+            total_r2_acc += full_r2_acc
+
+            diff = torch.abs(pred_float - patches_float)
+            pixel_acc_5pct = (diff <= 0.05).float().mean().item() * 100.0
+            pixel_acc_2pct = (diff <= 0.02).float().mean().item() * 100.0
+            total_pixel_acc_5pct += pixel_acc_5pct
+            total_pixel_acc_2pct += pixel_acc_2pct
+
+            rmse = torch.sqrt(full_mse.clamp_min(1e-10))
+            std = torch.sqrt(full_var)
+            nrmse_acc = max(0.0, 1.0 - (rmse / std).item()) * 100.0
+            total_nrmse_acc += nrmse_acc
+
+            # 2. Masked Patch MSE & Accuracy Metrics (if masking is enabled)
             if eval_mae_masking and mae_mask.any():
                 mae_mse = recon_loss_from_mae(pred, patches, mae_mask)
                 total_mae_mse += mae_mse.item()
+
+                mae_mask_expanded = mae_mask.expand_as(patches)
+                target_masked = patches_float[mae_mask_expanded]
+                pred_masked = pred_float[mae_mask_expanded]
+
+                masked_var = torch.var(target_masked, unbiased=False).clamp_min(1e-8)
+                masked_r2 = 1.0 - (mae_mse / masked_var)
+                masked_r2_acc = max(0.0, masked_r2.item()) * 100.0
+                total_masked_r2_acc += masked_r2_acc
+
+                masked_diff = torch.abs(pred_masked - target_masked)
+                masked_pacc_5 = (masked_diff <= 0.05).float().mean().item() * 100.0
+                masked_pacc_2 = (masked_diff <= 0.02).float().mean().item() * 100.0
+                total_masked_pixel_acc_5pct += masked_pacc_5
+                total_masked_pixel_acc_2pct += masked_pacc_2
+
+                masked_rmse = torch.sqrt(mae_mse.clamp_min(1e-10))
+                masked_std = torch.sqrt(masked_var)
+                masked_nrmse_acc = max(0.0, 1.0 - (masked_rmse / masked_std).item()) * 100.0
+                total_masked_nrmse_acc += masked_nrmse_acc
 
             # 3. LPIPS Perceptual Loss
             if self.lpips_fn is not None:
@@ -122,7 +172,15 @@ class TokenizerEvaluator:
         return {
             "full_recon_mse": total_full_mse / batches_run,
             "psnr_db": total_psnr / batches_run,
+            "r2_accuracy_pct": total_r2_acc / batches_run,
+            "nrmse_accuracy_pct": total_nrmse_acc / batches_run,
+            "pixel_accuracy_tol_5pct": total_pixel_acc_5pct / batches_run,
+            "pixel_accuracy_tol_2pct": total_pixel_acc_2pct / batches_run,
             "masked_mae_mse": (total_mae_mse / batches_run) if eval_mae_masking else None,
+            "masked_r2_accuracy_pct": (total_masked_r2_acc / batches_run) if eval_mae_masking else None,
+            "masked_nrmse_accuracy_pct": (total_masked_nrmse_acc / batches_run) if eval_mae_masking else None,
+            "masked_pixel_accuracy_tol_5pct": (total_masked_pixel_acc_5pct / batches_run) if eval_mae_masking else None,
+            "masked_pixel_accuracy_tol_2pct": (total_masked_pixel_acc_2pct / batches_run) if eval_mae_masking else None,
             "lpips": (total_lpips / batches_run) if self.lpips_fn else None,
         }
 
@@ -216,6 +274,13 @@ def load_model_from_ckpt(ckpt_path, args, device):
     if list(state.keys())[0].startswith("module."):
         state = {k[len("module."):]: v for k, v in state.items()}
 
+    # Check if checkpoint is a policy network rather than a Tokenizer model
+    if "net.0.weight" in state or not any(k.startswith(("encoder.", "decoder.")) for k in state.keys()):
+        raise ValueError(
+            f"Checkpoint at '{ckpt_path}' appears to be a Policy/Behavior-Cloning checkpoint (found keys: {list(state.keys())[:5]}), "
+            "not a Dreamer4 Tokenizer checkpoint. Please provide a Tokenizer model checkpoint such as 'logs/tokenizer_ckpts/latest.pt'."
+        )
+
     model.load_state_dict(state, strict=True)
     return model
 
@@ -267,14 +332,20 @@ if __name__ == "__main__":
     masked_metrics = evaluator.evaluate(num_batches=args.num_eval_batches, eval_mae_masking=True)
     for k, v in masked_metrics.items():
         if v is not None:
-            print(f"{k}: {v:.6f}")
+            if k.endswith("_pct"):
+                print(f"{k}: {v:.2f}%")
+            else:
+                print(f"{k}: {v:.6f}")
 
     # 2. Evaluate Full Reconstruction Quality (Unmasked Autoencoding)
     print("\n--- Unmasked Bottleneck Quality ---")
     unmasked_metrics = evaluator.evaluate(num_batches=args.num_eval_batches, eval_mae_masking=False)
     for k, v in unmasked_metrics.items():
         if v is not None:
-            print(f"{k}: {v:.6f}")
+            if k.endswith("_pct"):
+                print(f"{k}: {v:.2f}%")
+            else:
+                print(f"{k}: {v:.6f}")
 
     # 3. Generate Image Visualizations
     evaluator.visualize_reconstruction("eval_visualization.png")

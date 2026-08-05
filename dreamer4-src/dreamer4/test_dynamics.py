@@ -36,6 +36,7 @@ get_runtime_device = train_dynamics.get_runtime_device
 
 # 5. Now import the rest of your packages safely
 import torch
+import torch.nn.functional as F
 import imageio
 import argparse
 import numpy as np
@@ -76,6 +77,9 @@ def main(args):
         frames = frames.float() / 255.0
 
     raw_actions = batch["action"].to(device).clamp(-1, 1)
+    if raw_actions.dim() == 2:
+        raw_actions = raw_actions.unsqueeze(1).expand(-1, frames.shape[1], -1)
+
     actions = torch.zeros((*raw_actions.shape[:-1], 16), device=device, dtype=torch.float32)
     actions[..., : raw_actions.shape[-1]] = raw_actions.float()
 
@@ -151,32 +155,76 @@ def main(args):
         act_mask=act_mask,
     )
 
-    # --- QUANTITATIVE METRICS (Latent Z MSE) ---
+    # --- QUANTITATIVE METRICS (Latent Z & Decoded Video Frame Accuracy) ---
     z_gt_h = z_gt_packed[:, ctx_length:ctx_length + horizon]
     z_pred_h = z_pred_packed[:, ctx_length:ctx_length + horizon]
 
-    mse_z_per_t = (z_pred_h.float() - z_gt_h.float()).pow(2).mean(dim=(0, 2, 3))
+    # 1. Latent Z Space Metrics
+    z_gt_float = z_gt_h.float()
+    z_pred_float = z_pred_h.float()
+    mse_z_per_t = (z_pred_float - z_gt_float).pow(2).mean(dim=(0, 2, 3))
+    var_z_per_t = z_gt_float.var(dim=(0, 2, 3), unbiased=False).clamp_min(1e-8)
+    r2_z_per_t = torch.clamp((1.0 - (mse_z_per_t / var_z_per_t)) * 100.0, min=0.0)
+
+    cos_sim_per_t = F.cosine_similarity(z_pred_float, z_gt_float, dim=-1).mean(dim=(0, 2))
+    cos_sim_pct_per_t = torch.clamp(cos_sim_per_t * 100.0, min=0.0)
+
+    # 2. Decode Frames for Frame-Space Accuracy & Qualitative Visualization
+    print("\nDecoding frames for quantitative & qualitative evaluation...")
+    pred_frames = decode_packed_to_frames(
+        decoder,
+        z_packed=z_pred_packed,
+        H=H, W=W, C=C, patch=patch,
+        packing_factor=args.packing_factor,
+    )
 
     if horizon > 0:
-        t_start = 0
-        t_mid = (horizon - 1) // 2
+        t_step1 = 0
+        t_step15 = min(14, horizon - 1)
         t_end = horizon - 1
 
-        print("\n--- Quantitative Results (Latent Z MSE) ---")
-        print(f"Overall Horizon MSE: {mse_z_per_t.mean().item():.6f}")
-        print(f"Beginning Phase MSE (t={t_start}): {mse_z_per_t[t_start].item():.6f}")
-        print(f"Middle Phase MSE (t={t_mid}): {mse_z_per_t[t_mid].item():.6f}")
-        print(f"End Phase MSE (t={t_end}): {mse_z_per_t[t_end].item():.6f}")
-        print("-------------------------------------------\n")
+        # Frame Space Metrics over imagination horizon
+        gt_frames_h = frames_eval[:, ctx_length:ctx_length + horizon].float()
+        pred_frames_h = pred_frames[:, ctx_length:ctx_length + horizon].float()
 
-        # --- QUALITATIVE METRICS (GIF & Frame Generation) ---
-        print("Decoding frames for qualitative GIF generation...")
-        pred_frames = decode_packed_to_frames(
-            decoder,
-            z_packed=z_pred_packed,
-            H=H, W=W, C=C, patch=patch,
-            packing_factor=args.packing_factor,
-        )
+        frame_mse = F.mse_loss(pred_frames_h, gt_frames_h)
+        frame_var = torch.var(gt_frames_h, unbiased=False).clamp_min(1e-8)
+        frame_r2_acc_pct = max(0.0, (1.0 - (frame_mse / frame_var)).item()) * 100.0
+        frame_psnr = 10.0 * torch.log10(1.0 / frame_mse.clamp_min(1e-10)).item()
+
+        # Overall Frame Pixel Accuracy
+        frame_diff = torch.abs(pred_frames_h - gt_frames_h)
+        frame_pacc_5pct = (frame_diff <= 0.05).float().mean().item() * 100.0
+        frame_pacc_2pct = (frame_diff <= 0.02).float().mean().item() * 100.0
+
+        # Per-timestep Frame Space Breakdown
+        frame_mse_per_t = (pred_frames_h - gt_frames_h).pow(2).mean(dim=(0, 2, 3, 4))
+        frame_var_per_t = gt_frames_h.var(dim=(0, 2, 3, 4), unbiased=False).clamp_min(1e-8)
+        frame_r2_per_t = torch.clamp((1.0 - (frame_mse_per_t / frame_var_per_t)) * 100.0, min=0.0)
+
+        frame_pacc_5pct_per_t = (frame_diff <= 0.05).float().mean(dim=(0, 2, 3, 4)) * 100.0
+        frame_pacc_2pct_per_t = (frame_diff <= 0.02).float().mean(dim=(0, 2, 3, 4)) * 100.0
+
+        print("\n=================== Quantitative Dynamics Evaluation ===================")
+        print("--- Latent Space Z Accuracy ---")
+        print(f"Overall Horizon Latent MSE:            {mse_z_per_t.mean().item():.6f}")
+        print(f"Overall Horizon Latent R2 Accuracy:     {r2_z_per_t.mean().item():.2f}%")
+        print(f"Overall Horizon Latent Cosine Sim:      {cos_sim_pct_per_t.mean().item():.2f}%")
+        print(f"  - Step 1  (t_future=1)  Latent R2:     {r2_z_per_t[t_step1].item():.2f}% (MSE: {mse_z_per_t[t_step1].item():.6f})")
+        print(f"  - Step 15 (t_future=15) Latent R2:     {r2_z_per_t[t_step15].item():.2f}% (MSE: {mse_z_per_t[t_step15].item():.6f})")
+        print(f"  - Step {horizon:02d} (t_future={horizon}) Latent R2:     {r2_z_per_t[t_end].item():.2f}% (MSE: {mse_z_per_t[t_end].item():.6f})")
+
+        print("\n--- Decoded Imagined Video Frame Accuracy ---")
+        print(f"Overall Decoded Frame MSE:             {frame_mse.item():.6f}")
+        print(f"Overall Decoded Frame PSNR:            {frame_psnr:.2f} dB")
+        print(f"Overall Decoded Frame R2 Accuracy:     {frame_r2_acc_pct:.2f}%")
+        print(f"Overall Decoded Frame Pixel Acc (tol=0.05): {frame_pacc_5pct:.2f}%")
+        print(f"Overall Decoded Frame Pixel Acc (tol=0.02): {frame_pacc_2pct:.2f}%")
+        print("\n--- Decoded Frame Timestep Breakdown ---")
+        print(f"  - Step 1  (t_future=1):  Pixel Acc (tol=0.05)={frame_pacc_5pct_per_t[t_step1].item():.2f}%, Pixel Acc (tol=0.02)={frame_pacc_2pct_per_t[t_step1].item():.2f}%, Frame R2={frame_r2_per_t[t_step1].item():.2f}%")
+        print(f"  - Step 15 (t_future=15): Pixel Acc (tol=0.05)={frame_pacc_5pct_per_t[t_step15].item():.2f}%, Pixel Acc (tol=0.02)={frame_pacc_2pct_per_t[t_step15].item():.2f}%, Frame R2={frame_r2_per_t[t_step15].item():.2f}%")
+        print(f"  - Step {horizon:02d} (t_future={horizon}): Pixel Acc (tol=0.05)={frame_pacc_5pct_per_t[t_end].item():.2f}%, Pixel Acc (tol=0.02)={frame_pacc_2pct_per_t[t_end].item():.2f}%, Frame R2={frame_r2_per_t[t_end].item():.2f}%")
+        print("=======================================================================\n")
 
         b_idx = 0  # Process first item in batch
         gt_video = frames_eval[b_idx].permute(0, 2, 3, 1).cpu().numpy()
