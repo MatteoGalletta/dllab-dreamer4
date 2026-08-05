@@ -297,7 +297,8 @@ class ImaginedLatentVecEnv:
                 W = int(self.tok_args.get("W", 224))
                 C = int(self.tok_args.get("C", 3))
                 frames = self.temporal_unpatchify_fn(patches, H, W, C, self.patch)
-                return frames.clamp(0.0, 1.0).detach().cpu().numpy().astype(np.float32)
+                frames_hwc = frames.permute(0, 1, 3, 4, 2).clamp(0.0, 1.0)
+                return frames_hwc.detach().cpu().numpy().astype(np.float32)
         return obs.detach().cpu().numpy().astype(np.float32)
 
     @torch.no_grad()
