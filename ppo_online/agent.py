@@ -208,7 +208,12 @@ def _infer_bc_pixel_architecture(
                 hidden_dim = int(classifier_first.shape[0])
                 classifier_in_dim = int(classifier_first.shape[1])
                 if feature_dim > 0 and classifier_in_dim == feature_dim * frame_stack:
-                    policy_style = "direct_chunk_cnn"
+                    if "classifier.net.6.weight" in state_dict:
+                        policy_style = "direct_chunk_cnn"
+                    elif "classifier.net.3.weight" in state_dict:
+                        policy_style = "direct_chunk_cnn_legacy"
+                    else:
+                        policy_style = "direct_chunk_cnn"
                     source = "bc_prior_state_dict"
                 elif feature_dim > 0 and classifier_in_dim == feature_dim:
                     policy_style = "sequence_classifier"

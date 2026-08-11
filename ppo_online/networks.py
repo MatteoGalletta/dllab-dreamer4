@@ -178,6 +178,29 @@ class DirectChunkPolicyHead(nn.Module):
         return torch.tanh(logits) if self.output_tanh else logits
 
 
+class LegacyDirectChunkPolicyHead(nn.Module):
+    def __init__(self, *, in_dim: int, seq_len: int, hidden_dim: int, action_dim: int, dropout: float, output_tanh: bool = True):
+        super().__init__()
+        self.seq_len = int(seq_len)
+        self.action_dim = int(action_dim)
+        self.output_tanh = bool(output_tanh)
+        self.net = nn.Sequential(
+            nn.Linear(int(in_dim) * self.seq_len, int(hidden_dim)),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), self.action_dim),
+        )
+
+    def forward(self, features_btD: torch.Tensor) -> torch.Tensor:
+        if features_btD.ndim != 3:
+            raise ValueError(f"Expected feature sequence with shape (B, T, D), got {tuple(features_btD.shape)}")
+        batch, steps, feature_dim = features_btD.shape
+        if steps != self.seq_len:
+            raise ValueError(f"Expected seq_len={self.seq_len}, got {steps}")
+        logits = self.net(features_btD.reshape(batch, steps * feature_dim))
+        return torch.tanh(logits) if self.output_tanh else logits
+
+
 class SpatialSoftmax(nn.Module):
     def __init__(self, temperature: float = 1.0):
         super().__init__()
@@ -331,6 +354,15 @@ class BCPixelActorCritic(nn.Module):
         )
         if self.policy_style == "direct_chunk_cnn":
             self.classifier = DirectChunkPolicyHead(
+                in_dim=self.backbone.feature_dim,
+                seq_len=self.image_shape[0] if len(self.image_shape) >= 1 else 1,
+                hidden_dim=hidden_dim,
+                action_dim=action_dim,
+                dropout=dropout,
+                output_tanh=self.action_output_tanh,
+            )
+        elif self.policy_style == "direct_chunk_cnn_legacy":
+            self.classifier = LegacyDirectChunkPolicyHead(
                 in_dim=self.backbone.feature_dim,
                 seq_len=self.image_shape[0] if len(self.image_shape) >= 1 else 1,
                 hidden_dim=hidden_dim,
