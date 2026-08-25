@@ -27,6 +27,15 @@ COMPARISON_OFFLINE_RL_WITH_LEWM.md
 .env
 .env.*
 !.env.example
+.ssh/
+.aws/
+.gcloud/
+.netrc
+.pypirc
+*.pem
+*.key
+credentials*.json
+service-account*.json
 .DS_Store
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
