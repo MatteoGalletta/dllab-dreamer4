@@ -329,8 +329,8 @@ class PPOAgent:
                 actor_output_tanh=actor_output_tanh,
             ).to(self.device_override)
 
-        if network_type == "bc_pixels":  # <-- HIER: Nur network_type (ohne self.)
-            # Finde den Backbone, je nachdem ob Residual aktiv ist oder nicht
+        if network_type == "bc_pixels":
+            # Freeze the visual encoder while PPO adapts the actor and critic heads.
             backbone_to_freeze = None
             if hasattr(self.network, 'backbone'):
                 backbone_to_freeze = self.network.backbone
@@ -340,9 +340,8 @@ class PPOAgent:
             if backbone_to_freeze is not None:
                 for param in backbone_to_freeze.parameters():
                     param.requires_grad_(False)
-                print("CNN Backbone erfolgreich eingefroren! Nur die MLP-Köpfe werden trainiert.")
+                print("Frozen CNN backbone: optimizing only policy and value heads.")
 
-        # ANGEPASST: Wir übergeben dem Optimizer nur die Gewichte, die NICHT eingefroren sind
         trainable_params = filter(lambda p: p.requires_grad, self.network.parameters())
         self.optimizer = torch.optim.Adam(
             trainable_params,
@@ -376,7 +375,7 @@ class PPOAgent:
                 actor_output_tanh=actor_output_tanh,
                 prior_log_std_init=prior_log_std_init,
             )
-# NEU: Monkey-Patching NUR für die / 255.0 Skalierung (exakt wie in evaluate.py)
+        # Keep pixel PPO preprocessing aligned with the BC trainer and evaluator.
         if self.network_type == "bc_pixels":
             def patch_backbone(policy_net):
                 if hasattr(policy_net, 'backbone'):
@@ -601,7 +600,7 @@ class PPOAgent:
         ppo_epochs: int,
         update_idx: int = 0,
         clip_vloss: bool = True,
-        freeze_actor: bool = False,  # NEU: Parameter hinzugefügt
+        freeze_actor: bool = False,
     ) -> dict[str, float]:
         states = self._to_tensor(self._get_buffer_attr(buffer, ("states", "observations", "obs")))
         actions = self._to_tensor(self._get_buffer_attr(buffer, ("actions", "acts")))

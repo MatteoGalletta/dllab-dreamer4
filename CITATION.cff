@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite it using the metadata below."
+title: "Offline Reinforcement Learning with Dreamer4 for PushT"
+version: 0.1.0
+date-released: 2026-08-25
+authors:
+  - family-names: Eisele
+    given-names: Dennis
+  - family-names: Galletta
+    given-names: Matteo
+  - family-names: Porta
+    given-names: Luca
+repository-code: "https://github.com/eiseled/dllab-dreamer4"
+license: MIT

@@ -1,15 +1,33 @@
+# Local research artifacts: datasets, model weights, tracker runs, and videos.
 pusht_expert_train.h5
+data/
+logs/
+wandb/
+local_models/
+runs/
+videos/
+evaluation/
+evaluation_rollouts/
+debug/
+offline-rl-with-le-wm-dev/
+COMPARISON_OFFLINE_RL_WITH_LEWM.md
 
-# logs
-logs/*
-wandb/*
-local_models/*
-/data
-/runs
-/videos
-/evaluation
-/evaluation_rollouts
-/debug
+# Large artifacts can be regenerated or downloaded separately.
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.npz
+*.zarr/
+*.csupload
+*.mp4
+*.avi
+
+# Local credentials and editor/OS state.
+.env
+.env.*
+!.env.example
+.DS_Store
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python

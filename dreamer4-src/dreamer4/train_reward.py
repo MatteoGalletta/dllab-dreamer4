@@ -706,9 +706,3 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=0)
 
     train(p.parse_args())
-
-# Windows / single-GPU (RTX 3070 Ti) usage -- no torchrun needed:
-# python train_reward.py ^
-#   --dataset C:\path\to\pusht_expert_train.h5 ^
-#   --tokenizer_ckpt C:\path\to\tokenizer_ckpts\latest.pt ^
-#   --batch_size 16 --num_workers 4

@@ -1175,7 +1175,7 @@ class TrainConfig:
     norm_reward: bool = True
     reward_clip: float = 10.0
     clip_vloss: bool = True
-    critic_warmup_ratio: float = 0.10  # NEU: 10% der Updates als Warmup
+    critic_warmup_ratio: float = 0.10
 
 
 def load_imagination_components(config: TrainConfig, device: torch.device) -> dict[str, Any]:
@@ -1538,7 +1538,7 @@ def parse_args():
     parser.add_argument("--no-fixed-target-block-success", action="store_true")
     parser.add_argument("--block-start-near-goal", action="store_true")
     parser.add_argument("--no-block-start-near-goal", action="store_true")
-    parser.add_argument("--critic-warmup-ratio", type=float, default=None)  # NEU
+    parser.add_argument("--critic-warmup-ratio", type=float, default=None)
     return parser.parse_args()
 
 
@@ -2341,7 +2341,7 @@ def train_pusht():
             ppo_epochs=config.ppo_epochs,
             update_idx=update,
             clip_vloss=bool(config.clip_vloss),
-            freeze_actor=freeze_actor,  # NEU: Flag übergeben
+            freeze_actor=freeze_actor,
         )
         ppo_update_secs = time.perf_counter() - ppo_update_start
 

@@ -477,4 +477,3 @@ if __name__ == "__main__":
     p.add_argument("--compile", action="store_true")
 
     train(p.parse_args())
-# torchrun --nproc_per_node=8 train_tokenizer.py --dataset /data2/ws1/lagandua-MySpace/pusht_expert_train.h5 --wandb_mode online
